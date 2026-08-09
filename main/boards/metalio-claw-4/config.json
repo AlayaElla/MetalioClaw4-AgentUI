@@ -1,0 +1,9 @@
+{
+    "target": "esp32p4",
+    "builds": [
+        {
+            "name": "metalio-claw-4",
+            "sdkconfig_append": []
+        }
+    ]
+}

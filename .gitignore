@@ -1,0 +1,33 @@
+# ESP-IDF build and managed dependencies
+/build/
+/managed_components/
+**/build/
+**/__pycache__/
+*.py[cod]
+*.elf
+*.map
+*.bin
+*.log
+
+# Local/optional binary resources and device images
+/wakeword/
+/sd_images/
+/esp_claw_bin/
+/images/
+/main/factory-test-assets/
+/main/xingzhi-assets/
+/main/assets/locales/**/*.ogg
+/main/assets/common/*.ogg
+!/main/assets/common/ratchet_detent.ogg
+
+# Credentials, local configuration and editor files
+.env
+.env.*
+*.nvs
+*.dump
+.cache/
+.cursor/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

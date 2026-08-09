@@ -1,0 +1,14 @@
+# ESP-IDF Partition Table — 32MB dual-boot (xingzhi + esp-claw edge_agent)
+# Name,         Type, SubType,      Offset,   Size, Flags
+nvsfactory,     data, nvs,         0xA000,   200K,
+nvs,            data, nvs,                ,   840K,
+otadata,        data, ota,                ,     8K,
+phy_init,       data, phy,                ,     4K,
+model,          data, spiffs,             ,   956K,
+ota_0,          app,  ota_0,      0x200000,     9M,
+ota_1,          app,  ota_1,              ,     4M,
+resources,      data, spiffs,             ,     4M,
+factory_test,   data, spiffs,             ,   600K,
+emote,          data, spiffs,             ,     4M,
+system,         data, fat,                ,     1M,
+storage,        data, fat,                ,     7M,
