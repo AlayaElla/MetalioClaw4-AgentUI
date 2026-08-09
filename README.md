@@ -4,6 +4,12 @@
 驱动、音频、显示、Agent UI、网络协议和本地 ESP-IDF 组件。PC bridge 不属于本仓库，
 设备连接协议中的端口、消息和认证约定应与对应的 PC bridge 版本保持一致。
 
+## 界面预览
+
+<p align="center">
+  <img src="docs/images/agent-ui-home.png" alt="Metalio Claw4 Agent UI 首页" width="600">
+</p>
+
 ## 快速链接
 
 - 固件仓库：[CloudZao/MetalioClaw4](https://github.com/CloudZao/MetalioClaw4)
