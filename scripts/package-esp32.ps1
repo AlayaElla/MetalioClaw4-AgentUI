@@ -36,7 +36,7 @@ try {
     Push-Location $BuildDirectory
     try {
         & $EspIdfPython -m esptool --chip esp32p4 merge-bin `
-            -o Agent-ESP32P4-full.bin -f raw '@flash_args'
+            -o Agent-ESP32P4-full.bin -f raw --pad-to-size 32MB '@flash_args'
         if ($LASTEXITCODE -ne 0) { throw "ESP32 merge-bin failed." }
     }
     finally {
@@ -53,6 +53,9 @@ try {
 
     if ((Get-Item -LiteralPath $AppBinary).Length -gt 14MB) {
         throw "Agent app exceeds the 14 MB factory partition: $AppBinary"
+    }
+    if ((Get-Item -LiteralPath $FullBinary).Length -ne 32MB) {
+        throw "Expected a 32 MiB full flash image: $FullBinary"
     }
     New-Item -ItemType Directory -Force -Path $PackageDirectory | Out-Null
     Copy-Item -LiteralPath $FullBinary -Destination (Join-Path $PackageDirectory "Agent-ESP32P4-full.bin") -Force

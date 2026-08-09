@@ -3,6 +3,30 @@ import argparse
 import json
 import os
 
+OPTIONAL_SOUND_NAMES = (
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "ACTIVATION",
+    "ERR_PIN",
+    "ERR_REG",
+    "EXCLAMATION",
+    "LOW_BATTERY",
+    "POPUP",
+    "SUCCESS",
+    "UPGRADE",
+    "VIBRATION",
+    "WELCOME",
+    "WIFICONFIG",
+)
+
 HEADER_TEMPLATE = """// Auto-generated language config
 // Language: {lang_code} with en-US fallback
 #pragma once
@@ -161,16 +185,39 @@ def generate_header(lang_code, output_path):
         }};''')
 
     # 填充模板
+    # Public source distributions may omit the optional voice prompt files,
+    # but firmware call sites still refer to their symbols. Keep those builds
+    # source-compatible and let the existing empty-sound checks skip playback.
+    available_sound_names = {
+        os.path.splitext(file)[0].upper()
+        for file in all_sound_files.union(common_sounds)
+    }
+    missing_optional_sounds = [
+        name for name in OPTIONAL_SOUND_NAMES
+        if name not in available_sound_names
+    ]
+    sound_declarations = "\n".join(sorted(sounds))
+    if missing_optional_sounds:
+        sound_declarations += '''
+
+        // Optional voice prompts are distributed separately.  Keep the
+        // symbols available for builds that do not include those assets;
+        // Application::Alert skips playback for an empty sound view.
+{}'''.format("\n".join(
+            f"        inline constexpr std::string_view OGG_{name}{{}};"
+            for name in missing_optional_sounds
+        ))
+
     content = HEADER_TEMPLATE.format(
         lang_code=lang_code,
         lang_code_for_font=lang_code.replace('-', '_').lower(),
         strings="\n".join(sorted(strings)),
-        sounds="\n".join(sorted(sounds))
+        sounds=sound_declarations
     )
 
     # 写入文件
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
+    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
 
 if __name__ == "__main__":

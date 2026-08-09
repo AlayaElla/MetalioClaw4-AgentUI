@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-esp32.ps1 -IdfPath C:
 打包结果位于本仓库的 `build/esp32/`：
 
 ```text
-Agent-ESP32P4-full.bin       完整镜像（含分区表）
+Agent-ESP32P4-full.bin       32 MiB 完整镜像（含分区表；空分区填充为 0xFF）
 Agent-ESP32P4-app.bin        仅 factory app 镜像
 Agent-ESP32P4-firmware.zip   上述镜像的归档
 ```
