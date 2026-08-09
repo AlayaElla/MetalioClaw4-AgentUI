@@ -4,6 +4,11 @@
 驱动、音频、显示、Agent UI、网络协议和本地 ESP-IDF 组件。PC bridge 不属于本仓库，
 设备连接协议中的端口、消息和认证约定应与对应的 PC bridge 版本保持一致。
 
+## 快速链接
+
+- 固件仓库：[CloudZao/MetalioClaw4](https://github.com/CloudZao/MetalioClaw4)
+- 上游架构：[小智 AI (xiaozhi-esp32)](https://github.com/78/xiaozhi-esp32)
+
 ## 固件功能
 
 这是面向 Metalio Claw4 的 **Agent UI 版固件**。它保留完整的板级、联网、音频和
