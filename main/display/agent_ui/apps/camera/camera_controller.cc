@@ -43,12 +43,20 @@ void Controller::HandleLifecycle(AppLifecycleEvent event) {
             state_.gallery_loading = false;
             state_.gallery_available = false;
             state_.viewer_loading = false;
+            Dispatch({.type = CommandType::SetEffect,
+                      .generation = state_.generation,
+                      .effect_style = state_.effect_style,
+                      .dark_mode = state_.effect_dark_mode});
             Dispatch({.type = CommandType::Start, .generation = state_.generation});
             break;
         case AppLifecycleEvent::Resume:
             state_.mounted = true;
             state_.preview_running = false;
             state_.preview_frame.reset();
+            Dispatch({.type = CommandType::SetEffect,
+                      .generation = state_.generation,
+                      .effect_style = state_.effect_style,
+                      .dark_mode = state_.effect_dark_mode});
             Dispatch({.type = CommandType::Start, .generation = state_.generation});
             break;
         case AppLifecycleEvent::Suspend:
@@ -187,6 +195,19 @@ void Controller::HandleIntent(const Intent& intent) {
             Dispatch({.type = CommandType::PreviewDrawn,
                       .generation = state_.generation,
                       .buffer_index = intent.buffer_index});
+            return;
+        case IntentType::SetEffect:
+            if (state_.effect_style == intent.effect_style &&
+                state_.effect_dark_mode == intent.dark_mode) {
+                return;
+            }
+            state_.effect_style = intent.effect_style;
+            state_.effect_dark_mode = intent.dark_mode;
+            Dispatch({.type = CommandType::SetEffect,
+                      .generation = state_.generation,
+                      .effect_style = intent.effect_style,
+                      .dark_mode = intent.dark_mode});
+            PublishState();
             return;
     }
 }

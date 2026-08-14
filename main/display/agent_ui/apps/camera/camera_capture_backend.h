@@ -24,6 +24,7 @@ public:
     void Stop();
     void Capture();
     void Resume();
+    void SetEffect(EffectStyle style, bool dark_mode);
     void AcknowledgeFrame(uint32_t generation, int buffer_index);
 
     std::shared_ptr<const PreviewFrame> CurrentFrame(uint32_t generation) const;

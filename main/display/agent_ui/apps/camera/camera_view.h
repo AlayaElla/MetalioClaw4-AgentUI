@@ -34,6 +34,10 @@ private:
     static void OnSwipeBack();
     static void OnPreviewDrawPost(lv_event_t* event);
     static void OnGalleryItem(lv_event_t* event);
+    static void OnStylePressed(lv_event_t* event);
+    static void OnStylePressing(lv_event_t* event);
+    static void OnStyleReleased(lv_event_t* event);
+    static void OnStyleMotion(lv_timer_t* timer);
     static void OnFlashTimer(lv_timer_t* timer);
     static void SetFlashOpacity(void* object, int32_t opacity);
     static void OnFlashFadeInCompleted(lv_anim_t* animation);
@@ -60,6 +64,13 @@ private:
     void StartReviewFlashAnimation();
     void StartReviewFlashFade(uint32_t duration_ms);
     void StopReviewFlashAnimation();
+    void ApplyStyleGeometry();
+    void ApplyStyleFocus(int index, bool emit_intent = true);
+    void AdvanceStyleWheel(float delta);
+    void StartStyleMotion(float velocity);
+    void BeginStyleSnap();
+    void FinishStyleMotion();
+    void StopStyleMotion();
     void ClearContent();
 
     IntentSink intent_sink_;
@@ -71,6 +82,10 @@ private:
     lv_obj_t* review_mask_ = nullptr;
     lv_obj_t* review_image_ = nullptr;
     lv_obj_t* flash_ = nullptr;
+    lv_obj_t* style_overlay_ = nullptr;
+    lv_obj_t* style_wheel_ = nullptr;
+    std::vector<lv_obj_t*> style_items_;
+    std::vector<lv_obj_t*> style_detents_;
     lv_obj_t* camera_strip_ = nullptr;
     lv_obj_t* review_strip_ = nullptr;
     lv_obj_t* gallery_ = nullptr;
@@ -105,6 +120,22 @@ private:
     bool flash_fading_out_ = false;
     bool flash_timed_out_ = false;
     bool review_capture_pending_ = false;
+    int style_index_ = 0;
+    float style_offset_ = 0.0f;
+    float style_position_ = 0.0f;
+    float style_velocity_ = 0.0f;
+    float style_snap_start_offset_ = 0.0f;
+    float style_snap_target_position_ = 0.0f;
+    float style_snap_elapsed_ms_ = 0.0f;
+    int style_pointer_start_x_ = 0;
+    int style_pointer_last_x_ = 0;
+    int64_t style_pointer_last_us_ = 0;
+    int64_t style_motion_last_us_ = 0;
+    lv_timer_t* style_motion_timer_ = nullptr;
+    bool style_pointer_active_ = false;
+    bool style_pointer_moved_ = false;
+    bool style_snapping_ = false;
+    int32_t review_rotation_ = 0;
     bool review_exit_active_ = false;
     IntentType pending_review_intent_ = IntentType::NavigateBack;
 };

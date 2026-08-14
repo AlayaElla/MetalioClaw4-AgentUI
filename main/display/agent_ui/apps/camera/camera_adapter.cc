@@ -1,8 +1,6 @@
 #include "camera_adapter.h"
 
-#include <algorithm>
 #include <atomic>
-#include <cstring>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -19,39 +17,7 @@
 namespace agent_ui::camera {
 namespace {
 
-constexpr int kSaveWidth = 360;
-constexpr int kSaveHeight = 236;
-constexpr uint8_t kSaveJpegQuality = 55;
-
-std::vector<uint8_t> Downsample(const PreviewFrame& frame) {
-    std::vector<uint8_t> result(static_cast<std::size_t>(kSaveWidth) *
-                                kSaveHeight * 2);
-    if (frame.data == nullptr || frame.width <= 0 || frame.height <= 0) {
-        result.clear();
-        return result;
-    }
-    const auto* source = reinterpret_cast<const uint16_t*>(frame.data);
-    auto* destination = reinterpret_cast<uint16_t*>(result.data());
-    const uint32_t x_step = (static_cast<uint32_t>(frame.width) << 16) /
-                            static_cast<uint32_t>(kSaveWidth);
-    const uint32_t y_step = (static_cast<uint32_t>(frame.height) << 16) /
-                            static_cast<uint32_t>(kSaveHeight);
-    uint32_t y_acc = 0;
-    for (int y = 0; y < kSaveHeight; ++y) {
-        const std::size_t source_y = std::min<std::size_t>(
-            y_acc >> 16, static_cast<std::size_t>(frame.height - 1));
-        uint32_t x_acc = 0;
-        for (int x = 0; x < kSaveWidth; ++x) {
-            const std::size_t source_x = std::min<std::size_t>(
-                x_acc >> 16, static_cast<std::size_t>(frame.width - 1));
-            destination[y * kSaveWidth + x] =
-                source[source_y * frame.width + source_x];
-            x_acc += x_step;
-        }
-        y_acc += y_step;
-    }
-    return result;
-}
+constexpr uint8_t kSaveJpegQuality = 80;
 
 }  // namespace
 
@@ -102,10 +68,21 @@ struct Adapter::Impl : std::enable_shared_from_this<Adapter::Impl> {
             return;
         }
         auto owner = std::move(request->owner);
-        const auto rgb565 = Downsample(*request->frame);
+        const bool valid_frame = request->frame->data != nullptr &&
+                                 request->frame->width > 0 &&
+                                 request->frame->height > 0 &&
+                                 request->frame->width <= UINT16_MAX &&
+                                 request->frame->height <= UINT16_MAX;
+        const size_t rgb565_size =
+            valid_frame
+                ? static_cast<size_t>(request->frame->width) *
+                      request->frame->height * sizeof(uint16_t)
+                : 0;
         std::vector<uint8_t> jpeg;
-        const bool encoded = codec::EncodeRgb565(
-            rgb565.data(), rgb565.size(), kSaveWidth, kSaveHeight,
+        const bool encoded = valid_frame && codec::EncodeRgb565(
+            request->frame->data, rgb565_size,
+            static_cast<uint16_t>(request->frame->width),
+            static_cast<uint16_t>(request->frame->height),
             kSaveJpegQuality, jpeg);
         std::string path;
         const bool saved = encoded && owner->gallery.WriteJpeg(jpeg, &path);
@@ -208,6 +185,9 @@ struct Adapter::Impl : std::enable_shared_from_this<Adapter::Impl> {
                 break;
             case CommandType::PreviewDrawn:
                 capture.AcknowledgeFrame(command.generation, command.buffer_index);
+                break;
+            case CommandType::SetEffect:
+                capture.SetEffect(command.effect_style, command.dark_mode);
                 break;
         }
     }

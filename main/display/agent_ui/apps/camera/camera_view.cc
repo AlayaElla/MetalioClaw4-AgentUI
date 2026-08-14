@@ -1,12 +1,17 @@
 #include "camera_view.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <utility>
 
 #include <font_awesome.h>
+#include <esp_random.h>
+#include <esp_timer.h>
 
+#include "components/haptic_feedback.h"
 #include "components/ui_components.h"
 #include "core/fonts.h"
 #include "core/theme.h"
@@ -20,12 +25,27 @@ constexpr int kPanelH = 658;
 constexpr int kCameraAreaW = 720;
 constexpr int kCameraAreaH = 526;
 constexpr int kButtonStripY = kCameraAreaH;
+constexpr int kStyleOverlayH = 44;
+constexpr int kStyleOverlayY = kButtonStripY - kStyleOverlayH;
+constexpr int kStyleStep = 132;
+constexpr int kStyleItemW = 132;
+constexpr int kStyleCenterX = kCameraAreaW / 2;
+constexpr int kStyleDragThreshold = 10;
+constexpr int kStyleMotionPeriodMs = 16;
+constexpr float kStyleMaxVelocity = 3.1f;
+constexpr float kStyleReleaseBoost = 1.3f;
+constexpr float kStyleFriction = 0.95f;
+constexpr float kStyleStopVelocity = 0.025f;
+constexpr float kStyleMinReleaseVelocity = 0.06f;
+constexpr float kStyleSnapDurationMs = 240.0f;
 constexpr int kReviewW = 600;
 constexpr int kReviewH = 394;
 constexpr int kReviewFramePad = 14;
 constexpr int kReviewFrameBottom = 40;
 constexpr int kReviewFrameW = kReviewW + 2 * kReviewFramePad;
 constexpr int kReviewFrameH = kReviewFramePad + kReviewH + kReviewFrameBottom;
+constexpr int32_t kReviewTiltMin = 15;  // LVGL uses 0.1-degree units.
+constexpr int32_t kReviewTiltRange = 31;
 constexpr int kGalleryThumbW = 220;
 constexpr int kGalleryThumbH = 144;
 constexpr int kGalleryImageW = kGalleryThumbW - 10;
@@ -51,6 +71,41 @@ constexpr uint32_t kFlashTickMs = 16;
 constexpr uint32_t kReviewExitDurationMs = 200;
 constexpr int32_t kReviewExitOffsetY = 12;
 static_assert(kFlashTotalMs == 250);
+
+constexpr std::array<EffectStyle, 5> kEffectStyles = {
+    EffectStyle::Original,
+    EffectStyle::Mosaic,
+    EffectStyle::PrintComic,
+    EffectStyle::Ascii,
+    EffectStyle::BlackWhite,
+};
+
+constexpr std::array<const char*, 5> kEffectLabels = {
+    "原图",
+    "马赛克",
+    "彩色印刷",
+    "字符画",
+    "黑白",
+};
+
+int WrapStyleIndex(int index) {
+    const int count = static_cast<int>(kEffectStyles.size());
+    return (index % count + count) % count;
+}
+
+int StyleOrder(int item_index, int focused_index) {
+    const int count = static_cast<int>(kEffectStyles.size());
+    int order = WrapStyleIndex(item_index - focused_index);
+    if (order > count / 2) order -= count;
+    return order;
+}
+
+int StyleIndex(EffectStyle style) {
+    for (std::size_t i = 0; i < kEffectStyles.size(); ++i) {
+        if (kEffectStyles[i] == style) return static_cast<int>(i);
+    }
+    return 0;
+}
 
 View* Owner(lv_event_t* event) {
     if (event == nullptr) return nullptr;
@@ -86,10 +141,11 @@ const char* StatusText(const ViewState& state) {
 
 void SetDescriptor(lv_image_dsc_t& descriptor, const uint8_t* data,
                    std::size_t data_size, std::size_t width,
-                   std::size_t height, std::size_t stride) {
+                   std::size_t height, std::size_t stride,
+                   lv_color_format_t color_format = LV_COLOR_FORMAT_RGB565) {
     descriptor = {};
     descriptor.header.magic = LV_IMAGE_HEADER_MAGIC;
-    descriptor.header.cf = LV_COLOR_FORMAT_RGB565;
+    descriptor.header.cf = color_format;
     descriptor.header.w = static_cast<uint32_t>(width);
     descriptor.header.h = static_cast<uint32_t>(height);
     descriptor.header.stride = static_cast<uint32_t>(stride);
@@ -136,6 +192,7 @@ void View::BuildInto(lv_obj_t* parent, IntentSink intent_sink) {
     lv_obj_set_style_bg_color(camera_panel_, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(camera_panel_, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_clear_flag(camera_panel_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(camera_panel_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     MakeInputPassive(camera_panel_);
 
     preview_ = lv_image_create(camera_panel_);
@@ -175,6 +232,76 @@ void View::BuildInto(lv_obj_t* parent, IntentSink intent_sink) {
     AddFinderMark(viewfinder_, kFinderW / 2 - 1, kFinderH / 2 + 12, 3, 18);
     MakeInputPassive(viewfinder_);
 
+    style_overlay_ = lv_obj_create(camera_panel_);
+    StripObjectChrome(style_overlay_);
+    lv_obj_set_size(style_overlay_, kCameraAreaW, kStyleOverlayH);
+    lv_obj_set_pos(style_overlay_, 0, kStyleOverlayY);
+    lv_obj_set_style_bg_color(
+        style_overlay_, lv_color_hex(Theme::Get().colors().background),
+        LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(style_overlay_, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_border_width(style_overlay_, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_side(style_overlay_, LV_BORDER_SIDE_TOP,
+                                 LV_PART_MAIN);
+    lv_obj_set_style_border_color(
+        style_overlay_, lv_color_hex(Theme::Get().colors().border),
+        LV_PART_MAIN);
+    lv_obj_clear_flag(style_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+    IgnoreSwipeBack(style_overlay_, true);
+
+    style_wheel_ = lv_obj_create(style_overlay_);
+    StripObjectChrome(style_wheel_);
+    lv_obj_set_size(style_wheel_, kCameraAreaW, kStyleOverlayH);
+    lv_obj_set_pos(style_wheel_, 0, 0);
+    lv_obj_set_style_bg_opa(style_wheel_, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(style_wheel_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(style_wheel_, LV_OBJ_FLAG_SCROLLABLE);
+    IgnoreSwipeBack(style_wheel_, true);
+    lv_obj_add_event_cb(style_wheel_, OnStylePressed, LV_EVENT_PRESSED, this);
+    lv_obj_add_event_cb(style_wheel_, OnStylePressing, LV_EVENT_PRESSING, this);
+    lv_obj_add_event_cb(style_wheel_, OnStyleReleased, LV_EVENT_RELEASED, this);
+    lv_obj_add_event_cb(style_wheel_, OnStyleReleased, LV_EVENT_PRESS_LOST, this);
+
+    style_items_.reserve(kEffectLabels.size());
+    style_detents_.reserve(kEffectLabels.size());
+    for (std::size_t index = 0; index < kEffectLabels.size(); ++index) {
+        lv_obj_t* label = lv_label_create(style_wheel_);
+        lv_label_set_text(label, I18n::T(kEffectLabels[index]));
+        lv_obj_set_size(label, kStyleItemW, kStyleOverlayH);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_font(label, fonts::SmallBold(), LV_PART_MAIN);
+        lv_obj_set_style_text_color(
+            label, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+        lv_obj_set_style_pad_top(label, 12, LV_PART_MAIN);
+        MakeInputPassive(label);
+        style_items_.push_back(label);
+
+        lv_obj_t* detent = lv_obj_create(style_wheel_);
+        StripObjectChrome(detent);
+        lv_obj_set_size(detent, 2, 5);
+        lv_obj_set_style_bg_color(
+            detent, lv_color_hex(Theme::Get().colors().muted), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(detent, LV_OPA_70, LV_PART_MAIN);
+        lv_obj_set_style_radius(detent, 1, LV_PART_MAIN);
+        MakeInputPassive(detent);
+        style_detents_.push_back(detent);
+    }
+
+    for (const int x : {kStyleCenterX - kStyleItemW / 2 - 1,
+                        kStyleCenterX + kStyleItemW / 2 - 1}) {
+        lv_obj_t* mark = lv_obj_create(style_wheel_);
+        StripObjectChrome(mark);
+        lv_obj_set_size(mark, 2, 7);
+        lv_obj_set_pos(mark, x, (kStyleOverlayH - 7) / 2);
+        lv_obj_set_style_bg_color(
+            mark, lv_color_hex(Theme::Get().colors().accent), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(mark, LV_OPA_COVER, LV_PART_MAIN);
+        MakeInputPassive(mark);
+        lv_obj_move_foreground(mark);
+    }
+    ApplyStyleFocus(StyleIndex(state_.effect_style), false);
+    ApplyStyleGeometry();
+
     status_ = lv_label_create(camera_panel_);
     lv_label_set_text(status_, "");
     lv_obj_set_style_text_color(status_, lv_color_white(), LV_PART_MAIN);
@@ -195,7 +322,10 @@ void View::BuildInto(lv_obj_t* parent, IntentSink intent_sink) {
 
     review_image_ = lv_image_create(review_mask_);
     lv_obj_set_size(review_image_, kReviewFrameW, kReviewFrameH);
-    lv_image_set_inner_align(review_image_, LV_IMAGE_ALIGN_CONTAIN);
+    // CONTAIN disables image transforms in LVGL and silently forces rotation
+    // back to zero. The review descriptor already matches the object size, so
+    // CENTER preserves its native dimensions and allows the random tilt.
+    lv_image_set_inner_align(review_image_, LV_IMAGE_ALIGN_CENTER);
     lv_obj_align(review_image_, LV_ALIGN_CENTER, 0, 0);
     MakeInputPassive(review_image_);
 
@@ -347,6 +477,9 @@ void View::BuildInto(lv_obj_t* parent, IntentSink intent_sink) {
                                 LV_PART_MAIN);
     lv_obj_add_flag(review_strip_, LV_OBJ_FLAG_HIDDEN);
 
+    Emit(Intent::SetEffect(
+        kEffectStyles[style_index_],
+        Theme::Get().appearance_mode() == AppearanceMode::Dark));
     ApplyModeVisibility(state_.mode);
     Render(state_);
 }
@@ -395,6 +528,150 @@ void View::UpdateCaptureButton(const ViewState& state) {
                                 LV_PART_MAIN);
     lv_obj_set_style_text_color(capture_label_, lv_color_hex(colors.muted),
                                 LV_PART_MAIN);
+}
+
+void View::ApplyStyleGeometry() {
+    for (std::size_t index = 0; index < style_items_.size(); ++index) {
+        const int order = StyleOrder(static_cast<int>(index), style_index_);
+        const int center_x = kStyleCenterX + order * kStyleStep +
+                             static_cast<int>(std::lround(style_offset_));
+        lv_obj_set_pos(style_items_[index], center_x - kStyleItemW / 2, 0);
+    }
+    for (std::size_t index = 0; index < style_detents_.size(); ++index) {
+        const int leading_order =
+            StyleOrder(static_cast<int>(index), style_index_);
+        const int center_x = kStyleCenterX + leading_order * kStyleStep +
+                             kStyleStep / 2 +
+                             static_cast<int>(std::lround(style_offset_));
+        lv_obj_set_pos(style_detents_[index], center_x - 1,
+                       (kStyleOverlayH - 5) / 2);
+    }
+}
+
+void View::ApplyStyleFocus(int index, bool emit_intent) {
+    const int wrapped = WrapStyleIndex(index);
+    if (style_index_ == wrapped) return;
+    style_index_ = wrapped;
+    if (emit_intent) {
+        Emit(Intent::SetEffect(
+            kEffectStyles[style_index_],
+            Theme::Get().appearance_mode() == AppearanceMode::Dark));
+    }
+}
+
+void View::AdvanceStyleWheel(float delta) {
+    const float previous_position = style_position_;
+    style_position_ -= delta / kStyleStep;
+    style_offset_ += delta;
+    while (style_offset_ <= -kStyleStep / 2.0f) {
+        style_offset_ += kStyleStep;
+        ApplyStyleFocus(style_index_ + 1);
+    }
+    while (style_offset_ >= kStyleStep / 2.0f) {
+        style_offset_ -= kStyleStep;
+        ApplyStyleFocus(style_index_ - 1);
+    }
+
+    constexpr float kEpsilon = 0.000001f;
+    if (style_position_ > previous_position) {
+        const int first = static_cast<int>(
+                              std::floor(previous_position * 2.0f + kEpsilon)) +
+                          1;
+        const int last = static_cast<int>(
+            std::floor(style_position_ * 2.0f + kEpsilon));
+        for (int marker = first; marker <= last; ++marker) {
+            PlayHaptic(HapticStrength::Light);
+        }
+    } else if (style_position_ < previous_position) {
+        const int first = static_cast<int>(
+                              std::ceil(previous_position * 2.0f - kEpsilon)) -
+                          1;
+        const int last = static_cast<int>(
+            std::ceil(style_position_ * 2.0f - kEpsilon));
+        for (int marker = first; marker >= last; --marker) {
+            PlayHaptic(HapticStrength::Light);
+        }
+    }
+    ApplyStyleGeometry();
+}
+
+void View::StopStyleMotion() {
+    if (style_motion_timer_ == nullptr) return;
+    lv_timer_t* timer = style_motion_timer_;
+    style_motion_timer_ = nullptr;
+    lv_timer_delete(timer);
+}
+
+void View::FinishStyleMotion() {
+    const bool moved = std::abs(style_snap_start_offset_) >= 0.5f;
+    StopStyleMotion();
+    style_velocity_ = 0.0f;
+    style_offset_ = 0.0f;
+    style_position_ = style_snap_target_position_;
+    style_snap_elapsed_ms_ = 0.0f;
+    style_snapping_ = false;
+    ApplyStyleGeometry();
+    if (moved) PlayHaptic(HapticStrength::Light);
+}
+
+void View::BeginStyleSnap() {
+    style_velocity_ = 0.0f;
+    style_snap_start_offset_ = style_offset_;
+    style_snap_target_position_ = std::round(style_position_);
+    style_snap_elapsed_ms_ = 0.0f;
+    style_snapping_ = true;
+    if (std::abs(style_snap_start_offset_) < 0.5f) {
+        FinishStyleMotion();
+    }
+}
+
+void View::StartStyleMotion(float velocity) {
+    StopStyleMotion();
+    style_velocity_ =
+        std::clamp(velocity, -kStyleMaxVelocity, kStyleMaxVelocity);
+    style_snapping_ = false;
+    if (std::abs(style_velocity_) < kStyleMinReleaseVelocity) {
+        BeginStyleSnap();
+    }
+    if (style_motion_timer_ == nullptr &&
+        (style_snapping_ ||
+         std::abs(style_velocity_) >= kStyleMinReleaseVelocity)) {
+        style_motion_last_us_ = esp_timer_get_time();
+        style_motion_timer_ =
+            lv_timer_create(OnStyleMotion, kStyleMotionPeriodMs, this);
+    }
+}
+
+void View::OnStyleMotion(lv_timer_t* timer) {
+    auto* self = timer != nullptr
+                     ? static_cast<View*>(lv_timer_get_user_data(timer))
+                     : nullptr;
+    if (self == nullptr || self->style_motion_timer_ != timer) return;
+    const int64_t now_us = esp_timer_get_time();
+    float elapsed_ms = static_cast<float>(now_us - self->style_motion_last_us_) /
+                       1000.0f;
+    self->style_motion_last_us_ = now_us;
+    elapsed_ms = std::clamp(elapsed_ms, 1.0f, 32.0f);
+
+    if (self->style_snapping_) {
+        self->style_snap_elapsed_ms_ += elapsed_ms;
+        const float t = std::min(
+            1.0f, self->style_snap_elapsed_ms_ / kStyleSnapDurationMs);
+        const float spring = (1.0f - t) * (1.0f - 1.35f * t);
+        self->style_offset_ = self->style_snap_start_offset_ * spring;
+        self->style_position_ = self->style_snap_target_position_ -
+                                self->style_offset_ / kStyleStep;
+        self->ApplyStyleGeometry();
+        if (t >= 1.0f) self->FinishStyleMotion();
+        return;
+    }
+
+    self->AdvanceStyleWheel(self->style_velocity_ * elapsed_ms);
+    self->style_velocity_ *=
+        std::pow(kStyleFriction, elapsed_ms / 16.6667f);
+    if (std::abs(self->style_velocity_) < kStyleStopVelocity) {
+        self->BeginStyleSnap();
+    }
 }
 
 void View::SetReviewActionsEnabled(bool enabled) {
@@ -503,6 +780,13 @@ void View::Render(const ViewState& state) {
     }
     const ViewMode previous_mode = state_.mode;
     state_ = state;
+    const int rendered_style_index = StyleIndex(state.effect_style);
+    if (!style_pointer_active_ && rendered_style_index != style_index_) {
+        style_index_ = rendered_style_index;
+        style_offset_ = 0.0f;
+        style_position_ = std::round(style_position_);
+        ApplyStyleGeometry();
+    }
     Hide(camera_panel_);
     Hide(gallery_);
     Hide(viewer_);
@@ -515,6 +799,16 @@ void View::Render(const ViewState& state) {
         } else {
             Hide(status_);
         }
+    }
+    if (state.mode == ViewMode::Review && previous_mode != ViewMode::Review &&
+        review_image_ != nullptr) {
+        const int32_t magnitude =
+            kReviewTiltMin +
+            static_cast<int32_t>(esp_random() % kReviewTiltRange);
+        const int32_t angle = (esp_random() & 1U) != 0
+                                  ? magnitude
+                                  : -magnitude;
+        review_rotation_ = angle;
     }
     switch (state.mode) {
         case ViewMode::Camera:
@@ -576,10 +870,13 @@ void View::RenderReview(const ViewState& state) {
                       review_frame_->data_size, review_frame_->width,
                       review_frame_->height, review_frame_->stride);
         lv_image_set_src(review_, &review_descriptor_);
+        lv_image_set_rotation(review_, review_rotation_);
         Show(review_);
     } else {
         review_frame_.reset();
         lv_image_set_src(review_, nullptr);
+        review_rotation_ = 0;
+        lv_image_set_rotation(review_, 0);
     }
 }
 
@@ -644,11 +941,16 @@ void View::ApplyModeVisibility(ViewMode mode) {
     Hide(gallery_);
     Hide(viewer_);
     Hide(camera_strip_);
+    Hide(style_overlay_);
     Hide(review_strip_);
     Hide(gallery_header_);
     Hide(viewer_actions_);
     if (mode == ViewMode::Camera) {
         Show(camera_strip_);
+        Show(style_overlay_);
+    } else {
+        style_pointer_active_ = false;
+        StopStyleMotion();
     }
     const bool show_camera = mode == ViewMode::Camera || mode == ViewMode::Review;
     if (show_camera) {
@@ -692,16 +994,33 @@ void View::ApplyModeVisibility(ViewMode mode) {
 void View::RenderPreview(const ViewState& state) {
     if (!state.preview_frame || state.preview_frame->data == nullptr ||
         preview_ == nullptr) {
+        if (preview_ != nullptr && preview_frame_ != nullptr) {
+            const int released_index = pending_buffer_index_;
+            lv_image_cache_drop(&preview_descriptor_);
+            lv_image_set_src(preview_, nullptr);
+            preview_frame_.reset();
+            pending_buffer_index_ = -1;
+            if (released_index >= 0) {
+                Emit(Intent::PreviewDrawn(released_index));
+            }
+        }
         return;
     }
+    // The descriptor object is intentionally reused while its display-buffer
+    // pointer changes every frame. Drop LVGL's image cache entry first, just
+    // like its GIF player does for mutable image data, otherwise the first
+    // (often black warm-up) frame remains cached indefinitely.
+    lv_image_cache_drop(&preview_descriptor_);
     preview_frame_ = state.preview_frame;
     pending_buffer_index_ = preview_frame_->buffer_index;
     SetDescriptor(preview_descriptor_, preview_frame_->data,
                   static_cast<std::size_t>(preview_frame_->width) *
-                      preview_frame_->height * 2,
+                      preview_frame_->height * 3,
                   preview_frame_->width, preview_frame_->height,
-                  static_cast<std::size_t>(preview_frame_->width) * 2);
+                  static_cast<std::size_t>(preview_frame_->width) * 3,
+                  LV_COLOR_FORMAT_RGB888);
     lv_image_set_src(preview_, &preview_descriptor_);
+    lv_obj_invalidate(preview_);
 }
 
 void View::RenderGalleryItems(const ViewState& state) {
@@ -1008,6 +1327,7 @@ void View::RevealReviewAtFlashPeak() {
 void View::ClearContent() {
     CancelReviewExit();
     StopReviewFlashAnimation();
+    StopStyleMotion();
     if (content_ != nullptr) lv_obj_clean(content_);
     parent_ = nullptr;
     if (s_active_view == this) s_active_view = nullptr;
@@ -1019,6 +1339,8 @@ void View::ClearContent() {
     review_image_ = nullptr;
     flash_ = nullptr;
     camera_strip_ = nullptr;
+    style_overlay_ = nullptr;
+    style_wheel_ = nullptr;
     review_strip_ = nullptr;
     gallery_ = nullptr;
     gallery_header_ = nullptr;
@@ -1032,6 +1354,8 @@ void View::ClearContent() {
     gallery_list_ = nullptr;
     viewer_image_ = nullptr;
     viewer_status_ = nullptr;
+    style_items_.clear();
+    style_detents_.clear();
     thumbnail_images_.clear();
     thumbnail_failure_labels_.clear();
     thumbnail_descriptors_.clear();
@@ -1054,10 +1378,101 @@ void View::Reset() {
     flash_elapsed_ms_ = 0;
     flash_fading_out_ = false;
     flash_timed_out_ = false;
+    style_index_ = 0;
+    style_offset_ = 0.0f;
+    style_position_ = 0.0f;
+    style_velocity_ = 0.0f;
+    style_pointer_start_x_ = 0;
+    style_pointer_last_x_ = 0;
+    style_pointer_last_us_ = 0;
+    style_motion_last_us_ = 0;
+    style_snap_elapsed_ms_ = 0.0f;
+    style_snap_target_position_ = 0.0f;
+    style_snap_start_offset_ = 0.0f;
+    style_pointer_active_ = false;
+    style_pointer_moved_ = false;
+    style_snapping_ = false;
 }
 
 void View::LifecycleCallback(Lifecycle lifecycle) {
-    if (lifecycle == Lifecycle::Unload) Reset();
+    if (lifecycle == Lifecycle::Suspend) {
+        style_pointer_active_ = false;
+        StopStyleMotion();
+    } else if (lifecycle == Lifecycle::Unload) {
+        Reset();
+    }
+}
+
+void View::OnStylePressed(lv_event_t* event) {
+    View* self = Owner(event);
+    if (self == nullptr) return;
+    self->StopStyleMotion();
+    lv_indev_t* indev = lv_event_get_indev(event);
+    if (indev == nullptr) indev = lv_indev_active();
+    if (indev == nullptr) return;
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    self->style_pointer_start_x_ = point.x;
+    self->style_pointer_last_x_ = point.x;
+    self->style_pointer_last_us_ = esp_timer_get_time();
+    self->style_velocity_ = 0.0f;
+    self->style_pointer_active_ = true;
+    self->style_pointer_moved_ = false;
+}
+
+void View::OnStylePressing(lv_event_t* event) {
+    View* self = Owner(event);
+    if (self == nullptr || !self->style_pointer_active_) return;
+    lv_indev_t* indev = lv_event_get_indev(event);
+    if (indev == nullptr) indev = lv_indev_active();
+    if (indev == nullptr) return;
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    const int64_t now_us = esp_timer_get_time();
+    const int delta_x = point.x - self->style_pointer_last_x_;
+    const float elapsed_ms = std::max(
+        1.0f, static_cast<float>(now_us - self->style_pointer_last_us_) /
+                  1000.0f);
+    self->style_pointer_last_x_ = point.x;
+    self->style_pointer_last_us_ = now_us;
+    if (std::abs(point.x - self->style_pointer_start_x_) >=
+        kStyleDragThreshold) {
+        self->style_pointer_moved_ = true;
+    }
+    if (!self->style_pointer_moved_) return;
+    if (delta_x == 0) {
+        self->style_velocity_ *= 0.72f;
+        return;
+    }
+    const float instantaneous = delta_x / elapsed_ms;
+    self->style_velocity_ =
+        self->style_velocity_ * 0.68f + instantaneous * 0.32f;
+    self->AdvanceStyleWheel(static_cast<float>(delta_x));
+}
+
+void View::OnStyleReleased(lv_event_t* event) {
+    View* self = Owner(event);
+    if (self == nullptr || !self->style_pointer_active_) return;
+    self->style_pointer_active_ = false;
+    if (self->style_pointer_moved_) {
+        self->StartStyleMotion(self->style_velocity_ * kStyleReleaseBoost);
+        return;
+    }
+    const int direction = std::clamp(
+        static_cast<int>(std::lround(
+            static_cast<float>(self->style_pointer_start_x_ -
+                               kStyleCenterX) /
+            kStyleStep)),
+        -2, 2);
+    if (direction != 0) {
+        self->style_position_ += direction;
+        self->ApplyStyleFocus(self->style_index_ + direction);
+        self->style_offset_ = 0.0f;
+        self->ApplyStyleGeometry();
+        PlayHaptic(HapticStrength::Light);
+    } else {
+        self->StartStyleMotion(0.0f);
+    }
 }
 
 void View::OnCapture(lv_event_t* event) {

@@ -1,0 +1,179 @@
+diff --git a/sensors/ov2710/Kconfig.ov2710 b/sensors/ov2710/Kconfig.ov2710
+--- a/sensors/ov2710/Kconfig.ov2710
++++ b/sensors/ov2710/Kconfig.ov2710
+@@ -25,6 +25,13 @@ if CAMERA_OV2710
+                 RAW10 format at 1280x720 resolution (HD) with 25fps framerate.
+                 Requires MIPI CSI-2 1-lane interface with 24MHz input clock.
+ 
++        config CAMERA_OV2710_MIPI_RAW10_720X720_25FPS
++            bool "MIPI 1-lane, 24M input, 720x720 25fps, RAW10"
++            default n
++            help
++                RAW10 format at 720x720 resolution with 25fps framerate.
++                Requires MIPI CSI-2 1-lane interface with 24MHz input clock.
++
+         config CAMERA_OV2710_MIPI_RAW10_1920X1080_25FPS
+             bool "MIPI 1-lane, 24M input, 1920x1080 25fps, RAW10"
+             default y
+diff --git a/sensors/ov2710/ov2710.c b/sensors/ov2710/ov2710.c
+--- a/sensors/ov2710/ov2710.c
++++ b/sensors/ov2710/ov2710.c
+@@ -91,6 +91,9 @@ static const uint8_t ov2710_format_index[] = {
+ #if CONFIG_CAMERA_OV2710_MIPI_RAW10_1280X720_25FPS
+     1,
+ #endif
++#if CONFIG_CAMERA_OV2710_MIPI_RAW10_720X720_25FPS
++    2,
++#endif
+ };
+ 
+ static const esp_cam_sensor_format_t ov2710_format_info[] = {
+@@ -135,6 +138,26 @@ static const esp_cam_sensor_format_t ov2710_format_info[] = {
+         .reserved = NULL,
+     },
+ #endif
++#if CONFIG_CAMERA_OV2710_MIPI_RAW10_720X720_25FPS
++    {
++        .name = "MIPI_1lane_24Minput_RAW10_720x720_25fps",
++        .format = ESP_CAM_SENSOR_PIXFORMAT_RAW10,
++        .port = ESP_CAM_SENSOR_MIPI_CSI,
++        .xclk = OV2710_MCLK,
++        .width = 720,
++        .height = 720,
++        .regs = ov2710_mipi_1lane_24Minput_720x720_raw10_25fps,
++        .regs_size = ARRAY_SIZE(ov2710_mipi_1lane_24Minput_720x720_raw10_25fps),
++        .fps = 25,
++        .isp_info = &ov2710_isp_info[1],
++        .mipi_info = {
++            .mipi_clk = 800000000,
++            .lane_num = 1,
++            .line_sync_en = false,
++        },
++        .reserved = NULL,
++    },
++#endif
+ };
+ 
+ static uint8_t get_ov2710_actual_format_index(void)
+diff --git a/sensors/ov2710/private_include/ov2710_mipi_1lane_24Minput_720x720_raw10_25fps.h b/sensors/ov2710/private_include/ov2710_mipi_1lane_24Minput_720x720_raw10_25fps.h
+new file mode 100644
+--- /dev/null
++++ b/sensors/ov2710/private_include/ov2710_mipi_1lane_24Minput_720x720_raw10_25fps.h
+@@ -0,0 +1,105 @@
++/*
++ * SPDX-FileCopyrightText: 2025 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++/*
++ * Derived from Espressif's 1280x720 RAW10@25 mode. Keep its clock, MIPI,
++ * vertical window and frame timing, and center-crop only the horizontal
++ * sensor window from 1280 pixels to 720 pixels.
++ */
++static const ov2710_reginfo_t ov2710_mipi_1lane_24Minput_720x720_raw10_25fps[] = {
++    {0x3103, 0x93},
++    {0x3008, 0x82}, // reset
++    {OV2710_REG_DELAY, 0x04},
++    {0x4800, BIT(0)}, // Ensure streaming off so the clock lane enters LP-11.
++    {0x3008, 0x42}, // sleep en
++    {OV2710_REG_DELAY, 0x04},
++
++    {0x3103, 0x93},
++    {0x3017, 0x00},
++    {0x3018, 0x00},
++    {0x3706, 0x61},
++    {0x3712, 0x0c},
++    {0x3630, 0x6d},
++    {0x3801, 0xb4},
++    {0x3621, 0x04},
++    {0x3604, 0x60},
++    {0x3603, 0xa7},
++    {0x3631, 0x26},
++    {0x3600, 0x04},
++    {0x3620, 0x37},
++    {0x3623, 0x00},
++    {0x3702, 0x9e},
++    {0x3703, 0x5c},
++    {0x3704, 0x40},
++    {0x370d, 0x0f},
++    {0x3713, 0x9f},
++    {0x3714, 0x4c},
++    {0x3710, 0x9e},
++    {0x3801, 0xc4},
++    {0x3605, 0x05},
++    {0x3606, 0x3f},
++    {0x302d, 0x90},
++    {0x370b, 0x40},
++    {0x3716, 0x31},
++    {0x3707, 0x52},
++    {0x380d, 0x74},
++    {0x5181, 0x20},
++    {0x518f, 0x00},
++    {0x4301, 0xff},
++    {0x4303, 0x00},
++    {0x3a00, 0x78},
++    {0x300f, 0x88},
++    {0x3011, 0x28},
++    {0x3a1a, 0x06},
++    {0x3a18, 0x00},
++    {0x3a19, 0x7a},
++    {0x3a13, 0x54},
++    {0x382e, 0x0f},
++    {0x381a, 0x1a},
++    {0x401d, 0x02},
++    {0x381c, 0x10},
++    {0x381d, 0xb8},
++    {0x381e, 0x02},
++    {0x381f, 0xdc},
++    {0x3820, 0x0a},
++    {0x3821, 0x29},
++
++    // Center the 720-pixel window within the validated 1280-pixel window.
++    // 0x01c4 + (1280 - 720) / 2 = 0x02dc.
++    {0x3800, 0x02},
++    {0x3801, 0xdc},
++    {0x3804, 0x02},
++    {0x3805, 0xd0},
++    {0x3806, 0x02},
++    {0x3807, 0xd0},
++    {0x3808, 0x02},
++    {0x3809, 0xd0},
++    {0x380a, 0x02},
++    {0x380b, 0xd0},
++
++    // Preserve the validated 25 fps frame timing.
++    {0x380c, 0x09},
++    {0x380d, 0x74},
++    {0x380e, 0x05},
++    {0x380f, 0x2a},
++    {0x5688, 0x03},
++    {0x5684, 0x02},
++    {0x5685, 0xd0},
++    {0x5686, 0x02},
++    {0x5687, 0xd0},
++    {0x3a08, 0x1b},
++    {0x3a09, 0xe6},
++    {0x3a0a, 0x17},
++    {0x3a0b, 0x40},
++    {0x3a0e, 0x01},
++    {0x3a0d, 0x02},
++    {0x3011, 0x0a},
++    {0x300f, 0xc3},
++
++    {0x300e, 0x04},
++    {0x4801, 0x0f},
++    {0x4800, 0x24},
++    {OV2710_REG_END, 0x00},
++};
+diff --git a/sensors/ov2710/private_include/ov2710_settings.h b/sensors/ov2710/private_include/ov2710_settings.h
+--- a/sensors/ov2710/private_include/ov2710_settings.h
++++ b/sensors/ov2710/private_include/ov2710_settings.h
+@@ -20,6 +20,8 @@ extern "C" {
+ 
+ #include "ov2710_mipi_1lane_24Minput_1280x720_raw10_25fps.h"
+ 
++#include "ov2710_mipi_1lane_24Minput_720x720_raw10_25fps.h"
++
+ #include "ov2710_mipi_1lane_24Minput_1920x1080_raw10_25fps.h"
+ 
+ #ifdef __cplusplus

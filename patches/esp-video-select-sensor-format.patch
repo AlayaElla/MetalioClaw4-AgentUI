@@ -1,0 +1,40 @@
+diff --git a/src/device/esp_video_device_common.c b/src/device/esp_video_device_common.c
+--- a/src/device/esp_video_device_common.c
++++ b/src/device/esp_video_device_common.c
+@@ -443,10 +443,34 @@ static esp_err_t common_video_set_sensor_format(struct esp_video *video, const e
+ {
+     esp_err_t ret = ESP_OK;
+     esp_video_device_common_t *common = VIDEO_DEVICE_COMMON(video);
++    const esp_cam_sensor_format_t *selected_format = format;
+ 
+-    ESP_RETURN_ON_ERROR(esp_cam_sensor_set_format(common->cam.sensor, format), TAG, "failed to set sensor format");
+-    ESP_RETURN_ON_ERROR(update_format_config(common, format), TAG, "failed to initialize sensor format");
++    if (format && !format->regs) {
++        esp_cam_sensor_format_array_t supported_formats = {0};
++        ESP_RETURN_ON_ERROR(
++            esp_cam_sensor_query_format(common->cam.sensor, &supported_formats),
++            TAG, "failed to query sensor formats");
++        selected_format = NULL;
++        for (uint32_t i = 0; i < supported_formats.count; ++i) {
++            const esp_cam_sensor_format_t *candidate =
++                &supported_formats.format_array[i];
++            if (candidate->width == format->width &&
++                    candidate->height == format->height &&
++                    candidate->format == format->format &&
++                    (!format->fps || candidate->fps == format->fps)) {
++                selected_format = candidate;
++                break;
++            }
++        }
++        ESP_RETURN_ON_FALSE(
++            selected_format, ESP_ERR_NOT_FOUND, TAG,
++            "sensor format %ux%u format=%d fps=%u is unavailable",
++            format->width, format->height, format->format, format->fps);
++    }
++
++    ESP_RETURN_ON_ERROR(esp_cam_sensor_set_format(common->cam.sensor, selected_format), TAG, "failed to set sensor format");
++    ESP_RETURN_ON_ERROR(update_format_config(common, selected_format), TAG, "failed to initialize sensor format");
+     common->sensor_format = common->cam.sensor->cur_format;
+ 
+     return ret;
+ }

@@ -22,6 +22,14 @@ enum class ViewMode {
     Viewer,
 };
 
+enum class EffectStyle : uint8_t {
+    Original,
+    Mosaic,
+    PrintComic,
+    Ascii,
+    BlackWhite,
+};
+
 struct GalleryPhoto {
     std::string name;
     std::string path;
@@ -69,12 +77,15 @@ enum class IntentType {
     NavigateBack,
     LoadThumbnail,
     PreviewDrawn,
+    SetEffect,
 };
 
 struct Intent {
     IntentType type = IntentType::NavigateBack;
     std::size_t index = 0;
     int buffer_index = -1;
+    EffectStyle effect_style = EffectStyle::Original;
+    bool dark_mode = false;
 
     static Intent Capture() { return {.type = IntentType::Capture}; }
     static Intent DeleteReview() { return {.type = IntentType::DeleteReview}; }
@@ -93,6 +104,13 @@ struct Intent {
     static Intent PreviewDrawn(int value) {
         return {.type = IntentType::PreviewDrawn, .buffer_index = value};
     }
+    static Intent SetEffect(EffectStyle style, bool dark) {
+        return {
+            .type = IntentType::SetEffect,
+            .effect_style = style,
+            .dark_mode = dark,
+        };
+    }
 };
 
 enum class CommandType {
@@ -106,6 +124,7 @@ enum class CommandType {
     DeleteViewer,
     LoadThumbnail,
     PreviewDrawn,
+    SetEffect,
 };
 
 struct Command {
@@ -113,6 +132,8 @@ struct Command {
     uint32_t generation = 0;
     std::size_t index = 0;
     int buffer_index = -1;
+    EffectStyle effect_style = EffectStyle::Original;
+    bool dark_mode = false;
     std::string path;
 };
 

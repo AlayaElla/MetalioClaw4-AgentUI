@@ -20,6 +20,8 @@ struct ViewState {
     bool gallery_loading = false;
     bool gallery_available = false;
     bool viewer_loading = false;
+    EffectStyle effect_style = EffectStyle::Original;
+    bool effect_dark_mode = false;
     uint32_t generation = 0;
     StatusCode status_code = StatusCode::None;
     std::string status;
@@ -37,7 +39,10 @@ struct ViewState {
                review_ready == other.review_ready && saving == other.saving &&
                gallery_loading == other.gallery_loading &&
                gallery_available == other.gallery_available &&
-               viewer_loading == other.viewer_loading && generation == other.generation &&
+               viewer_loading == other.viewer_loading &&
+               effect_style == other.effect_style &&
+               effect_dark_mode == other.effect_dark_mode &&
+               generation == other.generation &&
                status_code == other.status_code &&
                status == other.status && gallery == other.gallery &&
                thumbnails == other.thumbnails &&
