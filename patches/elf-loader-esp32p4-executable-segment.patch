@@ -1,0 +1,40 @@
+diff --git a/managed_components/espressif__elf_loader/src/esp_elf_adapter.c b/managed_components/espressif__elf_loader/src/esp_elf_adapter.c
+--- a/managed_components/espressif__elf_loader/src/esp_elf_adapter.c
++++ b/managed_components/espressif__elf_loader/src/esp_elf_adapter.c
+@@ -11,0 +12 @@
++#include "esp_log.h"
+@@ -23,0 +25,6 @@
++#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_ESP_SYSTEM_MEMPROT
++#define ESP_ELF_EXEC_ARENA_SIZE (32U * 1024U)
++static uint8_t s_exec_arena[ESP_ELF_EXEC_ARENA_SIZE]
++    __attribute__((aligned(128)));
++static bool s_exec_arena_in_use;
++#endif
+@@ -34,0 +42,15 @@ void *esp_elf_malloc(uint32_t n, bool exec)
++#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_ESP_SYSTEM_MEMPROT
++    if (exec) {
++        if (s_exec_arena_in_use || n > sizeof(s_exec_arena)) {
++            ESP_LOGE("ELF", "Executable arena unavailable, requested=%u capacity=%u busy=%d",
++                     (unsigned)n, (unsigned)sizeof(s_exec_arena),
++                     s_exec_arena_in_use);
++            return NULL;
++        }
++        s_exec_arena_in_use = true;
++        ESP_LOGI("ELF", "Using reserved executable arena: %u/%u bytes",
++                 (unsigned)n, (unsigned)sizeof(s_exec_arena));
++        return s_exec_arena;
++    }
++#endif
++
+@@ -51 +73,3 @@ void *esp_elf_malloc(uint32_t n, bool exec)
+-    caps = MALLOC_CAP_8BIT;
++    /* ESP32-P4 can execute from internal L2 RAM at the same bus address. */
++    caps = exec ? (MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL)
++                : MALLOC_CAP_8BIT;
+@@ -69,0 +94,6 @@ void esp_elf_free(void *ptr)
++#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_ESP_SYSTEM_MEMPROT
++    if (ptr == s_exec_arena) {
++        s_exec_arena_in_use = false;
++        return;
++    }
++#endif

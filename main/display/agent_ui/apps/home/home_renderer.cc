@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <esp_timer.h>
 #include <font_awesome.h>
@@ -18,6 +19,7 @@
 #include "components/expression_player.h"
 #include "components/haptic_feedback.h"
 #include "components/ui_components.h"
+#include "external_app_manager.h"
 #include "core/fonts.h"
 #include "core/idle_power.h"
 #include "core/navigation.h"
@@ -194,18 +196,32 @@ std::string FormatConversationText(const char* text) {
 
 struct AppDefinition {
     ScreenId id;
-    const char* number;
-    const char* name;
+    std::string number;
+    std::string name;
+    std::string external_id;
     bool requires_network;
 };
 
-constexpr std::array<AppDefinition, 5> kApps = {{
-    {ScreenId::Codex, "01", "Codex", true},
-    {ScreenId::Phone, "02", "电话", false},
-    {ScreenId::Files, "03", "文件", false},
-    {ScreenId::Camera, "04", "相机", false},
-    {ScreenId::Settings, "05", "设置", false},
+const std::array<AppDefinition, 5> kBuiltInApps = {{
+    {ScreenId::Codex, "01", "Codex", "", true},
+    {ScreenId::Phone, "02", "电话", "", false},
+    {ScreenId::Files, "03", "文件", "", false},
+    {ScreenId::Camera, "04", "相机", "", false},
+    {ScreenId::Settings, "05", "设置", "", false},
 }};
+
+std::vector<AppDefinition> BuildAppDefinitions() {
+    std::vector<AppDefinition> definitions(kBuiltInApps.begin(), kBuiltInApps.end());
+    const auto& external = external_apps::Manager::Get().apps();
+    definitions.reserve(definitions.size() + external.size());
+    for (const external_apps::AppInfo& app : external) {
+        std::string number = std::to_string(definitions.size() + 1);
+        if (number.size() < 2) number.insert(number.begin(), '0');
+        definitions.push_back(
+            {ScreenId::ExternalAppHost, number, app.name, app.id, false});
+    }
+    return definitions;
+}
 
 struct ArcItem {
     lv_obj_t* button = nullptr;
@@ -239,8 +255,9 @@ struct HomeState {
     lv_draw_buf_t* carousel_snapshot = nullptr;
     lv_draw_buf_t* left_fade_mask = nullptr;
     lv_draw_buf_t* right_fade_mask = nullptr;
-    std::array<ArcItem, kApps.size()> apps{};
-    std::array<lv_obj_t*, kApps.size()> half_detents{};
+    std::vector<AppDefinition> app_definitions;
+    std::vector<ArcItem> apps;
+    std::vector<lv_obj_t*> half_detents;
     ExpressionPlayer* expression = nullptr;
     lv_timer_t* motion_timer = nullptr;
     lv_timer_t* message_timer = nullptr;
@@ -305,7 +322,7 @@ ParallaxLayer* FindParallaxLayer(lv_obj_t* object) {
 }
 
 bool RequiresNetwork(ScreenId screen) {
-    for (const auto& app : kApps) {
+    for (const auto& app : kBuiltInApps) {
         if (app.id == screen) return app.requires_network;
     }
     return false;
@@ -707,22 +724,24 @@ void CacheSettledCarousel(HomeState* state) {
 #endif
 }
 
-int WrapIndex(int index) {
-    const int count = static_cast<int>(kApps.size());
+int WrapIndex(const HomeState* state, int index) {
+    const int count = state == nullptr ? 0 : static_cast<int>(state->apps.size());
+    if (count == 0) return 0;
     index %= count;
     return index < 0 ? index + count : index;
 }
 
-int CircularDistance(int index, int focused_index) {
-    const int count = static_cast<int>(kApps.size());
-    int distance = WrapIndex(index - focused_index);
+int CircularDistance(const HomeState* state, int index, int focused_index) {
+    const int count = state == nullptr ? 0 : static_cast<int>(state->apps.size());
+    if (count == 0) return 0;
+    int distance = WrapIndex(state, index - focused_index);
     if (distance > count / 2) distance -= count;
     return distance;
 }
 
 void ApplyFocus(HomeState* state, int focused_index) {
     if (state == nullptr) return;
-    state->focused_index = WrapIndex(focused_index);
+    state->focused_index = WrapIndex(state, focused_index);
     const auto& colors = Theme::Get().colors();
     for (size_t index = 0; index < state->apps.size(); ++index) {
         ArcItem& item = state->apps[index];
@@ -739,7 +758,7 @@ void ApplyCarouselGeometry(HomeState* state) {
     if (state == nullptr || state->carousel == nullptr) return;
     for (size_t index = 0; index < state->apps.size(); ++index) {
         ArcItem& item = state->apps[index];
-        const int order = CircularDistance(static_cast<int>(index),
+        const int order = CircularDistance(state, static_cast<int>(index),
                                            state->focused_index);
         const int x = kCarouselFocusX + order * kCarouselStep +
                       static_cast<int>(std::lround(state->carousel_offset));
@@ -753,7 +772,7 @@ void ApplyCarouselGeometry(HomeState* state) {
     }
     for (size_t index = 0; index < state->half_detents.size(); ++index) {
         const int leading_order = CircularDistance(
-            static_cast<int>(index), state->focused_index);
+            state, static_cast<int>(index), state->focused_index);
         const int leading_center_x =
             kCarouselCenterX + leading_order * kCarouselStep +
             static_cast<int>(std::lround(state->carousel_offset));
@@ -1174,8 +1193,14 @@ void OnOpenApp(lv_event_t* event) {
         return;
     }
     PlayHaptic(HapticStrength::Medium);
-    const auto value = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target));
-    const ScreenId screen = static_cast<ScreenId>(value);
+    const size_t index = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(target));
+    if (index >= state->app_definitions.size()) return;
+    const AppDefinition& app = state->app_definitions[index];
+    if (!app.external_id.empty() &&
+        !external_apps::Manager::Get().Select(app.external_id)) {
+        return;
+    }
+    const ScreenId screen = app.id;
     if (state->expression != nullptr &&
         (state->expression->IsSleeping() || state->expression->IsWaking())) {
         state->pending_screen = screen;
@@ -1244,7 +1269,7 @@ void OnDelete(lv_event_t* event) {
 }
 
 ArcItem CreateArcItem(lv_obj_t* parent, const AppDefinition& app,
-                      HomeState* state) {
+                      size_t app_index, HomeState* state) {
     const auto& colors = Theme::Get().colors();
     ArcItem item;
     item.button = lv_button_create(parent);
@@ -1256,8 +1281,7 @@ ArcItem CreateArcItem(lv_obj_t* parent, const AppDefinition& app,
     lv_obj_set_style_shadow_width(item.button, 0, LV_PART_MAIN);
     lv_obj_set_style_transform_pivot_x(item.button, 12, LV_PART_MAIN);
     lv_obj_set_style_transform_pivot_y(item.button, 0, LV_PART_MAIN);
-    lv_obj_set_user_data(
-        item.button, reinterpret_cast<void*>(static_cast<uintptr_t>(app.id)));
+    lv_obj_set_user_data(item.button, reinterpret_cast<void*>(app_index));
     lv_obj_add_event_cb(item.button, OnCarouselPressed, LV_EVENT_PRESSED, state);
     lv_obj_add_event_cb(item.button, OnCarouselPressing, LV_EVENT_PRESSING, state);
     lv_obj_add_event_cb(item.button, OnCarouselReleased, LV_EVENT_RELEASED, state);
@@ -1272,13 +1296,13 @@ ArcItem CreateArcItem(lv_obj_t* parent, const AppDefinition& app,
     lv_obj_set_style_bg_opa(item.rule, LV_OPA_COVER, LV_PART_MAIN);
 
     item.number = lv_label_create(item.button);
-    lv_label_set_text(item.number, app.number);
+    lv_label_set_text(item.number, app.number.c_str());
     lv_obj_set_style_text_font(item.number, fonts::Large(), LV_PART_MAIN);
     lv_obj_set_style_text_color(item.number, lv_color_hex(colors.text), LV_PART_MAIN);
     lv_obj_set_pos(item.number, 8, 13);
 
     item.name = lv_label_create(item.button);
-    lv_label_set_text(item.name, app.name);
+    lv_label_set_text(item.name, app.name.c_str());
     lv_obj_set_style_text_font(item.name, fonts::MediumBold(), LV_PART_MAIN);
     lv_obj_set_style_text_color(item.name, lv_color_hex(colors.text), LV_PART_MAIN);
     lv_obj_set_pos(item.name, 8, 78);
@@ -1310,6 +1334,9 @@ lv_obj_t* Renderer::Create(RendererActions actions) {
     const auto& colors = Theme::Get().colors();
     auto* state = new HomeState{};
     state->actions = std::move(actions);
+    state->app_definitions = BuildAppDefinitions();
+    state->apps.resize(state->app_definitions.size());
+    state->half_detents.resize(state->app_definitions.size());
     s_state = state;
 
     state->root = lv_obj_create(nullptr);
@@ -1407,11 +1434,12 @@ lv_obj_t* Renderer::Create(RendererActions actions) {
     lv_obj_remove_flag(track, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(track, LV_OBJ_FLAG_CLICKABLE);
 
-    for (size_t index = 0; index < kApps.size(); ++index) {
+    for (size_t index = 0; index < state->app_definitions.size(); ++index) {
         state->half_detents[index] = CreateHalfDetent(track);
     }
-    for (size_t index = 0; index < kApps.size(); ++index) {
-        state->apps[index] = CreateArcItem(track, kApps[index], state);
+    for (size_t index = 0; index < state->app_definitions.size(); ++index) {
+        state->apps[index] =
+            CreateArcItem(track, state->app_definitions[index], index, state);
     }
 
     state->left_fade = CreateFadeMask(state, true);

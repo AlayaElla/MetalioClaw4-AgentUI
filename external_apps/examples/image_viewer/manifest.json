@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "id": "com.metalio.image-viewer",
+  "name": "图片查看器",
+  "version": "0.1.1",
+  "api_version": 1,
+  "target": "esp32p4",
+  "entry": "elf/esp32p4.elf",
+  "icon": "assets/demo.png"
+}

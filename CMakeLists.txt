@@ -15,11 +15,52 @@ add_compile_options(-Wno-missing-field-initializers)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(agent)
 
+# elf_loader 1.3.2 drops the executable allocation capability on ESP32-P4's
+# unified segment path. Runtime heap fragmentation can also exhaust the
+# contiguous executable heap even for small apps. Apply a narrow P4 allocator
+# patch that keeps one reusable 32 KiB internal executable arena after managed
+# dependencies are restored.
+find_package(Git QUIET)
+set(ELF_LOADER_DIR
+    "${CMAKE_SOURCE_DIR}/managed_components/espressif__elf_loader")
+set(ELF_LOADER_EXEC_PATCH
+    "${CMAKE_SOURCE_DIR}/patches/elf-loader-esp32p4-executable-segment.patch")
+if(GIT_FOUND AND EXISTS "${ELF_LOADER_DIR}/src/esp_elf_adapter.c" AND
+   EXISTS "${ELF_LOADER_EXEC_PATCH}")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero --check
+                "${ELF_LOADER_EXEC_PATCH}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE ELF_LOADER_PATCH_NEEDED
+        OUTPUT_QUIET ERROR_QUIET)
+    if(ELF_LOADER_PATCH_NEEDED EQUAL 0)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero
+                    "${ELF_LOADER_EXEC_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE ELF_LOADER_PATCH_RESULT)
+        if(NOT ELF_LOADER_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to patch ELF loader executable segment allocation")
+        endif()
+    else()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero --reverse --check
+                    "${ELF_LOADER_EXEC_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE ELF_LOADER_PATCH_ALREADY_APPLIED
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT ELF_LOADER_PATCH_ALREADY_APPLIED EQUAL 0)
+            message(FATAL_ERROR
+                "ELF loader sources do not match the tested ESP32-P4 patch")
+        endif()
+    endif()
+endif()
+
 # The Dashboard login response uses more than one Set-Cookie header. Keep the
 # small esp-ml307 transport extension reproducible even though managed_components
 # is intentionally not committed. The component manager may restore the pristine
 # dependency during reconfigure, so apply the patch idempotently after project().
-find_package(Git QUIET)
 set(ESP_ML307_DIR "${CMAKE_SOURCE_DIR}/managed_components/78__esp-ml307")
 set(ESP_ML307_HEADERS_PATCH
     "${CMAKE_SOURCE_DIR}/patches/esp-ml307-multi-response-headers.patch")

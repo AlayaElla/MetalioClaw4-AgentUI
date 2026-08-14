@@ -1,6 +1,7 @@
 #include "agent_ui_runtime.h"
 
 #include <array>
+#include <string>
 
 #include <esp_random.h>
 #include <esp_log.h>
@@ -8,6 +9,8 @@
 #include "agent_ui/apps/camera/camera_module.h"
 #include "agent_ui/apps/codex/codex_view.h"
 #include "agent_ui/apps/display_debug/display_debug_view.h"
+#include "agent_ui/apps/external_apps/external_apps_view.h"
+#include "agent_ui/apps/external_apps/external_app_manager.h"
 #include "agent_ui/apps/files/files_view.h"
 #include "agent_ui/apps/phone/phone_view.h"
 #include "agent_ui/apps/settings/settings_view.h"
@@ -64,6 +67,8 @@ void Runtime::Initialize() {
     Navigation::Get().Register(ScreenId::Phone, PhoneView::Create);
     Navigation::Get().Register(ScreenId::Files, FilesView::Create);
     Navigation::Get().Register(ScreenId::Settings, SettingsView::Create);
+    Navigation::Get().Register(ScreenId::ExternalAppHost,
+                               external_apps::HostView::Create);
     Navigation::Get().Register(ScreenId::DisplayDebug, DisplayDebugView::Create);
     UiDispatcher::Init();
     RegisterAppMcpTools();
@@ -93,6 +98,11 @@ void Runtime::OnBoardReady(Board& board) {
 }
 
 void Runtime::Start() {
+    std::string external_apps_error;
+    if (!external_apps::Manager::Get().Refresh(&external_apps_error)) {
+        ESP_LOGW(kTag, "External app discovery failed: %s",
+                 external_apps_error.c_str());
+    }
     Navigation::Get().Start();
 }
 

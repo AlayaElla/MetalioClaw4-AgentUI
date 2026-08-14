@@ -14,6 +14,8 @@ set(AGENT_UI_SOURCES
     "display/agent_ui/components/expression_acceleration.cc"
     "display/agent_ui/components/expression_player.cc"
     "display/agent_ui/components/haptic_feedback.cc"
+    "display/agent_ui/components/pet_animation.cc"
+    "display/agent_ui/components/pet_renderer.cc"
     "display/agent_ui/components/system_keyboard.cc"
 )
 
@@ -28,6 +30,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/apps/boot/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/camera/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/codex/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/display_debug/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/apps/external_apps/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/files/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/home/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/apps/network/sources.cmake")

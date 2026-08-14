@@ -2,6 +2,8 @@
 /build/
 /managed_components/
 **/build/
+/external_apps/examples/*/managed_components/
+/external_apps/examples/*/sdkconfig
 **/__pycache__/
 *.py[cod]
 *.elf
@@ -14,6 +16,7 @@
 /sd_images/
 /esp_claw_bin/
 /images/
+/design/agent/
 /main/factory-test-assets/
 /main/xingzhi-assets/
 /main/assets/locales/**/*.ogg

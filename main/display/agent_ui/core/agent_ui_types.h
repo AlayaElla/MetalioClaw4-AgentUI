@@ -11,6 +11,7 @@ enum class ScreenId : uint8_t {
     Phone,
     Files,
     Settings,
+    ExternalAppHost,
     DisplayDebug,
     Boot,
     Standby,
