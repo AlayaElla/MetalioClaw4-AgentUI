@@ -33,6 +33,7 @@ constexpr uint8_t REG_STATUS1    = 0x1E;
 constexpr uint8_t REG_UNLOCK     = 0x70;
 
 constexpr int I2C_TIMEOUT_MS = 100;
+constexpr uint32_t I2C_SPEED_HZ = 100 * 1000;
 
 i2c_master_dev_handle_t s_dev = nullptr;
 SemaphoreHandle_t s_lock = nullptr;
@@ -186,7 +187,11 @@ esp_err_t cx25601n_init(i2c_master_bus_handle_t bus)
     i2c_device_config_t dev_cfg = {};
     dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     dev_cfg.device_address = CX25601N_I2C_ADDR;
-    dev_cfg.scl_speed_hz = 400000;
+    // This charger shares GPIO 7/8 with the TCA9555, GT911 and battery gauge.
+    // Keep every client at the board-safe 100 kHz rate; 400 kHz is unreliable
+    // on this bus when the battery is deeply discharged or the rails are still
+    // rising.
+    dev_cfg.scl_speed_hz = I2C_SPEED_HZ;
 
     esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &s_dev);
     if (err != ESP_OK) {

@@ -43,11 +43,10 @@ void OnLong() {
 void PowerKey::Initialize() {
     if (s_initialized) return;
     auto& io = IOExpander::getInstance();
-    const esp_err_t click = io.onClick(IOExpander::Pin::PWR_KEY, OnShort);
-    const esp_err_t hold = io.onLongPress(IOExpander::Pin::PWR_KEY, kLongPressMs,
-                                          OnLong);
-    if (click != ESP_OK || hold != ESP_OK) {
-        ESP_LOGE(kTag, "Power key registration failed: click=%d hold=%d", click, hold);
+    const esp_err_t result = io.onShortOrLongPress(
+        IOExpander::Pin::PWR_KEY, kLongPressMs, OnShort, OnLong);
+    if (result != ESP_OK) {
+        ESP_LOGE(kTag, "Power key registration failed: %d", result);
         return;
     }
     s_initialized = true;

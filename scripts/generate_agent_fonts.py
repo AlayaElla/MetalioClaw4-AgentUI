@@ -2,9 +2,10 @@
 """Generate the Agent UI LVGL font assets.
 
 The browser demo uses Microsoft YaHei UI first, so the firmware uses the same
-regular and bold faces. The large bold AI conversation font includes GB2312;
-less critical bold faces stay limited to UI copy so the application remains
-inside the flash partition.
+regular and bold faces. Regular UI text and the small/large bold faces include
+GB2312; medium bold stays limited to current UI copy. Shared Segoe UI Emoji
+fallback fonts provide monochrome emoji at each UI text size without
+duplicating the same glyph bitmaps for both weights.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from fontTools.ttLib import TTCollection
+from fontTools.ttLib import TTCollection, TTFont
 
 
 ASCII_RANGE = "0x20-0x7e"
@@ -59,6 +60,12 @@ def collect_literal_characters(paths: list[Path]) -> str:
     return "".join(sorted(characters, key=ord))
 
 
+def collect_font_characters(source: Path) -> str:
+    font = TTFont(source)
+    cmap = font.getBestCmap() or {}
+    return "".join(chr(codepoint) for codepoint in sorted(cmap) if codepoint > 0x7E)
+
+
 def extract_collection_face(source: Path, index: int, output: Path) -> Path:
     if source.suffix.lower() not in {".ttc", ".otc"}:
         return source
@@ -78,6 +85,8 @@ def run_converter(
     symbols: str,
     bpp: int = 4,
     compress: bool = False,
+    use_color_info: bool = False,
+    include_ascii: bool = True,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -96,18 +105,21 @@ def run_converter(
         str(bpp),
         "--size",
         str(size),
-        "--range",
-        ASCII_RANGE,
-        "--symbols",
-        symbols,
+    ]
+    if include_ascii:
+        command.extend(("--range", ASCII_RANGE))
+    command.extend((
+        "--symbols", symbols,
         "--no-prefilter",
         "--no-kerning",
-        "--output",
-        str(output),
-    ]
+        "--output", str(output),
+    ))
     if not compress:
         command.append("--no-compress")
+    if use_color_info:
+        command.append("--use-color-info")
     subprocess.run(command, check=True)
+    output.write_bytes(output.read_bytes().rstrip(b"\r\n") + b"\n")
     print(f"{name}: {output.stat().st_size} bytes")
 
 
@@ -126,6 +138,11 @@ def main() -> None:
         default=Path(r"C:\Windows\Fonts\msyhbd.ttc"),
     )
     parser.add_argument(
+        "--emoji-font",
+        type=Path,
+        default=Path(r"C:\Windows\Fonts\seguiemj.ttf"),
+    )
+    parser.add_argument(
         "--collection-index",
         type=int,
         default=1,
@@ -136,8 +153,15 @@ def main() -> None:
         type=Path,
         default=project_dir / "main" / "display" / "font",
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="FONT_NAME",
+        help="generate only the named font; may be specified more than once",
+    )
     args = parser.parse_args()
-    for font in (args.regular_font, args.bold_font):
+    for font in (args.regular_font, args.bold_font, args.emoji_font):
         if not font.is_file():
             parser.error(f"font not found: {font}")
 
@@ -157,6 +181,7 @@ def main() -> None:
     display_symbols = "".join(
         sorted({character for character in DISPLAY_TEXT if ord(character) > 0x7E}, key=ord)
     )
+    emoji_symbols = collect_font_characters(args.emoji_font)
 
     converter = shutil.which("npx.cmd") or shutil.which("npx")
     if converter is None:
@@ -175,21 +200,33 @@ def main() -> None:
             parser.error(str(error))
 
         outputs = (
-            (regular_font, "font_agent_small_18", 18, body_symbols, 4, False),
-            (regular_font, "font_agent_medium_28", 28, body_symbols, 4, False),
-            (regular_font, "font_agent_large_56", 56, display_symbols, 4, False),
-            (bold_font, "font_agent_small_bold_18", 18, ui_symbols, 4, False),
-            (bold_font, "font_agent_medium_bold_28", 28, ui_symbols, 4, False),
-            (bold_font, "font_agent_large_bold_56", 56, body_symbols, 2, True),
+            (regular_font, "font_agent_small_18", 18, body_symbols, 3, True, False),
+            (regular_font, "font_agent_medium_28", 28, body_symbols, 3, True, False),
+            (regular_font, "font_agent_large_56", 56, display_symbols, 4, False, False),
+            (bold_font, "font_agent_small_bold_18", 18, body_symbols, 3, True, False),
+            # MediumBold is used by headings plus several runtime values. Keep
+            # all static Agent UI copy bold; unknown dynamic text falls through
+            # Medium() to the complete regular and emoji fonts.
+            (bold_font, "font_agent_medium_bold_28", 28, ui_symbols, 4, False, False),
+            (bold_font, "font_agent_large_bold_56", 56, body_symbols, 2, True, False),
             # Home carousel text is authored at its largest on-screen size.
             # LVGL then only scales it down during carousel motion, avoiding
             # the jagged 1.25x enlargement of the 56/28 px bitmap fonts.
             (bold_font, "font_agent_home_name_bold_35", 35,
-             "0123456789Codex电话文件相机设置", 4, False),
+             "0123456789Codex电话文件相机设置", 4, False, False),
             (bold_font, "font_agent_home_number_bold_70", 70,
-             "0123456789", 4, False),
+             "0123456789", 4, False, False),
+            (args.emoji_font, "font_agent_emoji_18", 18, emoji_symbols, 3, True, True),
+            (args.emoji_font, "font_agent_emoji_28", 28, emoji_symbols, 3, True, True),
+            (args.emoji_font, "font_agent_emoji_56", 56, emoji_symbols, 2, True, True),
         )
-        for font, name, size, symbols, bpp, compress in outputs:
+        output_names = {output[1] for output in outputs}
+        unknown_names = set(args.only) - output_names
+        if unknown_names:
+            parser.error(f"unknown font name(s): {', '.join(sorted(unknown_names))}")
+        for font, name, size, symbols, bpp, compress, use_color_info in outputs:
+            if args.only and name not in args.only:
+                continue
             run_converter(
                 converter,
                 font,
@@ -199,6 +236,8 @@ def main() -> None:
                 symbols,
                 bpp,
                 compress,
+                use_color_info,
+                not use_color_info,
             )
 
 

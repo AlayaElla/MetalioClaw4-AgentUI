@@ -98,7 +98,12 @@ void Keyboard::FocusCallback(lv_event_t* event) {
 
 void Keyboard::KeyboardCallback(lv_event_t* event) {
     auto* self = static_cast<Keyboard*>(lv_event_get_user_data(event));
-    if (self != nullptr) self->Hide();
+    if (self == nullptr) return;
+    if (lv_event_get_code(event) == LV_EVENT_READY && self->keyboard_ != nullptr) {
+        lv_obj_t* textarea = lv_keyboard_get_textarea(self->keyboard_);
+        if (textarea != nullptr) lv_obj_send_event(textarea, LV_EVENT_READY, nullptr);
+    }
+    self->Hide();
 }
 
 void Keyboard::KeyPressedCallback(lv_event_t*) {

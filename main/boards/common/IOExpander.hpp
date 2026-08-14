@@ -364,6 +364,54 @@ public:
     using ClickCallback     = std::function<void()>;
     using LongPressCallback = std::function<void()>;
 
+    // Register one mutually-exclusive short/long press state machine.
+    // The press is captured as soon as the active level is sampled. Releasing
+    // before long_press_ms fires short_callback; remaining pressed through the
+    // threshold fires long_callback once and suppresses the later short press.
+    esp_err_t onShortOrLongPress(Pin pin,
+                                 uint32_t long_press_ms,
+                                 ClickCallback short_callback,
+                                 LongPressCallback long_callback,
+                                 bool pressed_level = false) {
+        if (!short_callback || !long_callback || long_press_ms == 0) {
+            ESP_LOGE(TAG, "onShortOrLongPress: invalid callback or threshold");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const PinSlot* slot = lookupSlot(pin);
+        if (slot == nullptr) {
+            ESP_LOGE(TAG, "onShortOrLongPress: pin '%s' is not in pin map",
+                     PinName(pin));
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (slot->direction != Direction::kInput) {
+            ESP_LOGE(TAG,
+                     "onShortOrLongPress: pin '%s' is not configured as input",
+                     PinName(pin));
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(handlers_mutex_);
+            press_handlers_.push_back(PressHandler{
+                pin,
+                pressed_level,
+                long_press_ms,
+                std::move(short_callback),
+                std::move(long_callback),
+                /*was_pressed*/false,
+                /*press_start_us*/0,
+                /*long_fired*/false,
+            });
+            ensureMonitorTaskStartedLocked();
+        }
+
+        ESP_LOGI(TAG,
+                 "onShortOrLongPress: armed pin '%s' threshold=%u ms (active=%s)",
+                 PinName(pin), (unsigned)long_press_ms,
+                 pressed_level ? "high" : "low");
+        return ESP_OK;
+    }
+
     esp_err_t onClick(Pin pin,
                       ClickCallback callback,
                       bool pressed_level = false,
@@ -675,6 +723,17 @@ private:
         bool              fired;
     };
 
+    struct PressHandler {
+        Pin               pin;
+        bool              pressed_level;
+        uint32_t          long_press_ms;
+        ClickCallback     short_callback;
+        LongPressCallback long_callback;
+        bool              was_pressed;
+        int64_t           press_start_us;
+        bool              long_fired;
+    };
+
     // Caller must hold handlers_mutex_.
     void ensureMonitorTaskStartedLocked() {
         if (monitor_task_handle_ != nullptr) return;
@@ -727,6 +786,39 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(handlers_mutex_);
+                for (auto& h : press_handlers_) {
+                    bool level = false;
+                    if (!read_once(h.pin, &level)) {
+                        continue;
+                    }
+                    const bool is_pressed = (level == h.pressed_level);
+
+                    if (is_pressed && !h.was_pressed) {
+                        h.press_start_us = now_us;
+                        h.long_fired = false;
+                        ESP_LOGI(TAG, "Press detected on pin '%s'", PinName(h.pin));
+                    } else if (is_pressed && !h.long_fired) {
+                        const int64_t held_ms =
+                            (now_us - h.press_start_us) / 1000;
+                        if (held_ms >= static_cast<int64_t>(h.long_press_ms)) {
+                            pending.push_back(h.long_callback);
+                            h.long_fired = true;
+                        }
+                    } else if (!is_pressed && h.was_pressed && !h.long_fired) {
+                        const int64_t held_ms =
+                            (now_us - h.press_start_us) / 1000;
+                        if (held_ms >= static_cast<int64_t>(h.long_press_ms)) {
+                            // A read may have failed exactly when the threshold
+                            // was crossed. Preserve the mutually-exclusive
+                            // classification when release is observed later.
+                            pending.push_back(h.long_callback);
+                            h.long_fired = true;
+                        } else {
+                            pending.push_back(h.short_callback);
+                        }
+                    }
+                    h.was_pressed = is_pressed;
+                }
                 for (auto& h : click_handlers_) {
                     bool level = false;
                     if (!read_once(h.pin, &level)) {
@@ -787,6 +879,7 @@ private:
     bool                          initialized_         = false;
 
     std::mutex                    handlers_mutex_;
+    std::vector<PressHandler>     press_handlers_;
     std::vector<ClickHandler>     click_handlers_;
     std::vector<LongPressHandler> handlers_;
     TaskHandle_t                  monitor_task_handle_ = nullptr;
