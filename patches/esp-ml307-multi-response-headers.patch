@@ -1,0 +1,124 @@
+diff --git a/include/http.h b/include/http.h
+index a74d66c..58d1f34 100644
+--- a/include/http.h
++++ b/include/http.h
+@@ -4,6 +4,7 @@
+ #include <string>
+ #include <map>
+ #include <functional>
++#include <vector>
+ 
+ class Http {
+ public:
+@@ -39,5 +40,9 @@ public:
+     // 获取指定 key 的 HTTP 响应头
+     virtual std::string GetResponseHeader(const std::string& key) const = 0;
+ 
++    // Return every response header value with this name. This is required for
++    // standards-compliant handling of repeated fields such as Set-Cookie.
++    virtual std::vector<std::string> GetResponseHeaders(const std::string& key) const = 0;
++
+     // 获取 HTTP 响应体长度
+     virtual size_t GetBodyLength() = 0;
+diff --git a/include/http_client.h b/include/http_client.h
+index 8f9a9c1..2a210bf 100644
+--- a/include/http_client.h
++++ b/include/http_client.h
+@@ -42,6 +42,7 @@ public:
+ 
+     int GetStatusCode() override;
+     std::string GetResponseHeader(const std::string& key) const override;
++    std::vector<std::string> GetResponseHeaders(const std::string& key) const override;
+     size_t GetBodyLength() override;
+     std::string ReadAll() override;
+     int GetLastError() override;
+@@ -109,6 +110,7 @@ private:
+     int port_ = 80;
+     std::optional<std::string> content_ = std::nullopt;
+     std::map<std::string, HeaderEntry> response_headers_;  // key为小写，用于快速查找
++    std::multimap<std::string, std::string> repeated_response_headers_;
+     
+     // 移除原来的 body_ 变量，现在使用 body_chunks_ 队列
+     size_t body_offset_ = 0;
+diff --git a/src/http_client.cc b/src/http_client.cc
+index 4b9bc0d..b8e2598 100644
+--- a/src/http_client.cc
++++ b/src/http_client.cc
+@@ -487,6 +487,7 @@ bool HttpClient::ParseHeaderLine(const std::string& line) {
+     std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
+ 
+     response_headers_[lower_key] = HeaderEntry(key, value);
++    repeated_response_headers_.emplace(lower_key, value);
+ 
+     return true;
+ }
+@@ -696,6 +697,15 @@ std::string HttpClient::GetResponseHeader(const std::string& key) const {
+     return "";
+ }
+ 
++std::vector<std::string> HttpClient::GetResponseHeaders(const std::string& key) const {
++    std::string lower_key = key;
++    std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(), ::tolower);
++    std::vector<std::string> values;
++    const auto [first, last] = repeated_response_headers_.equal_range(lower_key);
++    for (auto it = first; it != last; ++it) values.push_back(it->second);
++    return values;
++}
++
+ size_t HttpClient::GetBodyLength() {
+     if (!headers_received_) {
+         GetStatusCode();  // 这会等待头部接收
+@@ -783,6 +793,7 @@ void HttpClient::ResetRequestState() {
+     // 重置请求状态，但保持连接
+     status_code_ = -1;
+     response_headers_.clear();
++    repeated_response_headers_.clear();
+     {
+         std::lock_guard<std::mutex> read_lock(read_mutex_);
+         body_chunks_.clear();
+diff --git a/src/ml307/ml307_http.cc b/src/ml307/ml307_http.cc
+index e37cdd7..ff3c782 100644
+--- a/src/ml307/ml307_http.cc
++++ b/src/ml307/ml307_http.cc
+@@ -166,6 +166,7 @@ void Ml307Http::ParseResponseHeaders(const std::string& headers) {
+         value.erase(value.find_last_not_of(" \t\r\n") + 1);
+         
+         response_headers_[key] = value;
++        repeated_response_headers_.emplace(key, value);
+ 
+         // 检查是否为chunked传输编码
+         if (key == "Transfer-Encoding" && value.find("chunked") != std::string::npos) {
+@@ -374,4 +375,11 @@ std::string Ml307Http::GetResponseHeader(const std::string& key) const {
+         return it->second;
+     }
+     return "";
+-}
+\ No newline at end of file
++}
++
++std::vector<std::string> Ml307Http::GetResponseHeaders(const std::string& key) const {
++    std::vector<std::string> values;
++    const auto [first, last] = repeated_response_headers_.equal_range(key);
++    for (auto it = first; it != last; ++it) values.push_back(it->second);
++    return values;
++}
+diff --git a/src/ml307/ml307_http.h b/src/ml307/ml307_http.h
+index 3908682..d8dcaef 100644
+--- a/src/ml307/ml307_http.h
++++ b/src/ml307/ml307_http.h
+@@ -34,6 +34,7 @@ public:
+ 
+     int GetStatusCode() override;
+     std::string GetResponseHeader(const std::string& key) const override;
++    std::vector<std::string> GetResponseHeaders(const std::string& key) const override;
+     size_t GetBodyLength() override;
+     std::string ReadAll() override;
+     int GetLastError() override;
+@@ -58,6 +59,7 @@ private:
+     std::string path_;
+     std::optional<std::string> content_ = std::nullopt;
+     std::map<std::string, std::string> response_headers_;
++    std::multimap<std::string, std::string> repeated_response_headers_;
+     std::string body_;
+     size_t body_offset_ = 0;
+     size_t content_length_ = 0;

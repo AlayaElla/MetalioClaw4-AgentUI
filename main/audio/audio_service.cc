@@ -66,7 +66,17 @@ void AudioService::Initialize(AudioCodec* codec) {
 #else
         listening_audio_features_.PublishActivity(0.0f, false);
 #endif
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        // This is the only point where AFE-processed 16 kHz mono frames are
+        // available.  The Hermes recorder is strictly copy-only here.
+        {
+            std::lock_guard<std::mutex> lock(processed_pcm_callback_mutex_);
+            if (processed_pcm_callback_) {
+                processed_pcm_callback_(data.data(), data.size());
+            }
+        }
+        if (network_audio_enabled_.load(std::memory_order_acquire)) {
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        }
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -152,7 +162,9 @@ void AudioService::Stop() {
         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    network_audio_generation_.fetch_add(1, std::memory_order_acq_rel);
     audio_encode_queue_.clear();
+    audio_send_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
@@ -299,8 +311,21 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        const bool is_pcm_playback = task->type == kAudioTaskTypePcmPlaybackQueue;
+        if (is_pcm_playback) pcm_playback_active_.fetch_add(1, std::memory_order_acq_rel);
         audio_queue_cv_.notify_all();
         lock.unlock();
+
+        std::unique_lock<std::mutex> pcm_output_lock(pcm_output_mutex_, std::defer_lock);
+        if (is_pcm_playback) {
+            pcm_output_lock.lock();
+            if (task->pcm_playback_generation !=
+                pcm_playback_generation_.load(std::memory_order_acquire)) {
+                pcm_playback_active_.fetch_sub(1, std::memory_order_acq_rel);
+                audio_queue_cv_.notify_all();
+                continue;
+            }
+        }
 
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
@@ -308,6 +333,10 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
+        if (is_pcm_playback) {
+            pcm_playback_active_.fetch_sub(1, std::memory_order_acq_rel);
+            audio_queue_cv_.notify_all();
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -388,8 +417,17 @@ void AudioService::OpusCodecTask() {
             if (!opus_encoder_->Encode(std::move(task->pcm), packet->payload)) {
                 ESP_LOGE(TAG, "Failed to encode audio");
                 if (task->type == kAudioTaskTypeEncodeToSendQueue) {
-                    pending_send_packets_.fetch_sub(1);
-                    if (callbacks_.on_send_queue_available) {
+                    bool notify = false;
+                    {
+                        std::lock_guard<std::mutex> queue_lock(audio_queue_mutex_);
+                        if (network_audio_enabled_.load(std::memory_order_acquire) &&
+                            task->network_audio_generation ==
+                                network_audio_generation_.load(std::memory_order_acquire)) {
+                            pending_send_packets_.fetch_sub(1);
+                            notify = true;
+                        }
+                    }
+                    if (notify && callbacks_.on_send_queue_available) {
                         callbacks_.on_send_queue_available();
                     }
                 }
@@ -402,9 +440,13 @@ void AudioService::OpusCodecTask() {
             if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                 {
                     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-                    audio_send_queue_.push_back(std::move(packet));
+                    if (network_audio_enabled_.load(std::memory_order_acquire) &&
+                        task->network_audio_generation ==
+                            network_audio_generation_.load(std::memory_order_acquire)) {
+                        audio_send_queue_.push_back(std::move(packet));
+                    }
                 }
-                if (callbacks_.on_send_queue_available) {
+                if (packet == nullptr && callbacks_.on_send_queue_available) {
                     callbacks_.on_send_queue_available();
                 }
             } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
@@ -444,6 +486,12 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     
     /* Push the task to the encode queue */
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+
+    if (type == kAudioTaskTypeEncodeToSendQueue) {
+        if (!network_audio_enabled_.load(std::memory_order_acquire)) return;
+        task->network_audio_generation =
+            network_audio_generation_.load(std::memory_order_acquire);
+    }
 
     /* If the task is to send queue, we need to set the timestamp */
     if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -487,6 +535,51 @@ void AudioService::EncodeAudio(
     }
     audio_encode_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
+}
+
+void AudioService::SetProcessedPcmCallback(
+        std::function<void(const int16_t*, size_t)> callback) {
+    std::lock_guard<std::mutex> lock(processed_pcm_callback_mutex_);
+    processed_pcm_callback_ = std::move(callback);
+}
+
+void AudioService::SetNetworkAudioEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    network_audio_enabled_.store(enabled, std::memory_order_release);
+    if (!enabled) {
+        network_audio_generation_.fetch_add(1, std::memory_order_acq_rel);
+        audio_encode_queue_.erase(std::remove_if(audio_encode_queue_.begin(),
+            audio_encode_queue_.end(), [](const std::unique_ptr<AudioTask>& task) {
+                return task->type == kAudioTaskTypeEncodeToSendQueue;
+            }), audio_encode_queue_.end());
+        audio_send_queue_.clear();
+        pending_send_packets_.store(0, std::memory_order_release);
+        audio_queue_cv_.notify_all();
+    }
+}
+
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
+                                          uint32_t playback_generation) {
+    if (pcm.empty() || pcm.size() != OPUS_FRAME_DURATION_MS * 16000 / 1000) return false;
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (playback_generation != pcm_playback_generation_.load(std::memory_order_acquire) ||
+        audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) return false;
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypePcmPlaybackQueue;
+    task->pcm_playback_generation = playback_generation;
+    task->pcm = std::move(pcm);
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
+bool AudioService::IsPcmPlaybackIdle() const {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return pcm_playback_active_.load(std::memory_order_acquire) == 0 &&
+        std::none_of(audio_playback_queue_.begin(), audio_playback_queue_.end(),
+        [](const std::unique_ptr<AudioTask>& task) {
+            return task->type == kAudioTaskTypePcmPlaybackQueue;
+        });
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
@@ -778,7 +871,12 @@ bool AudioService::IsIdle() {
 }
 
 void AudioService::ResetDecoder() {
+    // Serialize cancellation with the start of a PCM OutputData call. A frame
+    // already being written may finish, but no stale frame can start after
+    // this method returns.
+    std::lock_guard<std::mutex> output_lock(pcm_output_mutex_);
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    pcm_playback_generation_.fetch_add(1, std::memory_order_acq_rel);
     opus_decoder_->ResetState();
     timestamp_queue_.clear();
     audio_decode_queue_.clear();

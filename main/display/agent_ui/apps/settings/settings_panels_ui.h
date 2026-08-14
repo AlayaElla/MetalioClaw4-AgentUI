@@ -32,17 +32,30 @@ struct GeneralHandles {
 
 struct AiModel {
     bool wake_enabled = true;
-    bool config_refreshing = false;
+    bool hermes_selected = false;
+    const char* hermes_dashboard_url = nullptr;
+    const char* hermes_username = nullptr;
+    bool hermes_password_configured = false;
+    const char* hermes_profile = nullptr;
+    const char* hermes_test_status = nullptr;
+    const char* hermes_apply_status = nullptr;
 };
 
 struct AiCallbacks {
     lv_event_cb_t wake_changed = nullptr;
-    lv_event_cb_t config_refresh = nullptr;
+    lv_event_cb_t provider_changed = nullptr;
+    lv_event_cb_t hermes_field_committed = nullptr;
+    lv_event_cb_t hermes_save = nullptr;
+    lv_event_cb_t hermes_test = nullptr;
 };
 
 struct AiHandles {
-    lv_obj_t* config_row = nullptr;
-    lv_obj_t* config_status = nullptr;
+    lv_obj_t* hermes_dashboard_url = nullptr;
+    lv_obj_t* hermes_username = nullptr;
+    lv_obj_t* hermes_password = nullptr;
+    lv_obj_t* hermes_profile = nullptr;
+    lv_obj_t* hermes_test_status = nullptr;
+    lv_obj_t* hermes_apply_status = nullptr;
 };
 
 struct LanguageOption {

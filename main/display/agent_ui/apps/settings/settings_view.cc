@@ -5,11 +5,15 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <esp_app_desc.h>
 #include <esp_log.h>
+#include "ai_provider_config.h"
 #include "application.h"
+#include "hermes_voice_session.h"
 #include "audio_codec.h"
 #include "backlight.h"
 #include "board.h"
@@ -24,7 +28,6 @@
 #include "core/theme.h"
 #include "core/ui_utils.h"
 #include "i18n.h"
-#include "provisioning_client.h"
 #include "settings.h"
 
 namespace agent_ui {
@@ -52,12 +55,22 @@ struct UiState {
     lv_obj_t* brightness_value = nullptr;
     lv_obj_t* volume_value = nullptr;
     lv_obj_t* standby_value = nullptr;
-    lv_obj_t* config_refresh_row = nullptr;
-    lv_obj_t* config_refresh_status = nullptr;
+    lv_obj_t* hermes_dashboard_url = nullptr;
+    lv_obj_t* hermes_username = nullptr;
+    lv_obj_t* hermes_password = nullptr;
+    lv_obj_t* hermes_profile = nullptr;
+    lv_obj_t* hermes_test_status = nullptr;
+    lv_obj_t* hermes_apply_status = nullptr;
+    AiProviderConfig ai_config;
 };
 
 UiState s_ui;
-std::atomic<bool> s_config_refreshing{false};
+std::string s_hermes_test_status;
+std::string s_hermes_apply_status;
+std::atomic<bool> s_hermes_test_active{false};
+std::atomic<bool> s_hermes_save_active{false};
+std::atomic<uint32_t> s_ui_generation{0};
+std::atomic<uint32_t> s_hermes_test_epoch{0};
 
 constexpr char kTag[] = "AgentSettings";
 
@@ -66,6 +79,25 @@ constexpr std::array<const char*, 6> kTabLabels = {
 };
 
 void BuildPanel(Panel panel);
+void BuildAiPanel();
+
+void RebuildAiPanel() {
+    if (s_ui.current != Panel::Ai || s_ui.panel == nullptr) return;
+    const int32_t scroll_y = lv_obj_get_scroll_y(s_ui.panel);
+    s_ui.hermes_dashboard_url = nullptr;
+    s_ui.hermes_username = nullptr;
+    s_ui.hermes_password = nullptr;
+    s_ui.hermes_profile = nullptr;
+    s_ui.hermes_test_status = nullptr;
+    s_ui.hermes_apply_status = nullptr;
+    lv_obj_clean(s_ui.panel);
+    BuildAiPanel();
+    // Status changes and async task results rebuild this panel. Recalculate
+    // the new content height before restoring the user's viewport so action
+    // buttons do not send the Hermes settings back to the top.
+    lv_obj_update_layout(s_ui.panel);
+    lv_obj_scroll_to_y(s_ui.panel, scroll_y, LV_ANIM_OFF);
+}
 
 void SetValueText(lv_obj_t* label, int value, const char* suffix) {
     if (label == nullptr) return;
@@ -178,79 +210,298 @@ void BuildGeneralPanel() {
 void OnWakeSwitchChanged(lv_event_t* event) {
     auto* control = static_cast<lv_obj_t*>(lv_event_get_target(event));
     const bool enabled = lv_obj_has_state(control, LV_STATE_CHECKED);
-    Settings settings("agent_ai", true);
-    settings.SetInt("wake", enabled ? 1 : 0);
     Application::GetInstance().GetAudioService().EnableWakeWordDetection(enabled);
+    // A tiny synchronous NVS write preserves toggle ordering.
+    Settings settings(std::string(ai_provider_config::kNamespace), true);
+    settings.SetInt("wake", enabled ? 1 : 0);
 }
 
-void SetConfigRefreshUi(bool refreshing, const char* status, uint32_t color) {
-    if (s_ui.config_refresh_row != nullptr) {
-        refreshing ? lv_obj_clear_flag(s_ui.config_refresh_row, LV_OBJ_FLAG_CLICKABLE)
-                   : lv_obj_add_flag(s_ui.config_refresh_row, LV_OBJ_FLAG_CLICKABLE);
-    }
-    if (s_ui.config_refresh_status != nullptr) {
-        lv_label_set_text(s_ui.config_refresh_status, status != nullptr ? status : "");
-        lv_obj_set_style_text_color(s_ui.config_refresh_status, lv_color_hex(color),
-                                    LV_PART_MAIN);
-    }
-}
-
-struct ConfigRefreshResult {
-    esp_err_t error = ESP_FAIL;
+struct HermesTaskResult {
+    std::string error;
+    AiProviderConfig config;
+    bool success = false;
+    uint32_t ui_generation = 0;
+    uint32_t request_epoch = 0;
 };
 
-void ApplyConfigRefreshResult(void* user_data) {
-    auto* result = static_cast<ConfigRefreshResult*>(user_data);
-    const esp_err_t error = result != nullptr ? result->error : ESP_FAIL;
-    delete result;
-    s_config_refreshing.store(false);
+struct HermesTestRequest {
+    AiProviderConfig config;
+    uint32_t ui_generation = 0;
+    uint32_t request_epoch = 0;
+};
 
-    const auto& colors = Theme::Get().colors();
-    if (error == ESP_OK) {
-        SetConfigRefreshUi(false, "配置已更新", colors.accent);
+struct HermesSaveRequest {
+    AiProviderConfig config;
+    uint32_t ui_generation = 0;
+};
+
+std::string ReadTextarea(lv_obj_t* textarea) {
+    const char* text = textarea != nullptr ? lv_textarea_get_text(textarea) : nullptr;
+    return text != nullptr ? text : "";
+}
+
+AiProviderConfig DraftHermesConfig() {
+    AiProviderConfig config = s_ui.ai_config;
+    config.provider = AiProvider::Hermes;
+    config.hermes_dashboard_url = ai_provider_config::ResolveHermesBaseUrl(
+        ReadTextarea(s_ui.hermes_dashboard_url));
+    config.hermes_username = ReadTextarea(s_ui.hermes_username);
+    const std::string password = ReadTextarea(s_ui.hermes_password);
+    if (!password.empty()) config.hermes_password = password;
+    config.hermes_profile = ReadTextarea(s_ui.hermes_profile);
+    return config;
+}
+
+bool SameHermesConfig(const AiProviderConfig& left, const AiProviderConfig& right) {
+    return left.provider == right.provider &&
+        left.hermes_dashboard_url == right.hermes_dashboard_url &&
+        left.hermes_username == right.hermes_username &&
+        left.hermes_password == right.hermes_password &&
+        left.hermes_profile == right.hermes_profile;
+}
+
+enum class HermesAction : uint8_t { Test, Apply };
+
+void SetHermesActionStatus(HermesAction action, const char* status) {
+    std::string& value = action == HermesAction::Test
+        ? s_hermes_test_status : s_hermes_apply_status;
+    lv_obj_t* label = action == HermesAction::Test
+        ? s_ui.hermes_test_status : s_ui.hermes_apply_status;
+    value = status != nullptr ? status : "";
+    if (label != nullptr) lv_label_set_text(label, value.c_str());
+}
+
+bool ValidateHermesRequest(const AiProviderConfig& config, HermesAction action) {
+    const char* error = nullptr;
+    if (!ai_provider_config::IsValidHermesBaseUrl(config.hermes_dashboard_url)) {
+        error = "Hermes 服务地址无效";
+    } else if (config.hermes_username.empty() || config.hermes_password.empty()) {
+        error = "Dashboard 用户名或密码为空";
+    } else if (!ai_provider_config::IsValidHermesUsername(config.hermes_username) ||
+               !ai_provider_config::IsValidHermesPassword(config.hermes_password)) {
+        error = "Dashboard 用户名或密码格式无效";
+    } else if (!ai_provider_config::IsValidHermesProfile(config.hermes_profile)) {
+        error = "Agent/Profile 名称无效";
+    }
+    if (error == nullptr) return true;
+    ESP_LOGW(kTag, "%s", error);
+    SetHermesActionStatus(action, "配置有误");
+    return false;
+}
+
+void SetHermesApplyValidationError(const char* error) {
+    ESP_LOGW(kTag, "%s", error);
+    SetHermesActionStatus(HermesAction::Apply, "配置有误");
+}
+
+void ClearStaleHermesTestStatus() {
+    SetHermesActionStatus(HermesAction::Test, "");
+}
+
+void ApplyCompletedHermesDraft(const AiProviderConfig& draft) {
+    Application::GetInstance().ApplyAiProviderSelection(draft);
+    SetHermesActionStatus(HermesAction::Apply, "已应用");
+}
+
+void SaveIncompleteHermesDraft(const AiProviderConfig& draft) {
+    Application::GetInstance().Schedule([draft]() {
+        ai_provider_config::SaveHermesDraft(draft);
+    });
+    SetHermesActionStatus(HermesAction::Apply, "");
+}
+
+void CommitHermesDraft(const AiProviderConfig& draft) {
+    ClearStaleHermesTestStatus();
+    if (ai_provider_config::IsCompleteHermesConfig(draft)) {
+        ApplyCompletedHermesDraft(draft);
     } else {
-        SetConfigRefreshUi(false, "获取失败", colors.danger);
+        SaveIncompleteHermesDraft(draft);
     }
 }
 
-void ConfigRefreshTask(void*) {
-    ProvisioningClient client;
-    auto* result = new ConfigRefreshResult{client.FetchConfiguration()};
-    lv_async_call(ApplyConfigRefreshResult, result);
+void LogHermesTestFailure(const std::string& error) {
+    ESP_LOGW(kTag, "Hermes connection test failed: %s",
+             error.empty() ? "unknown error" : error.c_str());
+}
+
+void ApplyHermesTaskResult(void* user_data) {
+    std::unique_ptr<HermesTaskResult> result(static_cast<HermesTaskResult*>(user_data));
+    if (result == nullptr || result->ui_generation != s_ui_generation.load() ||
+        result->request_epoch != s_hermes_test_epoch.load()) {
+        return;
+    }
+    s_hermes_test_active.store(false);
+    if (!SameHermesConfig(DraftHermesConfig(), result->config)) {
+        ClearStaleHermesTestStatus();
+        return;
+    }
+    if (!result->success) LogHermesTestFailure(result->error);
+    SetHermesActionStatus(HermesAction::Test,
+                          result->success ? "测试成功" : "测试失败");
+}
+
+void RunHermesConnectionTestTask(void* user_data) {
+    std::unique_ptr<HermesTestRequest> request(
+        static_cast<HermesTestRequest*>(user_data));
+    auto* result = new HermesTaskResult;
+    result->ui_generation = request->ui_generation;
+    result->request_epoch = request->request_epoch;
+    result->config = request->config;
+    ai_provider_config::SaveHermesDraft(request->config);
+
+    hermes_voice::DashboardSession session;
+    std::vector<std::string> names;
+    bool ok = hermes_voice::LoginDashboard(request->config, &session, &result->error) &&
+        hermes_voice::CheckDashboardIdentity(request->config, session, &result->error) &&
+        hermes_voice::LoadDashboardProfiles(request->config, session, &names, &result->error);
+    if (ok && std::find(names.begin(), names.end(), request->config.hermes_profile) == names.end()) {
+        ok = false;
+        result->error = "未找到所选 Agent/Profile";
+    }
+    if (ok) {
+        ok = hermes_voice::TestDashboardGateway(request->config, session, &result->error);
+    }
+    result->success = ok;
+    lv_async_call(ApplyHermesTaskResult, result);
     vTaskDelete(nullptr);
 }
 
-void OnConfigRefreshClicked(lv_event_t*) {
+void OnHermesTestClicked(lv_event_t*) {
+    if (Application::GetInstance().IsHermesVoiceBusy()) {
+        SetHermesActionStatus(HermesAction::Test, "请结束对话");
+        return;
+    }
+    AiProviderConfig draft = DraftHermesConfig();
+    if (!ValidateHermesRequest(draft, HermesAction::Test)) return;
+    s_ui.ai_config = draft;
     bool expected = false;
-    if (!s_config_refreshing.compare_exchange_strong(expected, true)) return;
-
-    SetConfigRefreshUi(true, "正在获取", Theme::Get().colors().muted);
-    if (xTaskCreate(ConfigRefreshTask, "agent_config", 8192, nullptr,
+    if (!s_hermes_test_active.compare_exchange_strong(expected, true)) return;
+    SetHermesActionStatus(HermesAction::Test, "测试中");
+    const uint32_t request_epoch =
+        s_hermes_test_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    auto* request = new HermesTestRequest{
+        .config = std::move(draft),
+        .ui_generation = s_ui_generation.load(),
+        .request_epoch = request_epoch,
+    };
+    if (xTaskCreate(RunHermesConnectionTestTask, "hermes_test", 8192, request,
                     tskIDLE_PRIORITY + 2, nullptr) != pdPASS) {
-        ESP_LOGE(kTag, "Failed to start provisioning refresh task");
-        s_config_refreshing.store(false);
-        SetConfigRefreshUi(false, "系统忙", Theme::Get().colors().danger);
+        delete request;
+        s_hermes_test_active.store(false);
+        SetHermesActionStatus(HermesAction::Test, "测试失败");
     }
 }
 
+void OnHermesFieldCommitted(lv_event_t* event) {
+    lv_obj_t* field = lv_event_get_target_obj(event);
+    AiProviderConfig draft = DraftHermesConfig();
+    const std::string entered_password = ReadTextarea(s_ui.hermes_password);
+    if (field == s_ui.hermes_dashboard_url &&
+        !ai_provider_config::IsValidHermesBaseUrl(draft.hermes_dashboard_url)) {
+        SetHermesApplyValidationError("Hermes 服务地址无效，未保存");
+        return;
+    }
+    if (field == s_ui.hermes_username &&
+        !ai_provider_config::IsValidHermesUsername(draft.hermes_username)) {
+        SetHermesApplyValidationError("Dashboard 用户名无效，未保存");
+        return;
+    }
+    if (field == s_ui.hermes_password && !entered_password.empty() &&
+        !ai_provider_config::IsValidHermesPassword(entered_password)) {
+        SetHermesApplyValidationError("Dashboard 密码无效，未保存");
+        return;
+    }
+    if (field == s_ui.hermes_profile &&
+        !ai_provider_config::IsValidHermesProfile(draft.hermes_profile)) {
+        SetHermesApplyValidationError("Agent/Profile 名称无效，未保存");
+        return;
+    }
+
+    s_ui.ai_config = draft;
+    CommitHermesDraft(draft);
+}
+
+void OnAiProviderChanged(lv_event_t* event) {
+    const bool hermes = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)) != 0;
+    if (!hermes) {
+        s_ui.ai_config.provider = AiProvider::Xiaozhi;
+        Application::GetInstance().ApplyAiProviderSelection(s_ui.ai_config);
+    } else {
+        s_ui.ai_config.provider = AiProvider::Hermes;
+    }
+    RebuildAiPanel();
+}
+
+void PersistHermesDraftTask(void* user_data);
+
+void OnHermesSaveClicked(lv_event_t*) {
+    AiProviderConfig draft = DraftHermesConfig();
+    if (!ValidateHermesRequest(draft, HermesAction::Apply)) return;
+    bool expected = false;
+    if (!s_hermes_save_active.compare_exchange_strong(expected, true)) {
+        SetHermesActionStatus(HermesAction::Apply, "应用中");
+        return;
+    }
+    auto* request = new HermesSaveRequest{
+        .config = draft,
+        .ui_generation = s_ui_generation.load(),
+    };
+    if (xTaskCreate(PersistHermesDraftTask, "hermes_save", 4096, request,
+                    tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+        delete request;
+        s_hermes_save_active.store(false);
+        SetHermesActionStatus(HermesAction::Apply, "应用失败");
+    } else {
+        s_ui.ai_config = std::move(draft);
+        ClearStaleHermesTestStatus();
+        SetHermesActionStatus(HermesAction::Apply, "应用中");
+    }
+}
+
+void ApplyHermesSaveQueued(void* user_data) {
+    std::unique_ptr<uint32_t> generation(static_cast<uint32_t*>(user_data));
+    s_hermes_save_active.store(false);
+    if (generation != nullptr && *generation == s_ui_generation.load()) {
+        SetHermesActionStatus(HermesAction::Apply, "已应用");
+    }
+}
+
+void PersistHermesDraftTask(void* user_data) {
+    std::unique_ptr<HermesSaveRequest> request(
+        static_cast<HermesSaveRequest*>(user_data));
+    Application::GetInstance().ApplyAiProviderSelection(request->config);
+    lv_async_call(ApplyHermesSaveQueued, new uint32_t(request->ui_generation));
+    vTaskDelete(nullptr);
+}
+
 void BuildAiPanel() {
-    Settings settings("agent_ai", true);
-    const bool refreshing = s_config_refreshing.load();
     const auto handles = panels_ui::BuildAi(
         s_ui.panel,
         panels_ui::AiModel{
-            .wake_enabled = settings.GetInt("wake", 1) != 0,
-            .config_refreshing = refreshing,
+            .wake_enabled = Settings(std::string(ai_provider_config::kNamespace), false)
+                                .GetInt("wake", 1) != 0,
+            .hermes_selected = s_ui.ai_config.provider == AiProvider::Hermes,
+            .hermes_dashboard_url = s_ui.ai_config.hermes_dashboard_url.c_str(),
+            .hermes_username = s_ui.ai_config.hermes_username.c_str(),
+            .hermes_password_configured =
+                ai_provider_config::IsValidHermesPassword(s_ui.ai_config.hermes_password),
+            .hermes_profile = s_ui.ai_config.hermes_profile.c_str(),
+            .hermes_test_status = s_hermes_test_status.c_str(),
+            .hermes_apply_status = s_hermes_apply_status.c_str(),
         },
         panels_ui::AiCallbacks{
             .wake_changed = OnWakeSwitchChanged,
-            .config_refresh = OnConfigRefreshClicked,
+            .provider_changed = OnAiProviderChanged,
+            .hermes_field_committed = OnHermesFieldCommitted,
+            .hermes_save = OnHermesSaveClicked,
+            .hermes_test = OnHermesTestClicked,
         });
-    s_ui.config_refresh_row = handles.config_row;
-    s_ui.config_refresh_status = handles.config_status;
-    if (refreshing) {
-        SetConfigRefreshUi(true, "正在获取", Theme::Get().colors().muted);
-    }
+    s_ui.hermes_dashboard_url = handles.hermes_dashboard_url;
+    s_ui.hermes_username = handles.hermes_username;
+    s_ui.hermes_password = handles.hermes_password;
+    s_ui.hermes_profile = handles.hermes_profile;
+    s_ui.hermes_test_status = handles.hermes_test_status;
+    s_ui.hermes_apply_status = handles.hermes_apply_status;
 }
 
 void DeactivateEmbeddedView() {
@@ -358,8 +609,12 @@ void BuildPanel(Panel panel) {
     s_ui.brightness_value = nullptr;
     s_ui.volume_value = nullptr;
     s_ui.standby_value = nullptr;
-    s_ui.config_refresh_row = nullptr;
-    s_ui.config_refresh_status = nullptr;
+    s_ui.hermes_dashboard_url = nullptr;
+    s_ui.hermes_username = nullptr;
+    s_ui.hermes_password = nullptr;
+    s_ui.hermes_profile = nullptr;
+    s_ui.hermes_test_status = nullptr;
+    s_ui.hermes_apply_status = nullptr;
     DeactivateEmbeddedView();
     lv_obj_clean(s_ui.panel);
     UpdateTabStyles();
@@ -378,6 +633,9 @@ void OnDeleted(lv_event_t* event) {
     // RebuildCurrent creates the replacement screen before LVGL deletes the
     // old one. Do not let that delayed delete clear the replacement handles.
     if (lv_event_get_target_obj(event) != s_ui.root) return;
+    s_ui_generation.fetch_add(1, std::memory_order_acq_rel);
+    s_hermes_test_epoch.fetch_add(1, std::memory_order_acq_rel);
+    s_hermes_test_active.store(false);
     DeactivateEmbeddedView();
     s_ui = {};
 }
@@ -402,9 +660,15 @@ void SettingsLifecycleCallback(AppLifecycleEvent event) {
 }  // namespace
 
 lv_obj_t* SettingsView::Create() {
+    s_ui_generation.fetch_add(1, std::memory_order_acq_rel);
+    s_hermes_test_epoch.fetch_add(1, std::memory_order_acq_rel);
+    s_hermes_test_active.store(false);
+    s_hermes_test_status.clear();
+    s_hermes_apply_status.clear();
     auto shell = CreateAppShell("设置", nullptr);
     s_ui.root = shell.root;
     s_ui.current = Panel::General;
+    s_ui.ai_config = ai_provider_config::Load();
     lv_obj_add_event_cb(shell.root, OnDeleted, LV_EVENT_DELETE, nullptr);
     AttachAppLifecycle(shell.root, SettingsLifecycleCallback);
 

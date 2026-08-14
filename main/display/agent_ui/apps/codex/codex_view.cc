@@ -61,6 +61,7 @@ struct UiState {
     lv_obj_t* discovery_name = nullptr;
     lv_obj_t* connection_modes[2]{};
     lv_obj_t* connection_panels[2]{};
+    controls::ActionButtonParts connection_action{};
     lv_obj_t* remote_ip = nullptr;
     lv_obj_t* token = nullptr;
     lv_obj_t* approval = nullptr;
@@ -70,6 +71,8 @@ struct UiState {
     std::string discovered_ip;
     std::string approval_id;
     std::string voice_request_id;
+    std::string connected_token;
+    std::string connected_remote_ip;
     int discovered_port = 8765;
     uint32_t request_counter = 0;
     uint32_t stop_hold_started_at = 0;
@@ -78,6 +81,7 @@ struct UiState {
     bool task_active = false;
     bool stop_pending = false;
     bool remote_mode = false;
+    bool connected_remote_mode = false;
     bool voice_animation_active = false;
 };
 
@@ -394,6 +398,43 @@ void ClearMessages() {
     if (s_ui.chat != nullptr) lv_obj_clean(s_ui.chat);
 }
 
+std::string TextareaText(lv_obj_t* textarea) {
+    if (textarea == nullptr) return "";
+    const char* text = lv_textarea_get_text(textarea);
+    return text != nullptr ? text : "";
+}
+
+bool HasNewConnectionInfo() {
+    if (TextareaText(s_ui.token) != s_ui.connected_token) return true;
+    if (s_ui.remote_mode != s_ui.connected_remote_mode) return true;
+    return s_ui.remote_mode &&
+           TextareaText(s_ui.remote_ip) != s_ui.connected_remote_ip;
+}
+
+void UpdateConnectionAction() {
+    if (s_ui.connection_action.label == nullptr) return;
+    const bool unchanged_connection =
+        CodexWsClient::GetInstance().IsConnected() && !HasNewConnectionInfo();
+    lv_label_set_text(s_ui.connection_action.label,
+                      unchanged_connection ? "已连接" : "连接");
+}
+
+void CaptureConnectedConfig() {
+    auto& client = CodexWsClient::GetInstance();
+    std::string token;
+    if (client.LoadToken(token)) s_ui.connected_token = token;
+    else s_ui.connected_token.clear();
+    s_ui.connected_remote_mode = s_ui.remote_mode;
+    s_ui.connected_remote_ip = s_ui.remote_mode
+                                   ? TextareaText(s_ui.remote_ip)
+                                   : "";
+    UpdateConnectionAction();
+}
+
+void OnConnectionInfoChanged(lv_event_t*) {
+    UpdateConnectionAction();
+}
+
 void HideConfig() {
     Keyboard::Get().Hide();
     if (s_ui.config_overlay != nullptr) {
@@ -513,7 +554,10 @@ void PostStatus(bool connected) {
     UiDispatcher::Post([root, connected]() {
         if (root == nullptr || s_ui.root.load() != root) return;
         SetStatus(connected);
-        if (connected) HideConfig();
+        if (connected) {
+            CaptureConnectedConfig();
+            HideConfig();
+        }
         if (!connected) {
             if (s_ui.voice_label_timer != nullptr) {
                 lv_timer_delete(s_ui.voice_label_timer);
@@ -524,6 +568,7 @@ void PostStatus(bool connected) {
             s_ui.voice_pressed = false;
             s_ui.voice_request_id.clear();
             SetTaskActive(false);
+            UpdateConnectionAction();
         }
     });
 }
@@ -681,8 +726,12 @@ void OnNewTask(lv_event_t*) {
 
 void OnSaveToken(lv_event_t*) {
     if (s_ui.token == nullptr) return;
-    const char* token = lv_textarea_get_text(s_ui.token);
     auto& client = CodexWsClient::GetInstance();
+    if (client.IsConnected() && !HasNewConnectionInfo()) {
+        HideConfig();
+        return;
+    }
+    const char* token = lv_textarea_get_text(s_ui.token);
     if (token == nullptr || !client.SaveToken(token)) return;
     Keyboard::Get().Hide();
     if (s_ui.remote_mode) {
@@ -691,10 +740,15 @@ void OnSaveToken(lv_event_t*) {
                                     : nullptr;
         if (remote_ip == nullptr || remote_ip[0] == '\0') return;
         client.Connect(remote_ip, 8765);
-    } else if (!s_ui.discovered_ip.empty()) {
-        client.Connect(s_ui.discovered_ip, s_ui.discovered_port);
     } else {
-        client.StartDiscovery(8000);
+        const std::string ip = !s_ui.discovered_ip.empty()
+                                   ? s_ui.discovered_ip
+                                   : client.GetCurrentIp();
+        const int port = !s_ui.discovered_ip.empty()
+                             ? s_ui.discovered_port
+                             : client.GetCurrentPort();
+        if (!ip.empty()) client.Connect(ip, port);
+        else client.StartDiscovery(8000);
     }
 }
 
@@ -711,6 +765,7 @@ void SetConnectionMode(bool remote) {
         }
     }
     if (!remote) CodexWsClient::GetInstance().StartDiscovery(8000);
+    UpdateConnectionAction();
 }
 
 void OnConnectionMode(lv_event_t* event) {
@@ -842,6 +897,8 @@ void BuildConfigDialog(lv_obj_t* root) {
     lv_textarea_set_placeholder_text(s_ui.remote_ip, "例如 203.0.113.10");
     lv_obj_set_style_text_font(s_ui.remote_ip, fonts::Medium(), LV_PART_MAIN);
     lv_obj_set_style_radius(s_ui.remote_ip, metrics::kRadiusControl, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_ui.remote_ip, OnConnectionInfoChanged,
+                        LV_EVENT_VALUE_CHANGED, nullptr);
     Keyboard::Get().Bind(s_ui.remote_ip, "公网 IP", LV_KEYBOARD_MODE_TEXT_LOWER);
 
     lv_obj_t* token_field = controls::CreateContentPanel(panel, 98);
@@ -858,13 +915,20 @@ void BuildConfigDialog(lv_obj_t* root) {
     lv_textarea_set_placeholder_text(s_ui.token, "输入认证 Token");
     lv_obj_set_style_text_font(s_ui.token, fonts::Medium(), LV_PART_MAIN);
     lv_obj_set_style_radius(s_ui.token, metrics::kRadiusControl, LV_PART_MAIN);
+    std::string saved_token;
+    if (CodexWsClient::GetInstance().LoadToken(saved_token)) {
+        lv_textarea_set_text(s_ui.token, saved_token.c_str());
+    }
+    lv_obj_add_event_cb(s_ui.token, OnConnectionInfoChanged,
+                        LV_EVENT_VALUE_CHANGED, nullptr);
     Keyboard::Get().Bind(s_ui.token, "Codex Token");
 
     lv_obj_t* actions = controls::CreateBottomActionBar(
         drawer, metrics::kBottomActionContentHeight);
     controls::AddBottomActionSpacer(actions);
-    controls::AddBottomPrimaryButton(
+    s_ui.connection_action = controls::AddBottomPrimaryButton(
         actions, FONT_AWESOME_LINK, "连接", OnSaveToken);
+    CaptureConnectedConfig();
 }
 
 void BuildApprovalDialog(lv_obj_t* root) {
@@ -927,6 +991,7 @@ void OnDeleted(lv_event_t*) {
     s_ui.connection_modes[1] = nullptr;
     s_ui.connection_panels[0] = nullptr;
     s_ui.connection_panels[1] = nullptr;
+    s_ui.connection_action = {};
     s_ui.remote_ip = nullptr;
     s_ui.token = nullptr;
     s_ui.approval = nullptr;
@@ -935,9 +1000,12 @@ void OnDeleted(lv_event_t*) {
     s_ui.voice_stage = VoiceStage::Idle;
     s_ui.voice_pressed = false;
     s_ui.voice_request_id.clear();
+    s_ui.connected_token.clear();
+    s_ui.connected_remote_ip.clear();
     s_ui.task_active = false;
     s_ui.stop_pending = false;
     s_ui.remote_mode = false;
+    s_ui.connected_remote_mode = false;
     s_ui.voice_animation_active = false;
 }
 
@@ -984,12 +1052,12 @@ lv_obj_t* CodexView::Create() {
         shell.actions, nullptr, "菜单", OnOpenConfig);
     AddMenuGlyph(menu.root);
 
+    auto& client = CodexWsClient::GetInstance();
+    client.Init();
     BuildConfigDialog(shell.root);
     BuildApprovalDialog(shell.root);
 
     UiDispatcher::Init();
-    auto& client = CodexWsClient::GetInstance();
-    client.Init();
     client.SetOnMessageCallback(PostMessage);
     client.SetOnStatusCallback(PostStatus);
     client.SetOnDiscoveryCallback(PostDiscovery);

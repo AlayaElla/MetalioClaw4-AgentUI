@@ -74,12 +74,15 @@ enum AudioTaskType {
     kAudioTaskTypeEncodeToTestingQueue,
     kAudioTaskTypeEncodeForCallback,
     kAudioTaskTypeDecodeToPlaybackQueue,
+    kAudioTaskTypePcmPlaybackQueue,
 };
 
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    uint32_t network_audio_generation = 0;
+    uint32_t pcm_playback_generation = 0;
     std::function<void(std::unique_ptr<AudioStreamPacket>)> on_encoded;
 };
 
@@ -122,6 +125,17 @@ public:
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
+    // Called on the AFE/input task with processed 16 kHz mono PCM.  Keep the
+    // callback bounded: it must only copy into a preallocated recorder.
+    void SetProcessedPcmCallback(std::function<void(const int16_t*, size_t)> callback);
+    // Hermes uses a separate PCM route, never the Opus decoder queue.
+    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
+                                uint32_t playback_generation);
+    uint32_t pcm_playback_generation() const {
+        return pcm_playback_generation_.load(std::memory_order_acquire);
+    }
+    bool IsPcmPlaybackIdle() const;
+    void SetNetworkAudioEnabled(bool enabled);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
@@ -154,7 +168,7 @@ private:
     TaskHandle_t audio_input_task_handle_ = nullptr;
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
-    std::mutex audio_queue_mutex_;
+    mutable std::mutex audio_queue_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
@@ -162,6 +176,13 @@ private:
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
     std::atomic<size_t> pending_send_packets_{0};
+    std::atomic<size_t> pcm_playback_active_{0};
+    std::atomic<uint32_t> pcm_playback_generation_{0};
+    std::mutex pcm_output_mutex_;
+    std::atomic<bool> network_audio_enabled_{true};
+    std::atomic<uint32_t> network_audio_generation_{0};
+    std::function<void(const int16_t*, size_t)> processed_pcm_callback_;
+    std::mutex processed_pcm_callback_mutex_;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 

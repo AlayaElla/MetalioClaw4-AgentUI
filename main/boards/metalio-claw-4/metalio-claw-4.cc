@@ -200,7 +200,19 @@ private:
     }
 
     void InitializeCharger() {
-        if (i2c_master_probe(i2c_bus_, CX25601N_I2C_ADDR, 100) != ESP_OK) {
+        constexpr int kProbeAttempts = 5;
+        constexpr int kProbeDelayMs = 100;
+        esp_err_t probe_error = ESP_FAIL;
+        for (int attempt = 1; attempt <= kProbeAttempts; ++attempt) {
+            probe_error = i2c_master_probe(i2c_bus_, CX25601N_I2C_ADDR, 100);
+            if (probe_error == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "CX25601N probe attempt %d/%d failed: %s", attempt,
+                     kProbeAttempts, esp_err_to_name(probe_error));
+            vTaskDelay(pdMS_TO_TICKS(kProbeDelayMs));
+        }
+        if (probe_error != ESP_OK) {
             ESP_LOGW(TAG, "CX25601N charger not found at I2C address 0x%02X",
                      CX25601N_I2C_ADDR);
             return;
@@ -223,13 +235,42 @@ private:
             ESP_LOGE(TAG, "Failed to initialize charge current: %s",
                      esp_err_to_name(apply_error));
         }
+
+        // Initialization programs the limits, but no later UI owner guarantees
+        // that EN_CHG is asserted.  Explicitly enable charging here; this is
+        // essential when USB is attached after the battery has entered deep
+        // discharge.
+        const esp_err_t enable_error = cx25601n_enable_charge(true);
+        if (enable_error == ESP_OK) {
+            ESP_LOGI(TAG, "Battery charging enabled");
+        } else {
+            ESP_LOGE(TAG, "Failed to enable battery charging: %s",
+                     esp_err_to_name(enable_error));
+        }
     }
 
-    void InitializeIOExpander() {
+    bool InitializeIOExpander() {
         // gpio_output_init(GPIO_NUM_22, 1);
 
         auto& iOExpander = IOExpander::getInstance();
-        ESP_ERROR_CHECK(iOExpander.begin(i2c_bus_));
+        constexpr int kInitAttempts = 8;
+        constexpr int kInitDelayMs = 250;
+        esp_err_t init_error = ESP_FAIL;
+        for (int attempt = 1; attempt <= kInitAttempts; ++attempt) {
+            init_error = iOExpander.begin(i2c_bus_);
+            if (init_error == ESP_OK) {
+                break;
+            }
+            ESP_LOGW(TAG, "TCA9555 init attempt %d/%d failed: %s", attempt,
+                     kInitAttempts, esp_err_to_name(init_error));
+            vTaskDelay(pdMS_TO_TICKS(kInitDelayMs));
+        }
+        if (init_error != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "TCA9555 unavailable after %d attempts; continue in reduced mode",
+                     kInitAttempts);
+            return false;
+        }
         iOExpander.setLevel(IOExpander::Pin::BT_POWER, true);
         // PA is owned by audio_output_route and only turns on while the local
         // speaker is selected and codec output is active.
@@ -241,6 +282,7 @@ private:
         iOExpander.setLevel(IOExpander::Pin::CAM_PWDN, true);
         iOExpander.setLevel(IOExpander::Pin::SD, false);
 
+        return true;
     }
 
     void InitializeBTAudio() {
@@ -588,14 +630,23 @@ public:
     METALIO_CLAW_4() : DualNetworkBoard(NT26_TX_PIN, NT26_RX_PIN, NT26_MRDY_PIN, NT26_SRDY_PIN, 1) {
         InitializeI2C();
 
-        InitializeIOExpander();
+        // Bring the charger up before optional peripherals.  A deeply
+        // discharged battery can leave the TCA9555 rail temporarily unable to
+        // acknowledge I2C; charging must still start instead of entering an
+        // ESP_ERROR_CHECK reboot loop.
         InitializeCharger();
+        const bool io_expander_ready = InitializeIOExpander();
         // 把 BQ27220 电量计绑定到 i2c_bus_ 上；返回值表示「这次是否挂上」，
         // 开机失败 Bq27220Gauge::GetBatteryLevel 内部会节流自愈，这里不需要
         // ESP_ERROR_CHECK。
         (void)Bq27220Gauge::GetInstance().Begin(i2c_bus_);
-        CheckBatteryLevelAtBoot();
-        InitializeBTAudio();
+        if (io_expander_ready) {
+            CheckBatteryLevelAtBoot();
+            InitializeBTAudio();
+        } else {
+            ESP_LOGW(TAG,
+                     "Skipping IO-expander-dependent battery shutdown and Bluetooth init");
+        }
         // SD 卡的 LDO（chan 4）在 InitializeSDWIFIPower() 里已经打开，这里
         // 直接挂载，进入 Files App 时可立即读取，不需要再次 mount。
         InitializeSdCard();
@@ -612,7 +663,9 @@ public:
         (void)Sc7a20MotionService::GetInstance().Start(i2c_bus_);
         // 电源键回调会调用 LVGL。冷启动时用户可能仍按着开机键，因此必须
         // 等 LVGL 初始化完成后再开始检测松手事件。
-        agent_ui::PowerKey::Initialize();
+        if (io_expander_ready) {
+            agent_ui::PowerKey::Initialize();
+        }
         InitializeI2cWxcho();
         GetBacklight()->RestoreBrightness();
 

@@ -41,6 +41,7 @@ public:
 
     bool IsConnected() const { return connected_.load(); }
     std::string GetCurrentIp() const { return current_ip_; }
+    int GetCurrentPort() const { return current_port_; }
 
 private:
     CodexWsClient();

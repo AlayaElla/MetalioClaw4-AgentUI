@@ -1,0 +1,27 @@
+diff --git a/src/esp/esp_tcp.cc b/src/esp/esp_tcp.cc
+--- a/src/esp/esp_tcp.cc
++++ b/src/esp/esp_tcp.cc
+@@ -75,2 +75,14 @@ void EspTcp::Disconnect() {
+     if (!connected_) {
++        // The receive task may still be unwinding a passive-disconnect callback.
++        // Join it before the Tcp owner and its callback targets are destroyed.
++        if (receive_task_handle_ != nullptr &&
++            xTaskGetCurrentTaskHandle() != receive_task_handle_) {
++            auto bits = xEventGroupWaitBits(event_group_,
++                ESP_TCP_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE,
++                pdMS_TO_TICKS(10000));
++            if (!(bits & ESP_TCP_EVENT_RECEIVE_TASK_EXIT)) {
++                ESP_LOGE(TAG, "Failed to wait for receive task exit");
++            }
++            receive_task_handle_ = nullptr;
++        }
+         return;
+diff --git a/src/web_socket.cc b/src/web_socket.cc
+--- a/src/web_socket.cc
++++ b/src/web_socket.cc
+@@ -50,2 +50,4 @@ WebSocket::~WebSocket() {
+-    if (connected_) {
++    // Disconnect in the destructor body so TCP callbacks have finished before
++    // callback members and the handshake event group start being destroyed.
++    if (tcp_) {
+         tcp_->Disconnect();

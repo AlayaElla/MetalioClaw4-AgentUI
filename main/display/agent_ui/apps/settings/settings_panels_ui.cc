@@ -4,6 +4,7 @@
 #include <font_awesome.h>
 
 #include "components/haptic_feedback.h"
+#include "components/system_keyboard.h"
 #include "components/ui_components.h"
 #include "core/fonts.h"
 #include "core/theme.h"
@@ -12,6 +13,26 @@ namespace agent_ui::settings_panels_ui {
 namespace {
 
 namespace controls = ui_components;
+
+constexpr int kHermesFieldHeight = 144;
+constexpr int kHermesInputHeight = 96;
+constexpr int kHermesInputVerticalPadding = 22;
+
+lv_obj_t* CreateHermesInput(lv_obj_t* parent, const char* title) {
+    lv_obj_t* field = controls::CreateContentPanel(parent, kHermesFieldHeight, 10);
+    lv_obj_t* label = lv_label_create(field);
+    lv_label_set_text(label, title);
+    lv_obj_set_width(label, LV_PCT(100));
+    lv_obj_set_style_text_font(label, fonts::MediumBold(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(Theme::Get().colors().text),
+                                LV_PART_MAIN);
+
+    lv_obj_t* textarea = lv_textarea_create(field);
+    lv_obj_set_size(textarea, LV_PCT(100), kHermesInputHeight);
+    lv_obj_set_style_pad_ver(textarea, kHermesInputVerticalPadding, LV_PART_MAIN);
+    lv_obj_set_style_text_font(textarea, fonts::Medium(), LV_PART_MAIN);
+    return textarea;
+}
 
 lv_obj_t* CreateAccentGrid(lv_obj_t* parent, size_t selected,
                            lv_event_cb_t callback) {
@@ -114,25 +135,97 @@ AiHandles BuildAi(lv_obj_t* parent, const AiModel& model,
                   const AiCallbacks& callbacks) {
     AiHandles handles{};
     controls::CreateSectionHeading(parent, "AI");
+    lv_obj_t* provider = controls::CreateSegment(parent);
+    controls::AddSegmentButton(
+        provider, FONT_AWESOME_MICROPHONE, "小智", !model.hermes_selected,
+        callbacks.provider_changed, reinterpret_cast<void*>(static_cast<uintptr_t>(0)));
+    controls::AddSegmentButton(
+        provider, FONT_AWESOME_LINK, "Hermes", model.hermes_selected,
+        callbacks.provider_changed, reinterpret_cast<void*>(static_cast<uintptr_t>(1)));
     lv_obj_t* wake_row = controls::CreateRow(
         parent, FONT_AWESOME_MICROPHONE, "语音唤醒", nullptr);
     controls::AddSwitch(wake_row, model.wake_enabled, callbacks.wake_changed);
 
-    handles.config_row = controls::CreateRow(
-        parent, FONT_AWESOME_CLOUD_ARROW_DOWN, "重新获取配置", nullptr);
-    lv_obj_add_flag(handles.config_row, LV_OBJ_FLAG_CLICKABLE);
-    if (callbacks.config_refresh != nullptr) {
-        lv_obj_add_event_cb(handles.config_row, callbacks.config_refresh,
-                            LV_EVENT_CLICKED, nullptr);
+    if (model.hermes_selected) {
+        controls::CreateSectionHeading(parent, "Hermes Agent");
+
+        handles.hermes_dashboard_url = CreateHermesInput(parent, "Hermes 服务地址");
+        lv_textarea_set_one_line(handles.hermes_dashboard_url, true);
+        lv_textarea_set_max_length(handles.hermes_dashboard_url, 192);
+        lv_textarea_set_placeholder_text(handles.hermes_dashboard_url,
+            "默认 http://192.168.50.149:9119");
+        lv_textarea_set_text(handles.hermes_dashboard_url,
+            model.hermes_dashboard_url != nullptr ? model.hermes_dashboard_url : "");
+        Keyboard::Get().Bind(handles.hermes_dashboard_url, "Hermes 服务地址");
+        if (callbacks.hermes_field_committed != nullptr) {
+            lv_obj_add_event_cb(handles.hermes_dashboard_url,
+                                callbacks.hermes_field_committed, LV_EVENT_READY, nullptr);
+        }
+
+        handles.hermes_username = CreateHermesInput(parent, "Dashboard 用户名");
+        lv_textarea_set_one_line(handles.hermes_username, true);
+        lv_textarea_set_max_length(handles.hermes_username, 128);
+        lv_textarea_set_placeholder_text(handles.hermes_username, "Dashboard 用户名");
+        lv_textarea_set_text(handles.hermes_username,
+            model.hermes_username != nullptr ? model.hermes_username : "");
+        Keyboard::Get().Bind(handles.hermes_username, "Dashboard 用户名");
+        if (callbacks.hermes_field_committed != nullptr) {
+            lv_obj_add_event_cb(handles.hermes_username,
+                                callbacks.hermes_field_committed, LV_EVENT_READY, nullptr);
+        }
+
+        handles.hermes_password = CreateHermesInput(parent, "Dashboard 密码");
+        lv_textarea_set_one_line(handles.hermes_password, true);
+        lv_textarea_set_max_length(handles.hermes_password, 512);
+        lv_textarea_set_password_mode(handles.hermes_password, true);
+        lv_textarea_set_placeholder_text(handles.hermes_password,
+            model.hermes_password_configured ? "密码已配置；留空保留" : "Dashboard 密码");
+        Keyboard::Get().Bind(handles.hermes_password, "Dashboard 密码");
+        if (callbacks.hermes_field_committed != nullptr) {
+            lv_obj_add_event_cb(handles.hermes_password,
+                                callbacks.hermes_field_committed, LV_EVENT_READY, nullptr);
+        }
+
+        handles.hermes_profile = CreateHermesInput(parent, "Agent / Profile");
+        lv_textarea_set_one_line(handles.hermes_profile, true);
+        lv_textarea_set_max_length(handles.hermes_profile, 128);
+        lv_textarea_set_placeholder_text(handles.hermes_profile, "Agent/Profile，例如 default");
+        lv_textarea_set_text(handles.hermes_profile,
+            model.hermes_profile != nullptr ? model.hermes_profile : "");
+        Keyboard::Get().Bind(handles.hermes_profile, "Hermes Agent/Profile");
+        if (callbacks.hermes_field_committed != nullptr) {
+            lv_obj_add_event_cb(handles.hermes_profile,
+                                callbacks.hermes_field_committed, LV_EVENT_READY, nullptr);
+        }
+
+        const char* test_status =
+            model.hermes_test_status != nullptr ? model.hermes_test_status : "";
+        lv_obj_t* test_row = controls::CreateRow(
+            parent, FONT_AWESOME_LINK, "测试连接", nullptr);
+        lv_obj_add_flag(test_row, LV_OBJ_FLAG_CLICKABLE);
+        if (callbacks.hermes_test != nullptr) {
+            lv_obj_add_event_cb(test_row, callbacks.hermes_test, LV_EVENT_CLICKED, nullptr);
+        }
+        AttachButtonHaptic(test_row);
+        handles.hermes_test_status = controls::AddValueLabel(
+            test_row, test_status, 180);
+        lv_obj_set_style_text_font(handles.hermes_test_status,
+                                   fonts::MediumBold(), LV_PART_MAIN);
+
+        lv_obj_t* save_row = controls::CreateRow(
+            parent, FONT_AWESOME_PEN_TO_SQUARE, "应用 Hermes 配置", nullptr);
+        lv_obj_add_flag(save_row, LV_OBJ_FLAG_CLICKABLE);
+        if (callbacks.hermes_save != nullptr) {
+            lv_obj_add_event_cb(save_row, callbacks.hermes_save, LV_EVENT_CLICKED, nullptr);
+        }
+        AttachButtonHaptic(save_row);
+        const char* apply_status =
+            model.hermes_apply_status != nullptr ? model.hermes_apply_status : "";
+        handles.hermes_apply_status = controls::AddValueLabel(
+            save_row, apply_status, 180);
+        lv_obj_set_style_text_font(handles.hermes_apply_status,
+                                   fonts::MediumBold(), LV_PART_MAIN);
     }
-    AttachButtonHaptic(handles.config_row);
-    if (model.config_refreshing) {
-        lv_obj_clear_flag(handles.config_row, LV_OBJ_FLAG_CLICKABLE);
-    }
-    controls::AddChevron(handles.config_row);
-    handles.config_status = controls::AddValueLabel(
-        handles.config_row, model.config_refreshing ? "正在获取" : "");
-    lv_obj_align(handles.config_status, LV_ALIGN_RIGHT_MID, -46, 0);
     return handles;
 }
 
