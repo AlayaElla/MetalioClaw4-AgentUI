@@ -38,8 +38,8 @@ private:
     Theme() = default;
     void ApplyPreset(AccentPreset preset);
 
-    AccentPreset accent_preset_ = AccentPreset::Cobalt;
-    AppearanceMode appearance_mode_ = AppearanceMode::Light;
+    AccentPreset accent_preset_ = AccentPreset::Coral;
+    AppearanceMode appearance_mode_ = AppearanceMode::Dark;
     ThemeColors colors_{};
 };
 
@@ -68,6 +68,7 @@ constexpr int kTransitionMs = 180;
 void StyleRoot(lv_obj_t* root);
 void StyleSurface(lv_obj_t* object, bool raised = false);
 void StyleButton(lv_obj_t* button, bool accent = false);
+void StyleTextInput(lv_obj_t* textarea);
 void StyleLabel(lv_obj_t* label, bool muted = false);
 
 }  // namespace agent_ui

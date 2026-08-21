@@ -1,6 +1,7 @@
 #include "camera_gallery_repository.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -14,7 +15,8 @@
 namespace agent_ui::camera {
 namespace {
 
-constexpr char kRoot[] = "/sdcard";
+constexpr char kDcimDirectory[] = "/sdcard/DCIM";
+constexpr char kCameraDirectory[] = "/sdcard/DCIM/Camera";
 constexpr std::size_t kMaxItems = 48;
 
 bool IsJpg(const char* name) {
@@ -36,10 +38,25 @@ bool IsJpg(const char* name) {
            (extension[4] == 'g' || extension[4] == 'G');
 }
 
-bool IsRootPath(const std::string& path) {
-    return path.size() > std::strlen(kRoot) + 1 &&
-           path.compare(0, std::strlen(kRoot) + 1, std::string(kRoot) + "/") == 0 &&
-           path.find('/', std::strlen(kRoot) + 1) == std::string::npos;
+bool IsCameraPath(const std::string& path) {
+    const std::string prefix = std::string(kCameraDirectory) + "/";
+    return path.size() > prefix.size() && path.compare(0, prefix.size(), prefix) == 0 &&
+           path.find('/', prefix.size()) == std::string::npos;
+}
+
+bool EnsureDirectory(const char* path) {
+    struct stat info = {};
+    if (stat(path, &info) == 0) return S_ISDIR(info.st_mode);
+    if (mkdir(path, 0775) == 0) return true;
+    if (errno != EEXIST || stat(path, &info) != 0) return false;
+    return S_ISDIR(info.st_mode);
+}
+
+bool EnsureCameraDirectory() {
+    if (!EnsureDirectory(kDcimDirectory) || !EnsureDirectory(kCameraDirectory)) {
+        return false;
+    }
+    return true;
 }
 
 std::string FormatDate(const std::tm& local, char separator) {
@@ -96,9 +113,11 @@ std::string FormatSizeLabel(std::size_t bytes) {
 
 std::vector<GalleryPhoto> GalleryRepository::List() const {
     std::vector<GalleryPhoto> result;
-    if (!SdCardManager::GetInstance().IsMounted()) return result;
+    if (!SdCardManager::GetInstance().IsMounted() || !EnsureCameraDirectory()) {
+        return result;
+    }
 
-    DIR* directory = opendir(kRoot);
+    DIR* directory = opendir(kCameraDirectory);
     if (directory == nullptr) return result;
     while (struct dirent* entry = readdir(directory)) {
         if (entry->d_name[0] == '.' &&
@@ -113,7 +132,7 @@ std::vector<GalleryPhoto> GalleryRepository::List() const {
         }
         GalleryPhoto photo;
         photo.name = entry->d_name;
-        photo.path = std::string(kRoot) + "/" + entry->d_name;
+        photo.path = std::string(kCameraDirectory) + "/" + entry->d_name;
         struct stat info = {};
         if (stat(photo.path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
             continue;
@@ -140,23 +159,33 @@ std::vector<GalleryPhoto> GalleryRepository::List() const {
 }
 
 bool GalleryRepository::Delete(const std::string& path) const {
-    return IsRootPath(path) && unlink(path.c_str()) == 0;
+    return IsCameraPath(path) && unlink(path.c_str()) == 0;
 }
 
 bool GalleryRepository::WriteJpeg(const std::vector<uint8_t>& jpeg,
                                   std::string* path) const {
-    if (jpeg.empty() || !SdCardManager::GetInstance().IsMounted()) return false;
+    if (jpeg.empty() || !SdCardManager::GetInstance().IsMounted() ||
+        !EnsureCameraDirectory()) {
+        return false;
+    }
     char output_path[96];
     const unsigned long timestamp =
         static_cast<unsigned long>(esp_timer_get_time() / 1000ULL);
-    std::snprintf(output_path, sizeof(output_path), "%s/IMG_%lu.jpg", kRoot, timestamp);
-    FILE* file = fopen(output_path, "wb");
+    FILE* file = nullptr;
+    for (unsigned attempt = 0; attempt < 1000 && file == nullptr; ++attempt) {
+        std::snprintf(output_path, sizeof(output_path), "%s/IMG_%lu.jpg",
+                      kCameraDirectory, timestamp + attempt);
+        if (access(output_path, F_OK) != 0) file = fopen(output_path, "wb");
+    }
     if (file == nullptr) {
         return false;
     }
     const std::size_t written = fwrite(jpeg.data(), 1, jpeg.size(), file);
     fclose(file);
-    if (written != jpeg.size()) return false;
+    if (written != jpeg.size()) {
+        unlink(output_path);
+        return false;
+    }
     if (path != nullptr) *path = output_path;
     return true;
 }

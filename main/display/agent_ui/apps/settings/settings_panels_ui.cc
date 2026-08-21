@@ -29,8 +29,8 @@ lv_obj_t* CreateHermesInput(lv_obj_t* parent, const char* title) {
 
     lv_obj_t* textarea = lv_textarea_create(field);
     lv_obj_set_size(textarea, LV_PCT(100), kHermesInputHeight);
+    StyleTextInput(textarea);
     lv_obj_set_style_pad_ver(textarea, kHermesInputVerticalPadding, LV_PART_MAIN);
-    lv_obj_set_style_text_font(textarea, fonts::Medium(), LV_PART_MAIN);
     return textarea;
 }
 
@@ -41,10 +41,19 @@ lv_obj_t* CreateAccentGrid(lv_obj_t* parent, size_t selected,
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_column(grid, 12, LV_PART_MAIN);
 
-    constexpr std::array<uint32_t, 4> colors = {
-        0x0B44D8, 0x008B83, 0xE74638, 0xC77B00,
+    struct AccentSwatch {
+        AccentPreset preset;
+        uint32_t color;
     };
-    for (size_t i = 0; i < colors.size(); ++i) {
+    constexpr std::array<AccentSwatch, 4> swatches = {
+        AccentSwatch{AccentPreset::Coral, 0xFF6D00},
+        AccentSwatch{AccentPreset::Cobalt, 0x0B44D8},
+        AccentSwatch{AccentPreset::Teal, 0x008B83},
+        AccentSwatch{AccentPreset::Amber, 0xC77B00},
+    };
+    for (const auto& item : swatches) {
+        const bool is_selected =
+            selected == static_cast<size_t>(item.preset);
         lv_obj_t* swatch = controls::CreateButton(grid);
         lv_obj_remove_style_all(swatch);
         lv_obj_set_height(swatch, 58);
@@ -52,23 +61,24 @@ lv_obj_t* CreateAccentGrid(lv_obj_t* parent, size_t selected,
         lv_obj_set_style_bg_color(swatch, lv_color_hex(theme.colors().surface),
                                   LV_PART_MAIN);
         lv_obj_set_style_bg_opa(swatch, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_width(swatch, selected == i ? 4 : 1,
+        lv_obj_set_style_border_width(swatch, is_selected ? 4 : 1,
                                       LV_PART_MAIN);
         lv_obj_set_style_border_color(
             swatch,
-            lv_color_hex(selected == i ? theme.colors().text
-                                       : theme.colors().border),
+            lv_color_hex(is_selected ? theme.colors().text
+                                     : theme.colors().border),
             LV_PART_MAIN);
         lv_obj_set_style_radius(swatch, 12, LV_PART_MAIN);
         if (callback != nullptr) {
             lv_obj_add_event_cb(swatch, callback, LV_EVENT_CLICKED,
-                                reinterpret_cast<void*>(i));
+                                reinterpret_cast<void*>(
+                                    static_cast<uintptr_t>(item.preset)));
         }
 
         lv_obj_t* color = lv_obj_create(swatch);
         lv_obj_remove_style_all(color);
         lv_obj_set_size(color, LV_PCT(72), 32);
-        lv_obj_set_style_bg_color(color, lv_color_hex(colors[i]), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(color, lv_color_hex(item.color), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(color, LV_OPA_COVER, LV_PART_MAIN);
         lv_obj_set_style_radius(color, 4, LV_PART_MAIN);
         lv_obj_center(color);

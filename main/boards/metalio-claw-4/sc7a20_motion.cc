@@ -210,6 +210,25 @@ void Sc7a20MotionService::SetSuspended(bool suspended) {
     }
 }
 
+bool Sc7a20MotionService::ReadAcceleration(Sc7a20Sample* sample) const {
+    if (sample == nullptr ||
+        !acceleration_valid_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint32_t before =
+            acceleration_sequence_.load(std::memory_order_acquire);
+        if ((before & 1U) != 0U) continue;
+        sample->x_mg = acceleration_x_mg_.load(std::memory_order_relaxed);
+        sample->y_mg = acceleration_y_mg_.load(std::memory_order_relaxed);
+        sample->z_mg = acceleration_z_mg_.load(std::memory_order_relaxed);
+        const uint32_t after =
+            acceleration_sequence_.load(std::memory_order_acquire);
+        if (before == after && (after & 1U) == 0U) return true;
+    }
+    return false;
+}
+
 bool Sc7a20MotionService::ReadTilt(Sc7a20Tilt* tilt) const {
     if (tilt == nullptr) return false;
     tilt->x_q10 = tilt_x_published_q10_.load(std::memory_order_acquire);
@@ -260,6 +279,7 @@ void Sc7a20MotionService::TaskMain() {
             } else {
                 consecutive_errors = 0;
                 const uint32_t now_ms = NowMs();
+                PublishAcceleration(sample);
                 UpdateTilt(sample);
                 ResetShakeActionCountIfExpired(now_ms);
                 const int reversal_count = detector_.Update(sample, now_ms);
@@ -334,6 +354,7 @@ void Sc7a20MotionService::Disconnect() {
         device_ = nullptr;
     }
     address_ = 0;
+    ResetAcceleration();
     ResetTilt();
 }
 
@@ -364,6 +385,24 @@ bool Sc7a20MotionService::ReadSample(Sc7a20Sample* sample) {
     sample->y_mg = DecodeAxis(bytes[2], bytes[3]);
     sample->z_mg = DecodeAxis(bytes[4], bytes[5]);
     return true;
+}
+
+void Sc7a20MotionService::PublishAcceleration(const Sc7a20Sample& sample) {
+    acceleration_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    acceleration_x_mg_.store(sample.x_mg, std::memory_order_relaxed);
+    acceleration_y_mg_.store(sample.y_mg, std::memory_order_relaxed);
+    acceleration_z_mg_.store(sample.z_mg, std::memory_order_relaxed);
+    acceleration_sequence_.fetch_add(1, std::memory_order_release);
+    acceleration_valid_.store(true, std::memory_order_release);
+}
+
+void Sc7a20MotionService::ResetAcceleration() {
+    acceleration_valid_.store(false, std::memory_order_release);
+    acceleration_sequence_.fetch_add(1, std::memory_order_acq_rel);
+    acceleration_x_mg_.store(0, std::memory_order_relaxed);
+    acceleration_y_mg_.store(0, std::memory_order_relaxed);
+    acceleration_z_mg_.store(0, std::memory_order_relaxed);
+    acceleration_sequence_.fetch_add(1, std::memory_order_release);
 }
 
 void Sc7a20MotionService::UpdateTilt(const Sc7a20Sample& sample) {

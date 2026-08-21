@@ -132,6 +132,27 @@ void GuardSliderRelease(lv_event_t* event) {
     }
 }
 
+void ToggleSwitchFromRow(lv_event_t* event) {
+    lv_obj_t* row = lv_event_get_current_target_obj(event);
+    // A click on the switch itself can bubble to the row. The switch has
+    // already updated its state in that case, so only handle direct row taps.
+    if (row == nullptr || lv_event_get_target_obj(event) != row) return;
+
+    auto* control = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+    if (control == nullptr || !lv_obj_is_valid(control) ||
+        lv_obj_has_state(control, LV_STATE_DISABLED)) {
+        return;
+    }
+
+    PlayHaptic(HapticStrength::Medium);
+    if (lv_obj_has_state(control, LV_STATE_CHECKED)) {
+        lv_obj_clear_state(control, LV_STATE_CHECKED);
+    } else {
+        lv_obj_add_state(control, LV_STATE_CHECKED);
+    }
+    lv_obj_send_event(control, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
 }  // namespace
 
 lv_obj_t* CreateButton(lv_obj_t* parent) {
@@ -803,18 +824,35 @@ lv_obj_t* AddSwitch(lv_obj_t* row, bool checked, lv_event_cb_t callback,
     const auto& colors = Theme::Get().colors();
     lv_obj_t* control = lv_switch_create(row);
     AttachButtonHaptic(control);
-    lv_obj_set_size(control, 72, 38);
+    lv_obj_set_size(control, 88, 48);
     lv_obj_align(control, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.raised), LV_PART_MAIN);
+    lv_obj_set_style_border_color(control, lv_color_hex(colors.border), LV_PART_MAIN);
+    lv_obj_set_style_border_width(control, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(
+        control, lv_color_hex(colors.accent),
+        Selector(LV_PART_MAIN, LV_STATE_CHECKED));
+    lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.accent),
                               Selector(LV_PART_INDICATOR, LV_STATE_CHECKED));
+    lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.muted), LV_PART_KNOB);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.accent_ink),
                               Selector(LV_PART_KNOB, LV_STATE_CHECKED));
+    lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_KNOB);
     if (checked) lv_obj_add_state(control, LV_STATE_CHECKED);
     if (callback != nullptr) {
         lv_obj_add_event_cb(control, callback, LV_EVENT_VALUE_CHANGED, user_data);
     }
+
+    // The whole settings card is the touch target. Child controls can bubble
+    // CLICKED events to the row, so ToggleSwitchFromRow ignores non-row targets
+    // to ensure a direct switch tap still toggles exactly once.
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(
+        row, kAccentSoftOpacity,
+        Selector(LV_PART_MAIN, LV_STATE_PRESSED));
+    lv_obj_add_event_cb(row, ToggleSwitchFromRow, LV_EVENT_CLICKED, control);
     IgnoreSwipeBack(control, true);
     return control;
 }

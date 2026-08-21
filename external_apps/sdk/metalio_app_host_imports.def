@@ -1,0 +1,34 @@
+/*
+ * Native symbols intentionally exposed by the AgentUI host to external ELF
+ * apps. Keep this list narrow: package_app.py uses the same file as its
+ * unresolved-import allowlist.
+ *
+ * METALIO_APP_IMPORT(imported_name, host_target)
+ */
+METALIO_APP_IMPORT(log, HostLog)
+METALIO_APP_IMPORT(sqrt, HostSqrt)
+METALIO_APP_IMPORT(round, HostRound)
+METALIO_APP_IMPORT(snprintf, HostSnprintf)
+METALIO_APP_IMPORT(__gtdf2, __gtdf2)
+METALIO_APP_IMPORT(memcpy, HostMemcpy)
+METALIO_APP_IMPORT(__ltdf2, __ltdf2)
+METALIO_APP_IMPORT(__adddf3, __adddf3)
+METALIO_APP_IMPORT(strtod, HostStrtod)
+METALIO_APP_IMPORT(fmod, HostFmod)
+METALIO_APP_IMPORT(cos, HostCos)
+METALIO_APP_IMPORT(memchr, HostMemchr)
+METALIO_APP_IMPORT(sin, HostSin)
+METALIO_APP_IMPORT(strncmp, HostStrncmp)
+METALIO_APP_IMPORT(pow, HostPow)
+METALIO_APP_IMPORT(log10, HostLog10)
+METALIO_APP_IMPORT(memcmp, HostMemcmp)
+METALIO_APP_IMPORT(__divdf3, __divdf3)
+METALIO_APP_IMPORT(__muldf3, __muldf3)
+METALIO_APP_IMPORT(memset, HostMemset)
+METALIO_APP_IMPORT(strcmp, HostStrcmp)
+METALIO_APP_IMPORT(tan, HostTan)
+METALIO_APP_IMPORT(__nedf2, __nedf2)
+METALIO_APP_IMPORT(__unorddf2, __unorddf2)
+METALIO_APP_IMPORT(strlen, HostStrlen)
+METALIO_APP_IMPORT(__gedf2, __gedf2)
+METALIO_APP_IMPORT(__subdf3, __subdf3)

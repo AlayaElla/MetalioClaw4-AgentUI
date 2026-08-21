@@ -249,7 +249,9 @@ idf_component_register(SRCS ${SOURCES}
                     WHOLE_ARCHIVE
                     )
 
-target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_driver_tsens)
+target_link_libraries(${COMPONENT_LIB} PRIVATE
+                      idf::esp_driver_pcnt
+                      idf::esp_driver_tsens)
 
 if(CONFIG_BOARD_TYPE_METALIO_CLAW_4)
     if(NOT CONFIG_PM_ENABLE)

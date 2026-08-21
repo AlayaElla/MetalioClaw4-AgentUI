@@ -38,9 +38,15 @@ constexpr int kMessageFirstScrollDelayMs = 1600;
 constexpr int kMessageScrollPeriodMs = 1000;
 constexpr int kCarouselHeight = 208;
 constexpr int kCarouselTop = metrics::kDisplaySize - kCarouselHeight;
-constexpr int kCarouselStep = 154;
-constexpr int kCarouselFocusX = 297;
-constexpr int kCarouselItemWidth = 126;
+constexpr int kCarouselStep = 180;
+constexpr int kCarouselItemWidth = 168;
+constexpr int kCarouselFocusX =
+    (metrics::kDisplaySize - kCarouselItemWidth) / 2;
+constexpr int kCarouselNameInset = 8;
+constexpr int kCarouselNameWidth =
+    kCarouselItemWidth - kCarouselNameInset * 2;
+constexpr int kCarouselNameY = 78;
+constexpr int kCarouselNameCompactArrowY = 135;
 constexpr int kCarouselEdgeWidth = 92;
 constexpr int kCarouselCenterX = metrics::kDisplaySize / 2;
 constexpr int kCarouselDetentSize = 8;
@@ -1303,15 +1309,30 @@ ArcItem CreateArcItem(lv_obj_t* parent, const AppDefinition& app,
 
     item.name = lv_label_create(item.button);
     lv_label_set_text(item.name, app.name.c_str());
-    lv_obj_set_style_text_font(item.name, fonts::MediumBold(), LV_PART_MAIN);
+    const lv_font_t* regular_name_font = fonts::MediumBold();
+    lv_point_t regular_name_size{};
+    // Use rendered pixels instead of UTF-8 length: Latin glyph widths vary,
+    // while a single CJK character occupies multiple bytes.
+    lv_text_get_size(&regular_name_size, app.name.c_str(), regular_name_font,
+                     0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    const bool compact_name =
+        regular_name_size.x > kCarouselNameWidth ||
+        regular_name_size.y > regular_name_font->line_height;
+    const lv_font_t* name_font =
+        compact_name ? fonts::SmallBold() : regular_name_font;
+    lv_obj_set_style_text_font(item.name, name_font, LV_PART_MAIN);
     lv_obj_set_style_text_color(item.name, lv_color_hex(colors.text), LV_PART_MAIN);
-    lv_obj_set_pos(item.name, 8, 78);
+    lv_label_set_long_mode(item.name, LV_LABEL_LONG_DOT);
+    lv_obj_set_size(item.name, kCarouselNameWidth,
+                    name_font->line_height * (compact_name ? 2 : 1));
+    lv_obj_set_pos(item.name, kCarouselNameInset, kCarouselNameY);
 
     item.arrow = lv_label_create(item.button);
     lv_label_set_text(item.arrow, FONT_AWESOME_ARROW_RIGHT);
     lv_obj_set_style_text_font(item.arrow, fonts::Icon(), LV_PART_MAIN);
     lv_obj_set_style_text_color(item.arrow, lv_color_hex(colors.text), LV_PART_MAIN);
-    lv_obj_set_pos(item.arrow, 8, 120);
+    lv_obj_set_pos(item.arrow, 8,
+                   compact_name ? kCarouselNameCompactArrowY : 120);
     return item;
 }
 

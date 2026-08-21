@@ -23,6 +23,10 @@ public:
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
+    // Controls whether the physical output transport may accept samples.
+    // Most codecs are always ready, but externally clocked transports can
+    // suspend this while their clock owner changes modes.
+    virtual bool SetOutputTransportEnabled(bool enabled);
 
     virtual void OutputData(std::vector<int16_t>& data);
     virtual bool InputData(std::vector<int16_t>& data);

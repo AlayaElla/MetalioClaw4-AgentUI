@@ -128,6 +128,17 @@ public:
     // Called on the AFE/input task with processed 16 kHz mono PCM.  Keep the
     // callback bounded: it must only copy into a preallocated recorder.
     void SetProcessedPcmCallback(std::function<void(const int16_t*, size_t)> callback);
+    // Independent host recording tap. It must remain copy-only and must not
+    // perform filesystem I/O on the audio input task.
+    void SetExternalRecordingPcmCallback(
+        std::function<void(const int16_t*, size_t)> callback);
+    // Keeps the processed-PCM route active and suppresses wake-word capture
+    // while an external App owns the microphone. The latest normal route
+    // requests are restored when recording ends.
+    void SetExternalRecordingActive(bool active);
+    // Prevents the power timer from disabling the shared codec while an
+    // external App is feeding PCM directly instead of using AudioOutputTask.
+    void SetExternalPlaybackActive(bool active);
     // Hermes uses a separate PCM route, never the Opus decoder queue.
     bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
                                 uint32_t playback_generation);
@@ -183,6 +194,14 @@ private:
     std::atomic<uint32_t> network_audio_generation_{0};
     std::function<void(const int16_t*, size_t)> processed_pcm_callback_;
     std::mutex processed_pcm_callback_mutex_;
+    std::function<void(const int16_t*, size_t)>
+        external_recording_pcm_callback_;
+    std::mutex external_recording_pcm_callback_mutex_;
+    std::mutex input_route_mutex_;
+    bool wake_word_requested_ = false;
+    bool voice_processing_requested_ = false;
+    bool external_recording_active_ = false;
+    std::atomic<bool> external_playback_active_{false};
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -205,6 +224,9 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    void UpdateInputRoutesLocked();
+    void ApplyWakeWordDetectionLocked(bool enable);
+    void ApplyVoiceProcessingLocked(bool enable);
     void UpdateListeningAudioFeatures(const std::vector<int16_t>& pcm);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();

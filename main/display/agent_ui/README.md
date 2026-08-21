@@ -57,9 +57,10 @@ Mode changes follow the audio module protocol sequence and are completed by
 the matching `SET MODE` response. Mode 2 accepts both a device selected from
 the scan results and a reconnect reported by the module. Other uncorrelated
 success responses do not change the current route. Once SLC confirms the
-hands-free control profile, the app selects call mode by default and requests
-the SCO path for headset playback and microphone input. Music mode remains an
-explicit A2DP playback option. `SETUP SCO` confirms the call audio path.
+control link, the app selects A2DP music mode by default for ordinary Bluetooth
+speakers. Call mode remains an explicit option that requests the SCO path for
+compatible headset playback and microphone input. `SETUP SCO` confirms the
+call audio path.
 A device-level disconnect returns the module to Mode 1, restores the local
 audio route, and resumes wake-word processing after the local I2S
 acknowledgement.

@@ -151,7 +151,7 @@ struct Adapter::Impl {
 
     void ResumeWakeWord() {
         if (!wake_word_paused.exchange(false)) return;
-        ESP_LOGI(TAG, "Resuming wake word after the I2S input is ready");
+        ESP_LOGI(TAG, "Resuming wake word after Bluetooth releases the I2S input");
         Application::GetInstance().GetAudioService().EnableWakeWordDetection(
             true);
     }
@@ -173,9 +173,49 @@ struct Adapter::Impl {
         snapshot.audio_profile = AudioProfile::None;
     }
 
+    bool SetOutputTransportEnabled(bool enabled) {
+        auto* codec = Board::GetInstance().GetAudioCodec();
+        if (codec == nullptr) return false;
+        return codec->SetOutputTransportEnabled(enabled);
+    }
+
+    void SuspendOutputForRouteChange() {
+        Application::GetInstance().GetAudioService().ResetDecoder();
+        if (!SetOutputTransportEnabled(false)) {
+            ESP_LOGE(TAG, "Failed to suspend output transport for route change");
+        }
+    }
+
+    bool ActivateBluetoothOutput(AudioProfile profile) {
+        bool connected = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connected = snapshot.connection == ConnectionState::Connected;
+        }
+        if (!connected || requested_profile.load() != profile) return false;
+
+        AudioOutput_SetTarget(AudioOutputTarget::BluetoothSpeaker, false);
+        if (!SetOutputTransportEnabled(true)) {
+            ESP_LOGE(TAG,
+                     "Bluetooth output transport could not resume for profile %d",
+                     static_cast<int>(profile));
+            UseLocalRoute(true);
+            StartMode(ModuleMode::Local);
+            return false;
+        }
+        ESP_LOGI(TAG, "Bluetooth output route activated for %s profile",
+                 profile == AudioProfile::Call ? "call" : "music");
+        ESP_LOGI(TAG,
+                 "Bluetooth audio state: profile=%s slc=%d sco=%d "
+                 "I2S owner=module ESP role=slave",
+                 profile == AudioProfile::Call ? "call" : "music",
+                 slc_connected.load() ? 1 : 0,
+                 sco_connected.load() ? 1 : 0);
+        return true;
+    }
+
     void UseLocalRoute(bool disable_setting) {
-        auto& application = Application::GetInstance();
-        application.GetAudioService().ResetDecoder();
+        SuspendOutputForRouteChange();
         auto* codec = Board::GetInstance().GetAudioCodec();
         const bool restart_output = codec != nullptr && codec->output_enabled();
         if (restart_output) {
@@ -385,6 +425,23 @@ struct Adapter::Impl {
         ScheduleVolumeSync();
     }
 
+    void HandleCodecOutputChanged(bool enabled, AudioOutputTarget target) {
+        if (!enabled || target != AudioOutputTarget::BluetoothSpeaker ||
+            requested_profile.load() != AudioProfile::Music) {
+            return;
+        }
+        bool connected = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            connected = snapshot.connection == ConnectionState::Connected;
+        }
+        if (!connected) return;
+        ESP_LOGI(TAG,
+                 "Bluetooth PCM playback started; applying upstream music "
+                 "start sequence at the playback boundary");
+        StartProfileCommand(AudioProfile::Music);
+    }
+
     void HandleSlcConnectSuccess() {
         HandleConnectSuccess();
         bool connected = false;
@@ -395,12 +452,33 @@ struct Adapter::Impl {
         if (!connected) return;
         slc_connected.store(true);
         ESP_LOGI(TAG, "Bluetooth hands-free control link is ready");
-        SetAudioProfile(AudioProfile::Call);
+        requested_profile.store(AudioProfile::Music);
+        sco_connected.store(false);
+        sco_input_ready.store(false);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            snapshot.audio_profile = AudioProfile::Music;
+        }
+        Publish();
+        ESP_LOGI(TAG,
+                 "Defaulting connected Bluetooth audio device to music route; "
+                 "profile commands will run when PCM playback starts");
+        if (!ActivateBluetoothOutput(AudioProfile::Music)) {
+            ESP_LOGE(TAG,
+                     "Failed to activate default Bluetooth music route");
+        } else {
+            auto* codec = Board::GetInstance().GetAudioCodec();
+            if (codec != nullptr && codec->output_enabled()) {
+                HandleCodecOutputChanged(true,
+                                         AudioOutputTarget::BluetoothSpeaker);
+            }
+        }
     }
 
     struct ScoValidationArgs {
         Impl* self;
         uint32_t session;
+        AudioProfile profile;
         bool require_sco;
     };
 
@@ -408,6 +486,7 @@ struct Adapter::Impl {
         auto* args = static_cast<ScoValidationArgs*>(parameter);
         Impl* self = args->self;
         const uint32_t session = args->session;
+        const AudioProfile profile = args->profile;
         const bool require_sco = args->require_sco;
         delete args;
 
@@ -427,6 +506,7 @@ struct Adapter::Impl {
                             ConnectionState::Connected;
             }
             if (self->audio_session.load() != session || !connected ||
+                self->requested_profile.load() != profile ||
                 (require_sco && !self->sco_connected.load())) {
                 vTaskDelete(nullptr);
                 return;
@@ -448,35 +528,47 @@ struct Adapter::Impl {
                 consecutive_frames = 0;
             }
             if (consecutive_frames >= kRequiredConsecutiveFrames) {
+                if (self->audio_session.load() != session ||
+                    self->requested_profile.load() != profile) {
+                    vTaskDelete(nullptr);
+                    return;
+                }
                 self->sco_input_ready.store(true);
                 self->sco_validation_running.store(false);
                 self->ResumeWakeWord();
-                self->StartInputWatchdog(session);
+                if (profile == AudioProfile::Call) {
+                    self->StartInputWatchdog(session);
+                }
                 ESP_LOGI(TAG,
-                         "Bluetooth I2S input is stable: microphone_peak=%d "
-                         "reference_peak=%d",
+                         "Bluetooth %s I2S input is stable: "
+                         "microphone_peak=%d reference_peak=%d",
+                         profile == AudioProfile::Call ? "call" : "music",
                          microphone_peak, reference_peak);
                 vTaskDelete(nullptr);
                 return;
             }
         }
 
-        if (self->audio_session.load() == session) {
+        if (self->audio_session.load() == session &&
+            self->requested_profile.load() == profile) {
             self->sco_validation_running.store(false);
-            ESP_LOGE(TAG,
-                     "Bluetooth SCO has no readable I2S input; wake word remains paused");
+            self->sco_input_ready.store(false);
+            ESP_LOGW(TAG,
+                     "Bluetooth %s profile remains active, but I2S microphone input is not readable; wake word remains paused",
+                     profile == AudioProfile::Call ? "call" : "music");
         }
         vTaskDelete(nullptr);
     }
 
-    void ValidateAudioInput(bool require_sco) {
+    void ValidateAudioInput(AudioProfile profile, bool require_sco) {
         if (sco_input_ready.load()) return;
         bool expected = false;
         if (!sco_validation_running.compare_exchange_strong(expected, true)) {
             return;
         }
         auto* args =
-            new ScoValidationArgs{this, audio_session.load(), require_sco};
+            new ScoValidationArgs{this, audio_session.load(), profile,
+                                  require_sco};
         if (xTaskCreate(ScoValidationTask, "bt_sco_input", 4096, args, 5,
                         nullptr) != pdPASS) {
             delete args;
@@ -492,21 +584,21 @@ struct Adapter::Impl {
             connected = snapshot.connection == ConnectionState::Connected;
         }
         if (!connected) return;
+        if (requested_profile.load() != AudioProfile::Call) {
+            ESP_LOGI(TAG, "Ignoring stale SETUP SCO outside call profile");
+            return;
+        }
         sco_connected.store(true);
         sco_input_ready.store(false);
-        requested_profile.store(AudioProfile::Call);
         {
             std::lock_guard<std::mutex> lock(mutex);
             snapshot.audio_profile = AudioProfile::Call;
         }
-        AudioOutput_SetTarget(AudioOutputTarget::BluetoothSpeaker, false);
-        if (module_volume.load() < 0) {
-            module_volume.store(0);
-        }
-        ScheduleVolumeSync();
         Publish();
-        ESP_LOGI(TAG, "Bluetooth SCO link is ready; validating I2S input");
-        ValidateAudioInput(true);
+        if (!ActivateBluetoothOutput(AudioProfile::Call)) return;
+        ESP_LOGI(TAG,
+                 "Bluetooth SCO link is ready; output active, validating microphone input");
+        ValidateAudioInput(AudioProfile::Call, true);
     }
 
     void HandleDeviceDisconnected(const std::string& reason) {
@@ -587,7 +679,13 @@ struct Adapter::Impl {
         ESP_LOGI(TAG, "RX: %s", line.c_str());
 
         if (line.find("SET MODE 1") != std::string::npos) {
-            if (MarkModeReady(ModuleMode::Local)) ResumeWakeWord();
+            if (MarkModeReady(ModuleMode::Local)) {
+                if (!SetOutputTransportEnabled(true)) {
+                    ESP_LOGE(TAG,
+                             "Local mode is ready but I2S output transport could not resume");
+                }
+                ResumeWakeWord();
+            }
             return;
         }
         if (line.find("SET MODE 2") != std::string::npos) {
@@ -682,7 +780,9 @@ struct Adapter::Impl {
             sco_input_ready.store(false);
             Publish();
             PauseWakeWord();
-            ValidateAudioInput(false);
+            ESP_LOGI(TAG,
+                     "DISC SCO confirms music profile; keeping Bluetooth "
+                     "output route unchanged");
             return;
         }
         if (line.find("CONNECT SUCCESS") != std::string::npos) {
@@ -842,22 +942,30 @@ struct Adapter::Impl {
         self->sco_input_ready.store(false);
         self->sco_validation_running.store(false);
         if (profile == AudioProfile::Call) {
-            uart.sendString("AT+PP=1\r\n");
+            const bool pp_sent = uart.sendString("AT+PP=1\r\n");
+            ESP_LOGI(TAG, "TX: AT+PP=1 (profile=call sent=%d)",
+                     pp_sent ? 1 : 0);
             vTaskDelay(pdMS_TO_TICKS(200));
-            uart.sendString("AT+BTSCO=1\r\n");
+            const bool sco_sent = uart.sendString("AT+BTSCO=1\r\n");
+            ESP_LOGI(TAG, "TX: AT+BTSCO=1 (profile=call sent=%d)",
+                     sco_sent ? 1 : 0);
             ESP_LOGI(TAG,
                      "Selected Bluetooth call profile; waiting for SETUP SCO");
         } else if (profile == AudioProfile::Music) {
-            uart.sendString("AT+BTSCO=0\r\n");
+            const bool sco_sent = uart.sendString("AT+BTSCO=0\r\n");
+            ESP_LOGI(TAG, "TX: AT+BTSCO=0 (profile=music sent=%d)",
+                     sco_sent ? 1 : 0);
             vTaskDelay(pdMS_TO_TICKS(200));
-            uart.sendString("AT+PP=1\r\n");
+            const bool pp_sent = uart.sendString("AT+PP=1\r\n");
+            ESP_LOGI(TAG, "TX: AT+PP=1 (profile=music sent=%d)",
+                     pp_sent ? 1 : 0);
             ESP_LOGI(TAG, "Selected Bluetooth music profile");
         }
         vTaskDelay(pdMS_TO_TICKS(200));
         self->profile_command_running.store(false);
         if (profile == AudioProfile::Music &&
             self->requested_profile.load() == profile) {
-            self->ValidateAudioInput(false);
+            self->ActivateBluetoothOutput(AudioProfile::Music);
         }
         const AudioProfile requested = self->requested_profile.load();
         if (requested != AudioProfile::None && requested != profile) {
@@ -879,9 +987,9 @@ struct Adapter::Impl {
             pdPASS) {
             delete args;
             profile_command_running.store(false);
-            if (profile == AudioProfile::Music) {
-                ValidateAudioInput(false);
-            }
+            ESP_LOGE(TAG, "Failed to create Bluetooth profile task");
+            UseLocalRoute(true);
+            StartMode(ModuleMode::Local);
         }
     }
 
@@ -930,6 +1038,8 @@ struct Adapter::Impl {
     void SetEnabled(bool enabled) {
         if (enabled) {
             local_recovery_running.store(false);
+            SuspendOutputForRouteChange();
+            AudioOutput_SetTarget(AudioOutputTarget::LocalSpeaker, false);
             PauseWakeWord();
             ClearConnectionExpectations();
             ClearProfileState();
@@ -1009,13 +1119,15 @@ struct Adapter::Impl {
             std::lock_guard<std::mutex> lock(mutex);
             connected = snapshot.connection == ConnectionState::Connected;
             unchanged = connected && snapshot.audio_profile == profile &&
-                        requested_profile.load() == profile;
+                        requested_profile.load() == profile &&
+                        sco_input_ready.load();
             if (connected && !unchanged) snapshot.audio_profile = profile;
         }
         if (!connected || profile == AudioProfile::None || unchanged) return;
         Publish();
+        SuspendOutputForRouteChange();
+        AudioOutput_SetTarget(AudioOutputTarget::LocalSpeaker, false);
         PauseWakeWord();
-        AudioOutput_SetTarget(AudioOutputTarget::BluetoothSpeaker, false);
         StartProfileCommand(profile);
     }
 };
@@ -1029,6 +1141,7 @@ Adapter::Adapter() : impl_(new Impl) {}
 
 Adapter::~Adapter() {
     AudioOutput_SetVolumeChangeHandler(nullptr, nullptr);
+    AudioOutput_SetCodecChangeHandler(nullptr, nullptr);
     delete impl_;
     impl_ = nullptr;
 }
@@ -1047,6 +1160,12 @@ void Adapter::Initialize() {
         [](int volume, void* context) {
             auto* adapter = static_cast<Adapter*>(context);
             adapter->impl_->SetDeviceVolume(volume);
+        },
+        this);
+    AudioOutput_SetCodecChangeHandler(
+        [](bool enabled, AudioOutputTarget target, void* context) {
+            auto* adapter = static_cast<Adapter*>(context);
+            adapter->impl_->HandleCodecOutputChanged(enabled, target);
         },
         this);
     SimpleUart::getInstance().registerSystemCallback(

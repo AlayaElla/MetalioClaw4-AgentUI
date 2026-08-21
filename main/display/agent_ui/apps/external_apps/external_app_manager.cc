@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -10,6 +11,7 @@
 #include <unistd.h>
 
 #include <cJSON.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 namespace agent_ui::external_apps {
@@ -24,6 +26,8 @@ constexpr size_t kMaxManifestBytes = 8192;
 constexpr size_t kMaxPackageEntries = 128;
 constexpr size_t kMaxEntryBytes = 8 * 1024 * 1024;
 constexpr size_t kMaxExtractedBytes = 16 * 1024 * 1024;
+constexpr size_t kPreferredCopyBufferBytes = 32 * 1024;
+constexpr size_t kFallbackCopyBufferBytes = 4 * 1024;
 
 struct TarHeader {
     char name[100];
@@ -46,6 +50,12 @@ struct TarHeader {
 };
 
 static_assert(sizeof(TarHeader) == kTarBlockSize);
+
+struct PackageRecord {
+    std::string path;
+    std::string name;
+    size_t size = 0;
+};
 
 void SetError(std::string* error, const std::string& message) {
     if (error != nullptr) *error = message;
@@ -148,6 +158,35 @@ bool ReadRequiredString(cJSON* root, const char* key, std::string* value) {
     }
     *value = item->valuestring;
     return true;
+}
+
+bool ReadManifestDisplayName(const std::string& path, std::string* name) {
+    std::string json;
+    if (!ReadBoundedFile(path, kMaxManifestBytes, &json)) return false;
+    cJSON* root = cJSON_ParseWithLength(json.data(), json.size());
+    if (root == nullptr) return false;
+    const bool okay = ReadRequiredString(root, "name", name);
+    cJSON_Delete(root);
+    return okay;
+}
+
+std::string PackageFileName(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+void EmitInstallProgress(const InstallProgressCallback& callback,
+                         InstallProgress* progress, size_t package_bytes,
+                         size_t completed_before, size_t* last_percent,
+                         bool force = false) {
+    if (!callback || progress == nullptr || progress->bytes_total == 0) return;
+    progress->bytes_completed = std::min(
+        progress->bytes_total, completed_before + package_bytes);
+    const size_t percent =
+        progress->bytes_completed * 100U / progress->bytes_total;
+    if (!force && last_percent != nullptr && percent == *last_percent) return;
+    if (last_percent != nullptr) *last_percent = percent;
+    callback(*progress);
 }
 
 bool ParseManifest(const std::string& root_path, AppInfo* app, std::string* error) {
@@ -271,17 +310,37 @@ bool SkipBytes(FILE* file, size_t count) {
     return true;
 }
 
-bool ExtractPackage(const std::string& package_path, std::string* error) {
-    FILE* archive = fopen(package_path.c_str(), "rb");
+bool ExtractPackage(const PackageRecord& package, InstallProgress* progress,
+                    size_t completed_before,
+                    const InstallProgressCallback& progress_callback,
+                    std::string* error) {
+    FILE* archive = fopen(package.path.c_str(), "rb");
     if (archive == nullptr) {
         SetError(error, "无法打开 App 包");
+        return false;
+    }
+
+    size_t copy_buffer_size = kPreferredCopyBufferBytes;
+    auto* copy_buffer = static_cast<unsigned char*>(heap_caps_malloc(
+        copy_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy_buffer == nullptr) {
+        copy_buffer_size = kFallbackCopyBufferBytes;
+        copy_buffer = static_cast<unsigned char*>(
+            heap_caps_malloc(copy_buffer_size, MALLOC_CAP_8BIT));
+    }
+    if (copy_buffer == nullptr) {
+        fclose(archive);
+        SetError(error, "内存不足，无法准备 App 安装缓冲区");
         return false;
     }
 
     bool okay = false;
     size_t entry_count = 0;
     size_t extracted_bytes = 0;
+    size_t last_percent = 101;
     unsigned char block[kTarBlockSize];
+    EmitInstallProgress(progress_callback, progress, 0, completed_before,
+                        &last_percent, true);
     while (fread(block, 1, sizeof(block), archive) == sizeof(block)) {
         if (IsZeroBlock(block)) {
             okay = true;
@@ -336,13 +395,20 @@ bool ExtractPackage(const std::string& package_path, std::string* error) {
             size_t remaining = file_size;
             bool write_okay = true;
             while (remaining > 0) {
-                const size_t chunk = std::min(remaining, sizeof(block));
-                if (fread(block, 1, chunk, archive) != chunk ||
-                    fwrite(block, 1, chunk, output) != chunk) {
+                const size_t chunk = std::min(remaining, copy_buffer_size);
+                if (fread(copy_buffer, 1, chunk, archive) != chunk ||
+                    fwrite(copy_buffer, 1, chunk, output) != chunk) {
                     write_okay = false;
                     break;
                 }
                 remaining -= chunk;
+                const long offset = ftell(archive);
+                if (offset >= 0) {
+                    EmitInstallProgress(
+                        progress_callback, progress,
+                        std::min(package.size, static_cast<size_t>(offset)),
+                        completed_before, &last_percent);
+                }
             }
             fclose(output);
             if (!write_okay) {
@@ -356,11 +422,30 @@ bool ExtractPackage(const std::string& package_path, std::string* error) {
                 break;
             }
             extracted_bytes += file_size;
+            if (relative == kManifestName && progress != nullptr) {
+                std::string manifest_name;
+                if (ReadManifestDisplayName(destination, &manifest_name)) {
+                    progress->app_name = std::move(manifest_name);
+                    const long offset = ftell(archive);
+                    EmitInstallProgress(
+                        progress_callback, progress,
+                        offset < 0
+                            ? 0
+                            : std::min(package.size,
+                                       static_cast<size_t>(offset)),
+                        completed_before, &last_percent, true);
+                }
+            }
         } else {
             SetError(error, "App 包包含不支持的链接或条目类型");
             break;
         }
     }
+    if (okay) {
+        EmitInstallProgress(progress_callback, progress, package.size,
+                            completed_before, &last_percent, true);
+    }
+    heap_caps_free(copy_buffer);
     fclose(archive);
     return okay;
 }
@@ -373,12 +458,16 @@ bool HasEappExtension(const std::string& name) {
     return extension == ".eapp";
 }
 
-bool ActivatePackage(const std::string& package_path, std::string* error) {
+bool ActivatePackage(const PackageRecord& package, InstallProgress* progress,
+                     size_t completed_before,
+                     const InstallProgressCallback& progress_callback,
+                     std::string* error) {
     if (!RemoveTree(kStagingPath) || !EnsureDirectoryTree(kStagingPath)) {
         SetError(error, "无法准备 App 临时目录");
         return false;
     }
-    if (!ExtractPackage(package_path, error)) {
+    if (!ExtractPackage(package, progress, completed_before, progress_callback,
+                        error)) {
         RemoveTree(kStagingPath);
         return false;
     }
@@ -389,13 +478,6 @@ bool ActivatePackage(const std::string& package_path, std::string* error) {
         return false;
     }
     const std::string final_path = std::string(Manager::kInstalledRoot) + "/" + candidate.id;
-    AppInfo installed;
-    if (ParseManifest(final_path, &installed, nullptr) &&
-        installed.version == candidate.version) {
-        RemoveTree(kStagingPath);
-        return true;
-    }
-
     if (!RemoveTree(kBackupPath)) {
         RemoveTree(kStagingPath);
         SetError(error, "无法清理 App 更新备份");
@@ -415,7 +497,7 @@ bool ActivatePackage(const std::string& package_path, std::string* error) {
     }
     RemoveTree(kBackupPath);
     ESP_LOGI(kTag, "Activated %s %s from %s", candidate.id.c_str(),
-             candidate.version.c_str(), package_path.c_str());
+             candidate.version.c_str(), package.path.c_str());
     return true;
 }
 
@@ -426,33 +508,66 @@ Manager& Manager::Get() {
     return instance;
 }
 
-bool Manager::Refresh(std::string* error) {
+bool Manager::Refresh(std::string* error,
+                      const InstallProgressCallback& progress_callback) {
     apps_.clear();
     if (!EnsureDirectoryTree(kPackagesRoot) || !EnsureDirectoryTree(kInstalledRoot)) {
         SetError(error, "SD 卡不可用，无法准备 App 目录");
         return false;
     }
 
-    std::vector<std::string> packages;
+    std::vector<PackageRecord> packages;
+    size_t total_package_bytes = 0;
     if (DIR* package_directory = opendir(kPackagesRoot)) {
         while (dirent* entry = readdir(package_directory)) {
             if (entry->d_name[0] == '.' || !HasEappExtension(entry->d_name)) continue;
             const std::string path = std::string(kPackagesRoot) + "/" + entry->d_name;
-            if (IsRegularFile(path)) packages.push_back(path);
+            struct stat info {};
+            if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+                info.st_size <= 0 ||
+                static_cast<uint64_t>(info.st_size) > SIZE_MAX) {
+                continue;
+            }
+            const size_t package_size = static_cast<size_t>(info.st_size);
+            if (total_package_bytes > SIZE_MAX - package_size) {
+                closedir(package_directory);
+                SetError(error, "待安装 App 包总大小超过限制");
+                return false;
+            }
+            std::string name = entry->d_name;
+            name.resize(name.size() - 5);
+            packages.push_back({path, std::move(name), package_size});
+            total_package_bytes += package_size;
         }
         closedir(package_directory);
     }
-    std::sort(packages.begin(), packages.end());
-    for (const std::string& package : packages) {
+    std::sort(packages.begin(), packages.end(),
+              [](const PackageRecord& left, const PackageRecord& right) {
+                  return left.path < right.path;
+              });
+    size_t completed_package_bytes = 0;
+    for (size_t index = 0; index < packages.size(); ++index) {
+        const PackageRecord& package = packages[index];
+        InstallProgress progress{
+            .app_name = package.name,
+            .package_name = PackageFileName(package.path),
+            .package_index = index + 1,
+            .package_count = packages.size(),
+            .bytes_completed = completed_package_bytes,
+            .bytes_total = total_package_bytes,
+        };
         std::string install_error;
-        if (!ActivatePackage(package, &install_error)) {
-            ESP_LOGW(kTag, "Ignoring %s: %s", package.c_str(), install_error.c_str());
-        } else if (unlink(package.c_str()) != 0) {
+        if (!ActivatePackage(package, &progress, completed_package_bytes,
+                             progress_callback, &install_error)) {
+            ESP_LOGW(kTag, "Ignoring %s: %s", package.path.c_str(),
+                     install_error.c_str());
+        } else if (unlink(package.path.c_str()) != 0) {
             ESP_LOGW(kTag, "Installed but could not remove %s: errno=%d",
-                     package.c_str(), errno);
+                     package.path.c_str(), errno);
         } else {
-            ESP_LOGI(kTag, "Removed installed package %s", package.c_str());
+            ESP_LOGI(kTag, "Removed installed package %s", package.path.c_str());
         }
+        completed_package_bytes += package.size;
     }
 
     DIR* installed_directory = opendir(kInstalledRoot);

@@ -1,0 +1,9 @@
+{
+  "manifest_version": 1,
+  "id": "com.metalio.calculator",
+  "name": "计算器",
+  "version": "1.0.0",
+  "api_version": 1,
+  "target": "esp32p4",
+  "entry": "elf/esp32p4.elf"
+}

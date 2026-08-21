@@ -2,10 +2,9 @@
 """Generate the Agent UI LVGL font assets.
 
 The browser demo uses Microsoft YaHei UI first, so the firmware uses the same
-regular and bold faces. Regular UI text and the small/large bold faces include
-GB2312; medium bold stays limited to current UI copy. Shared Segoe UI Emoji
-fallback fonts provide monochrome emoji at each UI text size without
-duplicating the same glyph bitmaps for both weights.
+regular and bold faces. Regular UI text and all bold body faces include GB2312.
+Shared Segoe UI Emoji fallback fonts provide monochrome emoji at each UI text
+size without duplicating the same glyph bitmaps for both weights.
 """
 
 from __future__ import annotations
@@ -200,14 +199,15 @@ def main() -> None:
             parser.error(str(error))
 
         outputs = (
-            (regular_font, "font_agent_small_18", 18, body_symbols, 3, True, False),
-            (regular_font, "font_agent_medium_28", 28, body_symbols, 3, True, False),
+            (regular_font, "font_agent_small_18", 18, body_symbols, 2, True, False),
+            (regular_font, "font_agent_medium_28", 28, body_symbols, 2, True, False),
             (regular_font, "font_agent_large_56", 56, display_symbols, 4, False, False),
-            (bold_font, "font_agent_small_bold_18", 18, body_symbols, 3, True, False),
-            # MediumBold is used by headings plus several runtime values. Keep
-            # all static Agent UI copy bold; unknown dynamic text falls through
-            # Medium() to the complete regular and emoji fonts.
-            (bold_font, "font_agent_medium_bold_28", 28, ui_symbols, 4, False, False),
+            (bold_font, "font_agent_small_bold_18", 18, body_symbols, 2, True, False),
+            # MediumBold renders dynamic values such as external App names, so
+            # it needs the complete body character set. Two-bit compressed
+            # antialiasing keeps the expanded font within the firmware budget
+            # without changing its face, weight, or pixel size.
+            (bold_font, "font_agent_medium_bold_28", 28, body_symbols, 2, True, False),
             (bold_font, "font_agent_large_bold_56", 56, body_symbols, 2, True, False),
             # Home carousel text is authored at its largest on-screen size.
             # LVGL then only scales it down during carousel motion, avoiding

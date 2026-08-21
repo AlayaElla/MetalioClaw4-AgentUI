@@ -8,6 +8,9 @@ enum class AudioOutputTarget : uint8_t {
 };
 
 using AudioOutputVolumeChangeHandler = void (*)(int volume, void* context);
+using AudioOutputCodecChangeHandler = void (*)(bool enabled,
+                                                AudioOutputTarget target,
+                                                void* context);
 
 // Product-level audio route. It owns the persisted target and the local PA
 // gate so UI pages, standby policy and the codec do not manipulate PA
@@ -18,4 +21,6 @@ void AudioOutput_SetCodecEnabled(bool enabled);
 void AudioOutput_SetStandby(bool standby);
 void AudioOutput_SetVolumeChangeHandler(AudioOutputVolumeChangeHandler handler,
                                         void* context);
+void AudioOutput_SetCodecChangeHandler(AudioOutputCodecChangeHandler handler,
+                                       void* context);
 void AudioOutput_NotifyVolumeChanged(int volume);

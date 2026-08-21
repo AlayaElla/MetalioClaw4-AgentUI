@@ -1,10 +1,8 @@
 #include "camera_capture_backend.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cinttypes>
-#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -16,6 +14,7 @@
 #include <unistd.h>
 
 #include "IOExpander.hpp"
+#include "effects/camera_effects.h"
 #include "driver/i2c_master.h"
 #include "esp_cam_sensor_xclk.h"
 #include "esp_check.h"
@@ -58,6 +57,8 @@ constexpr int kPreviewFrameW = 720;
 constexpr int kPreviewFrameH = 526;
 constexpr int kPreviewSensorW = 720;
 constexpr int kPreviewSensorH = 720;
+constexpr int kPreviewCropOffsetY =
+    (kPreviewSensorH - kPreviewFrameH) / 2;
 constexpr int kStillSensorW = 1920;
 constexpr int kStillSensorH = 1080;
 constexpr int kReviewBufferNum = 2;
@@ -67,12 +68,6 @@ constexpr int kReviewFramePad = 14;
 constexpr int kReviewFrameBottom = 40;
 constexpr int kReviewFrameW = kReviewImageW + 2 * kReviewFramePad;
 constexpr int kReviewFrameH = kReviewFramePad + kReviewImageH + kReviewFrameBottom;
-constexpr int kAsciiCellW = 7;
-constexpr int kAsciiCellH = 10;
-constexpr int kAsciiColumns = (kPreviewSensorW + kAsciiCellW - 1) / kAsciiCellW;
-constexpr int kAsciiRows = (kPreviewSensorH + kAsciiCellH - 1) / kAsciiCellH + 2;
-constexpr size_t kAsciiLumaBytes = static_cast<size_t>(kAsciiColumns) * kAsciiRows;
-constexpr int64_t kAsciiFrameIntervalUs = 90000;
 constexpr int kCamPowerOnSettleMs = 200;
 constexpr int kCamXclkSettleMs = 50;
 constexpr int kCamResetRecoverMs = 120;
@@ -116,346 +111,7 @@ struct CameraDev {
     uint32_t stride = 0;
 };
 
-inline uint16_t PackRgb565(int r, int g, int b) {
-    r = std::clamp(r, 0, 255);
-    g = std::clamp(g, 0, 255);
-    b = std::clamp(b, 0, 255);
-    return static_cast<uint16_t>(((r & 0xF8) << 8) |
-                                 ((g & 0xFC) << 3) | (b >> 3));
-}
-
-struct Rgb {
-    int r = 0;
-    int g = 0;
-    int b = 0;
-};
-
-struct Rgb888Pixels {
-    uint8_t* data = nullptr;
-
-    Rgb Read(int index) const {
-        const uint8_t* pixel = data + static_cast<size_t>(index) * 3;
-        return {pixel[2], pixel[1], pixel[0]};
-    }
-
-    void Write(int index, const Rgb& value) {
-        uint8_t* pixel = data + static_cast<size_t>(index) * 3;
-        pixel[0] = static_cast<uint8_t>(std::clamp(value.b, 0, 255));
-        pixel[1] = static_cast<uint8_t>(std::clamp(value.g, 0, 255));
-        pixel[2] = static_cast<uint8_t>(std::clamp(value.r, 0, 255));
-    }
-};
-
-struct Rgb565Pixels {
-    uint16_t* data = nullptr;
-
-    Rgb Read(int index) const {
-        const uint16_t value = data[index];
-        return {
-            ((value >> 11) & 0x1F) * 255 / 31,
-            ((value >> 5) & 0x3F) * 255 / 63,
-            (value & 0x1F) * 255 / 31,
-        };
-    }
-
-    void Write(int index, const Rgb& value) {
-        data[index] = PackRgb565(value.r, value.g, value.b);
-    }
-};
-
-int Luma(const Rgb& value) {
-    return (value.r * 77 + value.g * 150 + value.b * 29) >> 8;
-}
-
-uint32_t EffectNoise(int column, int row, uint32_t frame, uint32_t salt) {
-    uint32_t value = static_cast<uint32_t>(column + 1) * 374761393U;
-    value ^= static_cast<uint32_t>(row + 1) * 668265263U;
-    value ^= (frame + 1U) * 2246822519U;
-    value ^= (salt + 1U) * 3266489917U;
-    value = (value ^ (value >> 13U)) * 1274126177U;
-    return value ^ (value >> 16U);
-}
-
-template <typename Pixels>
-void ApplyMosaic(Pixels& pixels, int width, int height, bool dark_mode) {
-    constexpr int kBlockSize = 16;
-    const Rgb gap = dark_mode ? Rgb{17, 20, 17} : Rgb{241, 240, 236};
-    for (int block_y = 0; block_y < height; block_y += kBlockSize) {
-        for (int block_x = 0; block_x < width; block_x += kBlockSize) {
-            const int block_w = std::min(kBlockSize, width - block_x);
-            const int block_h = std::min(kBlockSize, height - block_y);
-            const int sample_x = block_x + block_w / 2;
-            const int sample_y = block_y + block_h / 2;
-            const Rgb sample = pixels.Read(sample_y * width + sample_x);
-            for (int y = 0; y < block_h; ++y) {
-                for (int x = 0; x < block_w; ++x) {
-                    const bool separator =
-                        (x == block_w - 1 && block_x + block_w < width) ||
-                        (y == block_h - 1 && block_y + block_h < height);
-                    pixels.Write((block_y + y) * width + block_x + x,
-                                 separator ? gap : sample);
-                }
-            }
-        }
-    }
-}
-
-template <typename Pixels>
-void ApplyBlackWhite(Pixels& pixels, int width, int height) {
-    const int pixel_count = width * height;
-    for (int index = 0; index < pixel_count; ++index) {
-        int gray = Luma(pixels.Read(index));
-        gray = std::clamp(((gray - 128) * 44) / 32 + 132, 0, 255);
-        pixels.Write(index, {gray, gray, gray});
-    }
-}
-
-int PosterizeChannel(int value) {
-    value = std::clamp(((value - 128) * 40) / 32 + 145, 0, 255);
-    return std::clamp(((value + 42) / 85) * 85, 0, 255);
-}
-
-enum class InkPlate {
-    Cyan,
-    Magenta,
-    Yellow,
-    Black,
-};
-
-struct InkPlateConfig {
-    InkPlate plate;
-    int angle_degrees;
-    int step;
-};
-
-constexpr std::array<InkPlateConfig, 4> kInkPlates = {{
-    {InkPlate::Cyan, 15, 18},
-    {InkPlate::Magenta, 75, 19},
-    {InkPlate::Yellow, 0, 17},
-    {InkPlate::Black, 45, 11},
-}};
-
-int InkCoverage(const Rgb& value, InkPlate plate) {
-    const int black = 255 - std::max({value.r, value.g, value.b});
-    switch (plate) {
-        case InkPlate::Cyan:
-            return std::clamp(255 - value.r - black, 0, 255);
-        case InkPlate::Magenta:
-            return std::clamp(255 - value.g - black, 0, 255);
-        case InkPlate::Yellow:
-            return std::clamp(255 - value.b - black, 0, 255);
-        case InkPlate::Black:
-            return black;
-    }
-    return 0;
-}
-
-Rgb ApplyInk(const Rgb& value, InkPlate plate) {
-    Rgb output = value;
-    switch (plate) {
-        case InkPlate::Cyan:
-            output.r = output.r * 28 / 100;
-            break;
-        case InkPlate::Magenta:
-            output.g = output.g * 28 / 100;
-            break;
-        case InkPlate::Yellow:
-            output.b = output.b * 30 / 100;
-            break;
-        case InkPlate::Black:
-            output.r = output.r * 18 / 100;
-            output.g = output.g * 18 / 100;
-            output.b = output.b * 18 / 100;
-            break;
-    }
-    return output;
-}
-
-template <typename Pixels>
-void DrawInkDot(Pixels& pixels, int width, int height, int center_x,
-                int center_y, int radius, InkPlate plate) {
-    const int radius_sq = radius * radius;
-    for (int y = -radius; y <= radius; ++y) {
-        const int pixel_y = center_y + y;
-        if (pixel_y < 0 || pixel_y >= height) continue;
-        for (int x = -radius; x <= radius; ++x) {
-            if (x * x + y * y > radius_sq) continue;
-            const int pixel_x = center_x + x;
-            if (pixel_x < 0 || pixel_x >= width) continue;
-            const int index = pixel_y * width + pixel_x;
-            pixels.Write(index, ApplyInk(pixels.Read(index), plate));
-        }
-    }
-}
-
-template <typename Pixels>
-void ApplyPrintComic(Pixels& pixels, int width, int height) {
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            const int index = y * width + x;
-            const Rgb value = pixels.Read(index);
-            const int luma = Luma(value);
-            const int right_luma = x + 1 < width ? Luma(pixels.Read(index + 1))
-                                                  : luma;
-            const int down_luma = y + 1 < height
-                                      ? Luma(pixels.Read(index + width))
-                                      : luma;
-            if (std::abs(luma - right_luma) + std::abs(luma - down_luma) > 82) {
-                pixels.Write(index, {8, 7, 6});
-                continue;
-            }
-            const int average = (value.r + value.g + value.b) / 3;
-            pixels.Write(index, {
-                PosterizeChannel(average + (value.r - average) * 3 / 2),
-                PosterizeChannel(average + (value.g - average) * 3 / 2),
-                PosterizeChannel(average + (value.b - average) * 3 / 2),
-            });
-        }
-    }
-
-    constexpr float kPi = 3.14159265358979323846f;
-    for (const InkPlateConfig& config : kInkPlates) {
-        const float tangent = std::tan(config.angle_degrees * kPi / 180.0f);
-        int row = 0;
-        for (int y = config.step / 2; y < height; y += config.step, ++row) {
-            const int offset = config.angle_degrees == 0
-                                   ? 0
-                                   : static_cast<int>(std::lround(y * tangent)) %
-                                         config.step;
-            for (int x = config.step / 2 + offset; x < width;
-                 x += config.step) {
-                const int sample_x = std::clamp(x, 0, width - 1);
-                const int coverage = InkCoverage(
-                    pixels.Read(y * width + sample_x), config.plate);
-                if (coverage < 20) continue;
-                const int max_radius = std::max(1, config.step / 2 - 1);
-                const int radius = std::max(
-                    1, static_cast<int>(std::lround(
-                           std::sqrt(coverage / 255.0f) * max_radius)));
-                DrawInkDot(pixels, width, height, x, y, radius, config.plate);
-            }
-        }
-    }
-}
-
-constexpr std::array<std::array<uint8_t, 5>, 16> kAsciiGlyphs = {{
-    {{0x3E, 0x51, 0x49, 0x45, 0x3E}},  // 0
-    {{0x00, 0x42, 0x7F, 0x40, 0x00}},  // 1
-    {{0x42, 0x61, 0x51, 0x49, 0x46}},  // 2
-    {{0x21, 0x41, 0x45, 0x4B, 0x31}},  // 3
-    {{0x18, 0x14, 0x12, 0x7F, 0x10}},  // 4
-    {{0x27, 0x45, 0x45, 0x45, 0x39}},  // 5
-    {{0x3C, 0x4A, 0x49, 0x49, 0x30}},  // 6
-    {{0x01, 0x71, 0x09, 0x05, 0x03}},  // 7
-    {{0x36, 0x49, 0x49, 0x49, 0x36}},  // 8
-    {{0x06, 0x49, 0x49, 0x29, 0x1E}},  // 9
-    {{0x7E, 0x11, 0x11, 0x11, 0x7E}},  // A
-    {{0x7F, 0x49, 0x49, 0x49, 0x36}},  // B
-    {{0x3E, 0x41, 0x41, 0x41, 0x22}},  // C
-    {{0x7F, 0x41, 0x41, 0x22, 0x1C}},  // D
-    {{0x7F, 0x49, 0x49, 0x49, 0x41}},  // E
-    {{0x7F, 0x09, 0x09, 0x09, 0x01}},  // F
-}};
-
-template <typename Pixels>
-void ApplyAscii(Pixels& pixels, int width, int height, uint32_t frame,
-                uint8_t* luma_scratch, size_t scratch_size) {
-    const int columns = (width + kAsciiCellW - 1) / kAsciiCellW;
-    const int rows = (height + kAsciiCellH - 1) / kAsciiCellH + 2;
-    if (luma_scratch == nullptr ||
-        static_cast<size_t>(columns) * rows > scratch_size) {
-        ApplyBlackWhite(pixels, width, height);
-        return;
-    }
-
-    for (int row = 0; row < rows; ++row) {
-        const int sample_y = std::clamp(row * kAsciiCellH + kAsciiCellH / 2,
-                                        0, height - 1);
-        for (int column = 0; column < columns; ++column) {
-            const int sample_x = std::clamp(
-                column * kAsciiCellW + kAsciiCellW / 2, 0, width - 1);
-            luma_scratch[row * columns + column] = static_cast<uint8_t>(
-                Luma(pixels.Read(sample_y * width + sample_x)));
-        }
-    }
-    for (int index = 0; index < width * height; ++index) {
-        pixels.Write(index, {0, 0, 0});
-    }
-
-    for (int column = 0; column < columns; ++column) {
-        if (EffectNoise(column, 0, 0, 3) % 29U == 0U) continue;
-        const int speed = 1 + static_cast<int>(EffectNoise(column, 0, 0, 5) % 3U);
-        const int offset = static_cast<int>(
-            (EffectNoise(column, 0, 0, 7) % kAsciiCellH +
-             frame * static_cast<uint32_t>(speed * 2)) % kAsciiCellH);
-        const int head_row = static_cast<int>(
-            (frame * static_cast<uint32_t>(speed) + column * 7U) % rows);
-        for (int row = -1; row < rows; ++row) {
-            if (EffectNoise(column, row, frame / 3U, 11) % 23U == 0U) continue;
-            const int y = row * kAsciiCellH + offset;
-            const int sample_row = std::clamp(row, 0, rows - 1);
-            const int brightness = luma_scratch[sample_row * columns + column];
-            const bool head = ((row % rows) + rows) % rows == head_row;
-            const Rgb color = head
-                                  ? Rgb{183, 255, 208}
-                                  : Rgb{0, 32 + brightness * 213 / 255,
-                                        8 + brightness * 54 / 255};
-            const auto& glyph = kAsciiGlyphs[
-                EffectNoise(column, row, frame, 13) % kAsciiGlyphs.size()];
-            for (int glyph_x = 0; glyph_x < 5; ++glyph_x) {
-                for (int glyph_y = 0; glyph_y < 7; ++glyph_y) {
-                    if ((glyph[glyph_x] & (1U << glyph_y)) == 0U) continue;
-                    const int pixel_x = column * kAsciiCellW + glyph_x + 1;
-                    const int pixel_y = y + glyph_y + 1;
-                    if (pixel_x < 0 || pixel_x >= width ||
-                        pixel_y < 0 || pixel_y >= height) {
-                        continue;
-                    }
-                    pixels.Write(pixel_y * width + pixel_x, color);
-                }
-            }
-        }
-    }
-}
-
-template <typename Pixels>
-void ApplyEffect(Pixels& pixels, int width, int height, EffectStyle style,
-                 bool dark_mode, uint32_t ascii_frame,
-                 uint8_t* luma_scratch, size_t scratch_size) {
-    switch (style) {
-        case EffectStyle::Original:
-            break;
-        case EffectStyle::Mosaic:
-            ApplyMosaic(pixels, width, height, dark_mode);
-            break;
-        case EffectStyle::PrintComic:
-            ApplyPrintComic(pixels, width, height);
-            break;
-        case EffectStyle::Ascii:
-            ApplyAscii(pixels, width, height, ascii_frame, luma_scratch,
-                       scratch_size);
-            break;
-        case EffectStyle::BlackWhite:
-            ApplyBlackWhite(pixels, width, height);
-            break;
-    }
-}
-
-const char* EffectName(EffectStyle style) {
-    switch (style) {
-        case EffectStyle::Original:
-            return "original";
-        case EffectStyle::Mosaic:
-            return "mosaic";
-        case EffectStyle::PrintComic:
-            return "print";
-        case EffectStyle::Ascii:
-            return "ascii";
-        case EffectStyle::BlackWhite:
-            return "black_white";
-    }
-    return "unknown";
-}
+using effects::PackRgb565;
 
 bool PpaRotateCropRgb565ToRgb888(const uint8_t* src, const CameraDev& cam,
                                  uint8_t* dst, void*& handle) {
@@ -480,7 +136,7 @@ bool PpaRotateCropRgb565ToRgb888(const uint8_t* src, const CameraDev& cam,
     config.in.block_w = kPreviewFrameW;
     config.in.block_h = kPreviewFrameH;
     config.in.block_offset_x = (cam.width - kPreviewFrameW) / 2;
-    config.in.block_offset_y = (cam.height - kPreviewFrameH) / 2;
+    config.in.block_offset_y = kPreviewCropOffsetY;
     config.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
     config.out.buffer = dst;
     config.out.buffer_size = static_cast<uint32_t>(PpaAlignedSize(
@@ -621,8 +277,8 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
     uint32_t ppa_failures = 0;
     uint8_t* display_buffers[kPreviewBufferNum] = {};
     std::shared_ptr<uint8_t> display_owners[kPreviewBufferNum];
-    uint8_t* ascii_luma = nullptr;
-    std::shared_ptr<uint8_t> ascii_luma_owner;
+    uint8_t* effect_scratch = nullptr;
+    std::shared_ptr<uint8_t> effect_scratch_owner;
     uint8_t* review_buffers[kReviewBufferNum] = {};
     std::shared_ptr<DecodedImage> review_images[kReviewBufferNum] = {};
     mutable std::mutex captured_frame_mutex;
@@ -646,8 +302,8 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
             display_owners[i].reset();
             display_buffers[i] = nullptr;
         }
-        ascii_luma_owner.reset();
-        ascii_luma = nullptr;
+        effect_scratch_owner.reset();
+        effect_scratch = nullptr;
         // DecodedImage pixel owners release review slots after any queued
         // ReviewReady/ViewState references are gone.  Do not free the raw
         // pointers here while those shared owners may still be live.
@@ -699,19 +355,20 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                 std::memset(display_buffers[i], 0, display_size);
             }
         }
-        if (ascii_luma == nullptr) {
-            ascii_luma = static_cast<uint8_t*>(heap_caps_malloc(
-                kAsciiLumaBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-            if (ascii_luma == nullptr) {
-                ESP_LOGE(kTag, "alloc ASCII luma scratch failed (%u bytes)",
-                         static_cast<unsigned>(kAsciiLumaBytes));
+        if (effect_scratch == nullptr) {
+            effect_scratch = static_cast<uint8_t*>(heap_caps_malloc(
+                effects::kEffectScratchBytes,
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (effect_scratch == nullptr) {
+                ESP_LOGE(kTag, "alloc effect scratch failed (%u bytes)",
+                         static_cast<unsigned>(effects::kEffectScratchBytes));
                 return false;
             }
-            ascii_luma_owner = std::shared_ptr<uint8_t>(
-                ascii_luma, [](uint8_t* value) {
+            effect_scratch_owner = std::shared_ptr<uint8_t>(
+                effect_scratch, [](uint8_t* value) {
                     if (value != nullptr) heap_caps_free(value);
                 });
-            std::memset(ascii_luma, 0, kAsciiLumaBytes);
+            std::memset(effect_scratch, 0, effects::kEffectScratchBytes);
         }
         const size_t review_size = PpaAlignedSize(
             MALLOC_CAP_SPIRAM,
@@ -1216,6 +873,10 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                     uint32_t effect_window_count = 0;
                     uint64_t effect_window_total_us = 0;
                     uint32_t effect_window_max_us = 0;
+                    uint32_t print_stage_window_count = 0;
+                    uint64_t print_radii_window_total_us = 0;
+                    uint64_t print_base_window_total_us = 0;
+                    uint64_t print_dots_window_total_us = 0;
                     while (running.load(std::memory_order_acquire) &&
                            generation.load(std::memory_order_acquire) ==
                                worker_generation) {
@@ -1279,17 +940,27 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                                 std::memory_order_acquire);
                                         const int64_t effect_started_us =
                                             esp_timer_get_time();
-                                        Rgb565Pixels captured_pixels{
+                                        effects::EffectStageTiming stage_timing;
+                                        effects::Rgb565Pixels captured_pixels{
                                             reinterpret_cast<uint16_t*>(
                                                 still_pixels)};
-                                        ApplyEffect(
-                                            captured_pixels, kPreviewSensorW,
-                                            kPreviewSensorH, captured_style,
-                                            captured_dark_mode,
-                                            static_cast<uint32_t>(
-                                                effect_started_us /
-                                                kAsciiFrameIntervalUs),
-                                            ascii_luma, kAsciiLumaBytes);
+                                        const effects::EffectContext
+                                            effect_context{
+                                                kPreviewSensorW,
+                                                kPreviewSensorH,
+                                                0,
+                                                captured_dark_mode,
+                                                static_cast<uint32_t>(
+                                                    effect_started_us /
+                                                    effects::
+                                                        kAnimationFrameIntervalUs),
+                                                effect_scratch,
+                                                effects::kEffectScratchBytes,
+                                                &stage_timing,
+                                            };
+                                        effects::ApplyEffect(
+                                            captured_pixels, captured_style,
+                                            effect_context);
                                         const int64_t effect_elapsed_us =
                                             esp_timer_get_time() -
                                             effect_started_us;
@@ -1321,10 +992,17 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                                 1000));
                                         ESP_LOGI(
                                             kTag,
-                                            "captured effect=%s processing=%lld ms",
-                                            EffectName(captured_style),
+                                            "captured effect=%s processing=%lld ms "
+                                            "print_radii/base/dots=%.2f/%.2f/%.2f ms",
+                                            effects::EffectName(captured_style),
                                             static_cast<long long>(
-                                                effect_elapsed_us / 1000));
+                                                effect_elapsed_us / 1000),
+                                            stage_timing.capture_radii_us /
+                                                1000.0,
+                                            stage_timing.render_base_us /
+                                                1000.0,
+                                            stage_timing.render_dots_us /
+                                                1000.0);
                                         {
                                             std::lock_guard<std::mutex> lock(
                                                 captured_frame_mutex);
@@ -1389,6 +1067,10 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                             effect_window_count = 0;
                             effect_window_total_us = 0;
                             effect_window_max_us = 0;
+                            print_stage_window_count = 0;
+                            print_radii_window_total_us = 0;
+                            print_base_window_total_us = 0;
+                            print_dots_window_total_us = 0;
                             {
                                 std::lock_guard<std::mutex> lock(
                                     performance_mutex);
@@ -1426,17 +1108,27 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                 if (active_effect != EffectStyle::Original) {
                                     const int64_t effect_started_us =
                                         esp_timer_get_time();
-                                    Rgb888Pixels effect_pixels{
+                                    effects::EffectStageTiming stage_timing;
+                                    effects::Rgb888Pixels effect_pixels{
                                         display_buffers[back]};
-                                    ApplyEffect(
-                                        effect_pixels, kPreviewFrameW,
-                                        kPreviewFrameH, active_effect,
-                                        effect_dark_mode.load(
-                                            std::memory_order_acquire),
-                                        static_cast<uint32_t>(
-                                            effect_started_us /
-                                            kAsciiFrameIntervalUs),
-                                        ascii_luma, kAsciiLumaBytes);
+                                    const effects::EffectContext
+                                        effect_context{
+                                            kPreviewFrameW,
+                                            kPreviewFrameH,
+                                            kPreviewCropOffsetY,
+                                            effect_dark_mode.load(
+                                                std::memory_order_acquire),
+                                            static_cast<uint32_t>(
+                                                effect_started_us /
+                                                effects::
+                                                    kAnimationFrameIntervalUs),
+                                            effect_scratch,
+                                            effects::kEffectScratchBytes,
+                                            &stage_timing,
+                                        };
+                                    effects::ApplyEffect(
+                                        effect_pixels, active_effect,
+                                        effect_context);
                                     const uint32_t effect_us =
                                         static_cast<uint32_t>(
                                             esp_timer_get_time() -
@@ -1445,6 +1137,16 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                     effect_window_total_us += effect_us;
                                     effect_window_max_us = std::max(
                                         effect_window_max_us, effect_us);
+                                    if (active_effect ==
+                                        EffectStyle::PrintComic) {
+                                        ++print_stage_window_count;
+                                        print_radii_window_total_us +=
+                                            stage_timing.capture_radii_us;
+                                        print_base_window_total_us +=
+                                            stage_timing.render_base_us;
+                                        print_dots_window_total_us +=
+                                            stage_timing.render_dots_us;
+                                    }
                                 }
                                 pending_index.store(back,
                                                     std::memory_order_release);
@@ -1507,6 +1209,24 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                           effect_window_total_us) /
                                           effect_window_count / 1000.0
                                     : 0.0;
+                            const double print_radii_avg_ms =
+                                print_stage_window_count > 0
+                                    ? static_cast<double>(
+                                          print_radii_window_total_us) /
+                                          print_stage_window_count / 1000.0
+                                    : 0.0;
+                            const double print_base_avg_ms =
+                                print_stage_window_count > 0
+                                    ? static_cast<double>(
+                                          print_base_window_total_us) /
+                                          print_stage_window_count / 1000.0
+                                    : 0.0;
+                            const double print_dots_avg_ms =
+                                print_stage_window_count > 0
+                                    ? static_cast<double>(
+                                          print_dots_window_total_us) /
+                                          print_stage_window_count / 1000.0
+                                    : 0.0;
                             const EffectStyle active_effect =
                                 effect_style.load(std::memory_order_acquire);
                             ESP_LOGI(
@@ -1515,6 +1235,7 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                 "pending_drop=%.1f fps frozen=%" PRIu32
                                 " PPA_avg/max=%.2f/%.2f ms "
                                 "effect=%s avg/max=%.2f/%.2f ms "
+                                "print_radii/base/dots=%.2f/%.2f/%.2f ms "
                                 "ack_avg/max=%.2f/%.2f ms "
                                 "PPA RGB565->RGB888 rotate_crop=%" PRIu32
                                 "/%" PRIu32,
@@ -1523,8 +1244,10 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                                 pending_drop_window_frames / seconds,
                                 frozen_window_frames, transform_avg_ms,
                                 transform_window_max_us / 1000.0,
-                                EffectName(active_effect), effect_avg_ms,
+                                effects::EffectName(active_effect), effect_avg_ms,
                                 effect_window_max_us / 1000.0,
+                                print_radii_avg_ms, print_base_avg_ms,
+                                print_dots_avg_ms,
                                 ack_avg_ms, window_ack_max_us / 1000.0,
                                 ppa_hits, ppa_failures);
                             stats_window_started_us = now_us;
@@ -1538,6 +1261,10 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
                             effect_window_count = 0;
                             effect_window_total_us = 0;
                             effect_window_max_us = 0;
+                            print_stage_window_count = 0;
+                            print_radii_window_total_us = 0;
+                            print_base_window_total_us = 0;
+                            print_dots_window_total_us = 0;
                         }
                     }
                     CloseDevice();
@@ -1715,7 +1442,7 @@ void CaptureBackend::SetEffect(EffectStyle style, bool dark_mode) {
         dark_mode, std::memory_order_acq_rel);
     if (previous != style || previous_dark != dark_mode) {
         ESP_LOGI(kTag, "camera effect=%s mosaic_gap=%s",
-                 EffectName(style), dark_mode ? "dark" : "light");
+                 effects::EffectName(style), dark_mode ? "dark" : "light");
     }
 }
 

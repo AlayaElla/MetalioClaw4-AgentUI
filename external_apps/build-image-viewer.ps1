@@ -1,6 +1,6 @@
 param(
     [string]$BuildDirectory = "$PSScriptRoot/examples/image_viewer/build",
-    [string]$Output = "$PSScriptRoot/dist/image-viewer-0.1.0.eapp"
+    [string]$Output = "$PSScriptRoot/dist/image-viewer-1.0.0.eapp"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,7 +12,7 @@ $example = Join-Path $PSScriptRoot "examples/image_viewer"
 $idf = Join-Path $env:IDF_PATH "tools/idf.py"
 $elf = Join-Path $BuildDirectory "metalio_image_viewer.app.elf"
 $manifest = Join-Path $example "manifest.json"
-$asset = Join-Path $PSScriptRoot "../main/display/agent_ui/apps/pet_demo/assets/q_drop_preview.png"
+$assetDirectory = Join-Path $example "assets"
 $packer = Join-Path $PSScriptRoot "tools/package_app.py"
 
 if (-not (Test-Path (Join-Path $BuildDirectory "CMakeCache.txt"))) {
@@ -21,5 +21,19 @@ if (-not (Test-Path (Join-Path $BuildDirectory "CMakeCache.txt"))) {
 }
 python $idf -C $example -B $BuildDirectory build
 if ($LASTEXITCODE -ne 0) { throw "Image Viewer build failed." }
-python $packer --manifest $manifest --elf $elf --asset $asset --output $Output
+$assets = @(Get-ChildItem -LiteralPath $assetDirectory -Filter "*.png" -File |
+    Sort-Object Name)
+if ($assets.Count -ne 5) {
+    throw "Image Viewer package requires exactly 5 PNG assets; found $($assets.Count)."
+}
+if (-not ($assets.Name -contains "demo.png")) {
+    throw "Image Viewer package icon assets/demo.png is missing."
+}
+
+$packageArgs = @($packer, "--manifest", $manifest, "--elf", $elf)
+foreach ($asset in $assets) {
+    $packageArgs += @("--asset", $asset.FullName)
+}
+$packageArgs += @("--output", $Output)
+python @packageArgs
 if ($LASTEXITCODE -ne 0) { throw "Image Viewer packaging failed." }

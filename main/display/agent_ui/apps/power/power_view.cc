@@ -104,20 +104,18 @@ void PowerView::BeginShutdown(const char* reason) {
     ESP_LOGW(kTag, "Shutdown started: %s", reason != nullptr ? reason : "system");
     CloseDialog();
 
+    const auto& colors = Theme::Get().colors();
     lv_obj_t* screen = lv_obj_create(nullptr);
     StyleRoot(screen);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x030403), LV_PART_MAIN);
     lv_obj_t* icon = lv_label_create(screen);
     lv_label_set_text(icon, FONT_AWESOME_POWER_OFF);
     lv_obj_set_style_text_font(icon, fonts::Icon(), LV_PART_MAIN);
-    lv_obj_set_style_text_color(icon, lv_color_hex(Theme::Get().colors().accent),
-                                LV_PART_MAIN);
+    lv_obj_set_style_text_color(icon, lv_color_hex(colors.accent), LV_PART_MAIN);
     lv_obj_align(icon, LV_ALIGN_CENTER, 0, -42);
     lv_obj_t* label = lv_label_create(screen);
     lv_label_set_text(label, "正在关机...");
     lv_obj_set_style_text_font(label, fonts::Large(), LV_PART_MAIN);
-    lv_obj_set_style_text_color(label, lv_color_hex(Theme::Get().colors().text),
-                                LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_hex(colors.text), LV_PART_MAIN);
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 42);
     lv_screen_load(screen);
     xTaskCreate(ShutdownPulseTask, "agent_power_off", 2048, nullptr, 5, nullptr);

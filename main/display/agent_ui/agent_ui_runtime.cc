@@ -1,11 +1,16 @@
 #include "agent_ui_runtime.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <string>
 
 #include <esp_random.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
+#include "agent_ui/apps/boot/boot_view.h"
 #include "agent_ui/apps/camera/camera_module.h"
 #include "agent_ui/apps/codex/codex_view.h"
 #include "agent_ui/apps/display_debug/display_debug_view.h"
@@ -98,12 +103,54 @@ void Runtime::OnBoardReady(Board& board) {
 }
 
 void Runtime::Start() {
-    std::string external_apps_error;
-    if (!external_apps::Manager::Get().Refresh(&external_apps_error)) {
-        ESP_LOGW(kTag, "External app discovery failed: %s",
-                 external_apps_error.c_str());
+    bool expected = false;
+    if (!start_started_.compare_exchange_strong(expected, true)) return;
+    if (xTaskCreate(StartTask, "app_install", 8192, this, 4, nullptr) != pdPASS) {
+        start_started_.store(false);
+        ESP_LOGE(kTag, "Failed to create external app installation task");
+        Navigation::Get().Start();
     }
-    Navigation::Get().Start();
+}
+
+void Runtime::StartTask(void* argument) {
+    static_cast<Runtime*>(argument)->RunStartTask();
+    vTaskDelete(nullptr);
+}
+
+void Runtime::RunStartTask() {
+    std::string external_apps_error;
+    const bool refreshed = external_apps::Manager::Get().Refresh(
+        &external_apps_error,
+        [](const external_apps::InstallProgress& progress) {
+            const uint8_t percent = progress.bytes_total == 0
+                                        ? 0
+                                        : static_cast<uint8_t>(std::min<uint64_t>(
+                                              100,
+                                              static_cast<uint64_t>(
+                                                  progress.bytes_completed) *
+                                                  100U /
+                                                  progress.bytes_total));
+            UiDispatcher::Post([
+                app_name = progress.app_name,
+                package_index = progress.package_index,
+                package_count = progress.package_count, percent]() {
+                BootView::SetInstallProgress(
+                    app_name.c_str(), package_index, package_count, percent);
+            });
+        });
+
+    while (!UiDispatcher::Post(
+        [this, refreshed, external_apps_error]() {
+            if (!refreshed) {
+                ESP_LOGW(kTag, "External app discovery failed: %s",
+                         external_apps_error.c_str());
+            }
+            BootView::SetReady();
+            Navigation::Get().Start();
+            start_started_.store(false);
+        })) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 void Runtime::SetAgentState(AgentState state) {

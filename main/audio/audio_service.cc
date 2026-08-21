@@ -74,6 +74,13 @@ void AudioService::Initialize(AudioCodec* codec) {
                 processed_pcm_callback_(data.data(), data.size());
             }
         }
+        {
+            std::lock_guard<std::mutex> lock(
+                external_recording_pcm_callback_mutex_);
+            if (external_recording_pcm_callback_) {
+                external_recording_pcm_callback_(data.data(), data.size());
+            }
+        }
         if (network_audio_enabled_.load(std::memory_order_acquire)) {
             PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
         }
@@ -543,6 +550,29 @@ void AudioService::SetProcessedPcmCallback(
     processed_pcm_callback_ = std::move(callback);
 }
 
+void AudioService::SetExternalRecordingPcmCallback(
+        std::function<void(const int16_t*, size_t)> callback) {
+    std::lock_guard<std::mutex> lock(
+        external_recording_pcm_callback_mutex_);
+    external_recording_pcm_callback_ = std::move(callback);
+}
+
+void AudioService::SetExternalRecordingActive(bool active) {
+    std::lock_guard<std::mutex> lock(input_route_mutex_);
+    if (external_recording_active_ == active) return;
+    external_recording_active_ = active;
+    UpdateInputRoutesLocked();
+}
+
+void AudioService::SetExternalPlaybackActive(bool active) {
+    external_playback_active_.store(active, std::memory_order_release);
+    if (active && audio_power_timer_ != nullptr) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(
+            audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+    }
+}
+
 void AudioService::SetNetworkAudioEnabled(bool enabled) {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     network_audio_enabled_.store(enabled, std::memory_order_release);
@@ -627,6 +657,12 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
+    std::lock_guard<std::mutex> lock(input_route_mutex_);
+    wake_word_requested_ = enable;
+    UpdateInputRoutesLocked();
+}
+
+void AudioService::ApplyWakeWordDetectionLocked(bool enable) {
     if (!wake_word_) {
         return;
     }
@@ -655,6 +691,16 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
+    std::lock_guard<std::mutex> lock(input_route_mutex_);
+    voice_processing_requested_ = enable;
+    UpdateInputRoutesLocked();
+}
+
+void AudioService::ApplyVoiceProcessingLocked(bool enable) {
+    const bool currently_enabled =
+        (xEventGroupGetBits(event_group_) &
+         AS_EVENT_AUDIO_PROCESSOR_RUNNING) != 0;
+    if (enable == currently_enabled) return;
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
         if (!audio_processor_initialized_) {
@@ -680,6 +726,23 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         audio_processor_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     }
+}
+
+void AudioService::UpdateInputRoutesLocked() {
+    const bool want_voice =
+        voice_processing_requested_ || external_recording_active_;
+    const bool want_wake = wake_word_requested_ && !want_voice;
+    const EventBits_t bits = xEventGroupGetBits(event_group_);
+    const bool wake_active = (bits & AS_EVENT_WAKE_WORD_RUNNING) != 0;
+    const bool voice_active =
+        (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) != 0;
+
+    // Disable the old route first because the input task gives wake-word
+    // capture priority over processed PCM when both bits are set.
+    if (wake_active && !want_wake) ApplyWakeWordDetectionLocked(false);
+    if (voice_active && !want_voice) ApplyVoiceProcessingLocked(false);
+    if (!voice_active && want_voice) ApplyVoiceProcessingLocked(true);
+    if (!wake_active && want_wake) ApplyWakeWordDetectionLocked(true);
 }
 
 void AudioService::UpdateListeningAudioFeatures(
@@ -892,10 +955,12 @@ void AudioService::CheckAndUpdateAudioPowerState() {
     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
         codec_->EnableInput(false);
     }
-    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
+    if (!external_playback_active_.load(std::memory_order_acquire) &&
+        output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
         codec_->EnableOutput(false);
     }
-    if (!codec_->input_enabled() && !codec_->output_enabled()) {
+    if (!codec_->input_enabled() && !codec_->output_enabled() &&
+        !external_playback_active_.load(std::memory_order_acquire)) {
         esp_timer_stop(audio_power_timer_);
     }
 }

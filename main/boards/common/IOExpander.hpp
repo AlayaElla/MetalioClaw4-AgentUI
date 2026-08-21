@@ -368,6 +368,8 @@ public:
     // The press is captured as soon as the active level is sampled. Releasing
     // before long_press_ms fires short_callback; remaining pressed through the
     // threshold fires long_callback once and suppresses the later short press.
+    // A press already active at registration is ignored until its release so
+    // a power-on hold cannot be reported as a new runtime press during boot.
     esp_err_t onShortOrLongPress(Pin pin,
                                  uint32_t long_press_ms,
                                  ClickCallback short_callback,
@@ -390,6 +392,11 @@ public:
             return ESP_ERR_INVALID_STATE;
         }
 
+        bool initial_level = !pressed_level;
+        const esp_err_t initial_read = readLevel(pin, &initial_level);
+        const bool initial_press_active =
+            initial_read == ESP_OK && initial_level == pressed_level;
+
         {
             std::lock_guard<std::mutex> lock(handlers_mutex_);
             press_handlers_.push_back(PressHandler{
@@ -398,11 +405,22 @@ public:
                 long_press_ms,
                 std::move(short_callback),
                 std::move(long_callback),
-                /*was_pressed*/false,
+                /*was_pressed*/initial_press_active,
                 /*press_start_us*/0,
-                /*long_fired*/false,
+                /*long_fired*/initial_press_active,
             });
             ensureMonitorTaskStartedLocked();
+        }
+
+        if (initial_press_active) {
+            ESP_LOGI(TAG,
+                     "onShortOrLongPress: pin '%s' active at registration; "
+                     "ignoring until release",
+                     PinName(pin));
+        } else if (initial_read != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "onShortOrLongPress: initial read of pin '%s' failed: %s",
+                     PinName(pin), esp_err_to_name(initial_read));
         }
 
         ESP_LOGI(TAG,

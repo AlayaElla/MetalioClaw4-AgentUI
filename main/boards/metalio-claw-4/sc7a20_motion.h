@@ -65,6 +65,7 @@ public:
 
     bool Start(i2c_master_bus_handle_t bus);
     void SetSuspended(bool suspended);
+    bool ReadAcceleration(Sc7a20Sample* sample) const;
     bool ReadTilt(Sc7a20Tilt* tilt) const;
 
 private:
@@ -80,6 +81,8 @@ private:
     bool ReadRegister(uint8_t reg, uint8_t* value);
     bool WriteRegister(uint8_t reg, uint8_t value);
     bool ReadSample(Sc7a20Sample* sample);
+    void PublishAcceleration(const Sc7a20Sample& sample);
+    void ResetAcceleration();
     void UpdateTilt(const Sc7a20Sample& sample);
     void ResetTilt();
     void ResetShakeActionCountIfExpired(uint32_t now_ms);
@@ -97,6 +100,11 @@ private:
     std::atomic<int16_t> tilt_x_published_q10_{0};
     std::atomic<int16_t> tilt_y_published_q10_{0};
     std::atomic<bool> tilt_valid_{false};
+    std::atomic<uint32_t> acceleration_sequence_{0};
+    std::atomic<int16_t> acceleration_x_mg_{0};
+    std::atomic<int16_t> acceleration_y_mg_{0};
+    std::atomic<int16_t> acceleration_z_mg_{0};
+    std::atomic<bool> acceleration_valid_{false};
     bool started_ = false;
     std::atomic<bool> suspended_{false};
     TaskHandle_t task_handle_ = nullptr;

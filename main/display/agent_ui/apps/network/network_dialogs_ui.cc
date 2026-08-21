@@ -140,10 +140,10 @@ void View::OpenPassword(const char* ssid, lv_event_cb_t connect_callback,
 
     password_textarea_ = lv_textarea_create(card);
     lv_obj_set_size(password_textarea_, LV_PCT(100), 58);
+    StyleTextInput(password_textarea_);
     lv_obj_align(password_textarea_, LV_ALIGN_TOP_LEFT, 0, 82);
     lv_textarea_set_one_line(password_textarea_, true);
     lv_textarea_set_password_mode(password_textarea_, true);
-    lv_obj_set_style_text_font(password_textarea_, fonts::Medium(), LV_PART_MAIN);
     IgnoreSwipeBack(password_textarea_, true);
 
     lv_obj_t* show = lv_checkbox_create(card);

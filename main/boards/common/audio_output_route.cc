@@ -16,6 +16,8 @@ bool s_standby = false;
 AudioOutputTarget s_target = AudioOutputTarget::LocalSpeaker;
 AudioOutputVolumeChangeHandler s_volume_change_handler = nullptr;
 void* s_volume_change_context = nullptr;
+AudioOutputCodecChangeHandler s_codec_change_handler = nullptr;
+void* s_codec_change_context = nullptr;
 
 AudioOutputTarget NormalizeTarget(int value) {
     return value == static_cast<int>(AudioOutputTarget::BluetoothSpeaker)
@@ -63,6 +65,9 @@ void AudioOutput_SetTarget(AudioOutputTarget target, bool persist) {
 void AudioOutput_SetCodecEnabled(bool enabled) {
     s_codec_enabled = enabled;
     ApplyPaState();
+    if (s_codec_change_handler != nullptr) {
+        s_codec_change_handler(enabled, s_target, s_codec_change_context);
+    }
 }
 
 void AudioOutput_SetStandby(bool standby) {
@@ -74,6 +79,12 @@ void AudioOutput_SetVolumeChangeHandler(AudioOutputVolumeChangeHandler handler,
                                         void* context) {
     s_volume_change_handler = handler;
     s_volume_change_context = context;
+}
+
+void AudioOutput_SetCodecChangeHandler(AudioOutputCodecChangeHandler handler,
+                                       void* context) {
+    s_codec_change_handler = handler;
+    s_codec_change_context = context;
 }
 
 void AudioOutput_NotifyVolumeChanged(int volume) {

@@ -8,6 +8,10 @@
 namespace agent_ui {
 namespace {
 
+constexpr lv_style_selector_t Selector(lv_part_t part, lv_state_t state) {
+    return static_cast<lv_style_selector_t>(part | state);
+}
+
 constexpr ThemeColors kBaseColors = {
     .background = 0xF7F6F3,
     .surface = 0xFFFFFF,
@@ -46,10 +50,10 @@ Theme& Theme::Get() {
 void Theme::Initialize() {
     Settings settings("agent_ui", true);
     const int appearance = settings.GetInt(
-        "appearance", static_cast<int>(AppearanceMode::Light));
+        "appearance", static_cast<int>(AppearanceMode::Dark));
     appearance_mode_ = static_cast<AppearanceMode>(std::clamp(
         appearance, 0, static_cast<int>(AppearanceMode::Dark)));
-    const int value = settings.GetInt("accent", static_cast<int>(AccentPreset::Cobalt));
+    const int value = settings.GetInt("accent", static_cast<int>(AccentPreset::Coral));
     const int maximum = static_cast<int>(AccentPreset::Amber);
     ApplyPreset(static_cast<AccentPreset>(std::clamp(value, 0, maximum)));
 }
@@ -78,8 +82,8 @@ void Theme::ApplyPreset(AccentPreset preset) {
             colors_.accent_pressed = dark ? 0x65D7CC : 0x006E68;
             break;
         case AccentPreset::Coral:
-            colors_.accent = dark ? 0xFF786E : 0xE74638;
-            colors_.accent_pressed = dark ? 0xFF9A93 : 0xC33227;
+            colors_.accent = 0xFF6D00;
+            colors_.accent_pressed = dark ? 0xFF8A33 : 0xD95D00;
             break;
         case AccentPreset::Amber:
             colors_.accent = dark ? 0xF0B449 : 0xC77B00;
@@ -131,6 +135,29 @@ void StyleButton(lv_obj_t* button, bool accent) {
     lv_obj_set_style_border_width(button, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(button, metrics::kRadiusControl, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(button, 0, LV_PART_MAIN);
+}
+
+void StyleTextInput(lv_obj_t* textarea) {
+    if (textarea == nullptr) return;
+    const auto& colors = Theme::Get().colors();
+    lv_obj_set_style_bg_color(textarea, lv_color_hex(colors.raised), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(textarea, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(textarea, lv_color_hex(colors.border),
+                                  LV_PART_MAIN);
+    lv_obj_set_style_border_width(textarea, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(
+        textarea, lv_color_hex(colors.accent),
+        Selector(LV_PART_MAIN, LV_STATE_FOCUSED));
+    lv_obj_set_style_border_width(textarea, 2,
+                                  Selector(LV_PART_MAIN, LV_STATE_FOCUSED));
+    lv_obj_set_style_radius(textarea, metrics::kRadiusControl, LV_PART_MAIN);
+    lv_obj_set_style_text_font(textarea, fonts::Medium(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(textarea, lv_color_hex(colors.text), LV_PART_MAIN);
+    lv_obj_set_style_text_color(textarea, lv_color_hex(colors.muted),
+                                LV_PART_TEXTAREA_PLACEHOLDER);
+    lv_obj_set_style_border_color(
+        textarea, lv_color_hex(colors.accent),
+        Selector(LV_PART_CURSOR, LV_STATE_FOCUSED));
 }
 
 void StyleLabel(lv_obj_t* label, bool muted) {

@@ -892,11 +892,10 @@ void BuildConfigDialog(lv_obj_t* root) {
     lv_obj_align(remote_label, LV_ALIGN_TOP_LEFT, 0, 0);
     s_ui.remote_ip = lv_textarea_create(s_ui.connection_panels[1]);
     lv_obj_set_size(s_ui.remote_ip, LV_PCT(100), 58);
+    StyleTextInput(s_ui.remote_ip);
     lv_obj_align(s_ui.remote_ip, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_textarea_set_one_line(s_ui.remote_ip, true);
     lv_textarea_set_placeholder_text(s_ui.remote_ip, "例如 203.0.113.10");
-    lv_obj_set_style_text_font(s_ui.remote_ip, fonts::Medium(), LV_PART_MAIN);
-    lv_obj_set_style_radius(s_ui.remote_ip, metrics::kRadiusControl, LV_PART_MAIN);
     lv_obj_add_event_cb(s_ui.remote_ip, OnConnectionInfoChanged,
                         LV_EVENT_VALUE_CHANGED, nullptr);
     Keyboard::Get().Bind(s_ui.remote_ip, "公网 IP", LV_KEYBOARD_MODE_TEXT_LOWER);
@@ -909,12 +908,11 @@ void BuildConfigDialog(lv_obj_t* root) {
     lv_obj_align(token_label, LV_ALIGN_TOP_LEFT, 0, 0);
     s_ui.token = lv_textarea_create(token_field);
     lv_obj_set_size(s_ui.token, LV_PCT(100), 66);
+    StyleTextInput(s_ui.token);
     lv_obj_align(s_ui.token, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_textarea_set_one_line(s_ui.token, true);
     lv_textarea_set_password_mode(s_ui.token, true);
     lv_textarea_set_placeholder_text(s_ui.token, "输入认证 Token");
-    lv_obj_set_style_text_font(s_ui.token, fonts::Medium(), LV_PART_MAIN);
-    lv_obj_set_style_radius(s_ui.token, metrics::kRadiusControl, LV_PART_MAIN);
     std::string saved_token;
     if (CodexWsClient::GetInstance().LoadToken(saved_token)) {
         lv_textarea_set_text(s_ui.token, saved_token.c_str());

@@ -30,9 +30,12 @@ public:
 private:
     Runtime() = default;
 
+    static void StartTask(void* argument);
+    void RunStartTask();
     static lv_obj_t* CreateHomeView();
     static lv_obj_t* CreateCameraView();
     bool initialized_ = false;
+    std::atomic<bool> start_started_{false};
     std::atomic<bool> board_ready_posted_{false};
     bool power_runtime_started_ = false;
     GlobalUiState global_state_;

@@ -1,6 +1,6 @@
 param(
     [string]$BuildDirectory = "$PSScriptRoot/examples/pet_demo/build",
-    [string]$Output = "$PSScriptRoot/dist/pet-demo-0.1.0.eapp"
+    [string]$Output = "$PSScriptRoot/dist/pet-demo-1.0.0.eapp"
 )
 
 $ErrorActionPreference = "Stop"
