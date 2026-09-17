@@ -279,7 +279,7 @@ int RecordingService::Start(
         void* owner, const metalio_app_recording_config_t* config) {
     if (owner == nullptr) return METALIO_APP_RECORDING_ERROR_INVALID;
     Application& app = Application::GetInstance();
-    if (app.GetDeviceState() != kDeviceStateIdle || app.IsHermesVoiceBusy() ||
+    if (app.GetDeviceState() != kDeviceStateIdle ||
         app.IsCodexVoiceCaptureActive()) {
         return METALIO_APP_RECORDING_ERROR_BUSY;
     }

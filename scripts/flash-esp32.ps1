@@ -3,6 +3,7 @@ param(
     [ValidateRange(115200, 2000000)]
     [int]$Baud = 921600,
     [string]$IdfPath = "D:\esp\v6.0.2\esp-idf",
+    [switch]$PromptForPort,
     [switch]$SkipBuild,
     [switch]$DryRun
 )
@@ -16,6 +17,11 @@ $RepositoryDirectory = (Resolve-Path (Join-Path $ScriptDirectory "..")).Path
 $PackageScriptPath = Join-Path $ScriptDirectory "package-esp32.ps1"
 $BuildDirectory = Join-Path $RepositoryDirectory "build"
 $FlashArgumentsPath = Join-Path $BuildDirectory "flash_args"
+
+if ($PromptForPort -and -not $PSBoundParameters.ContainsKey("Port")) {
+    $Port = Select-AgentSerialPort
+}
+$SerialPort = Resolve-AgentSerialPort -RequestedPort $Port
 
 if (-not $DryRun -and -not $SkipBuild) {
     Write-Host "Building and packaging the current AgentUI source before flashing..."
@@ -65,7 +71,6 @@ Write-Host "  Image:    $($AppImage.FullName)"
 Write-Host ("  Modified: {0:yyyy-MM-dd HH:mm:ss}" -f $AppImage.LastWriteTime)
 Write-Host ("  Size:     {0:N0} bytes" -f $AppImage.Length)
 
-$SerialPort = Resolve-AgentSerialPort -RequestedPort $Port
 if ($DryRun) {
     Write-Host ("Dry run: would erase the full chip, then write and verify {0:N2} MiB from {1}." -f `
         $FlashMiB, $FlashArgumentsPath)

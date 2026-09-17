@@ -1,0 +1,49 @@
+# 小智语音协议
+
+固件的 AI 对话统一使用小智协议。设备负责唤醒、音频采集、Opus 传输、播放、
+表情和设备端 MCP 工具；语音识别、语音合成及 Agent 执行由所连接的服务器提供。
+
+在设备上打开 **设置 → AI → 小智**，可选择“官方小智”或“自建服务器”。
+
+1. 选择“自建服务器”，填写服务器提供的 **HTTP / HTTPS 配置地址**，例如
+   `http://192.168.1.10:8003/xiaozhi/ota/`。实际域名、端口和路径以部署配置为准。
+2. 键盘点击完成会保存地址草稿；切换标签或离开页面也会保存，输入时不逐字写入闪存。
+3. 点击“保存并重启连接”。设备保存配置并重启，再从选定服务器获取连接参数。
+4. 要切回官方服务，选择“官方小智”并点击同一按钮；自建地址会保留，方便下次使用。
+
+只填写 `http://主机:端口` 时自动补全 `/xiaozhi/ota/`，完整路径按输入保留。
+配置地址必须使用 HTTP / HTTPS；不能把语音服务的 `ws://.../xiaozhi/v1/`
+地址填到这里。配置服务返回 MQTT 或 WebSocket 的地址和认证参数，固件沿用
+对应的小智协议建立会话。配置地址及返回的语音地址都必须能被设备访问；
+例如服务器返回的 `127.0.0.1` 指向设备本身，不能作为设备的连接地址。
+
+“当前配置”表示已保存的服务器选择；连接是否成功仍取决于网络和服务器响应。
+连接失败会提示检查设置并按原有流程重试；未获取到有效协议配置时保持未连接状态。
+自建服务器上的 Hermes 负责 Agent 执行，其账号、模型、记忆和工具设置在服务器管理。
+设备 AI 面板继续提供“语音唤醒”开关。
+
+`ProvisioningClient` 在启动时固定本次配置会话的地址，避免编辑设置影响正在进行的请求。
+地址优先读取 NVS `agent_ai/server_url`；首次使用新设置之前兼容原有
+`wifi/provisioning_url`，最后回退到 `CONFIG_PROVISIONING_URL`。
+“官方小智”明确选择 `https://api.tenclass.net/xiaozhi/ota/`。
+草稿保存在 `agent_ai/custom_url`，只有“保存并重启连接”才更新生效地址。
+启动获取配置前比较 `agent_ai/config_source`：来源变化时清理 `mqtt` 和 `websocket`
+连接缓存，全部提交成功后再更新来源标记；失败可重试。Wi-Fi、Codex 和语音偏好保留。
+
+升级后的首次启动会清理 `agent_ai` 中旧的 `provider`、`hermes_durl`、`hermes_user`、
+`hermes_pass` 和 `hermes_profile`。迁移逐项删除并显式提交 NVS，保留 `wake` 和其他偏好；
+没有旧键时不重复提交，失败时在后续启动重试。固件中保留这些旧键名仅用于配置迁移。
+
+公共音频服务继续支持 Codex 语音采集、通知声音和外部应用录音、播放。
+
+服务器设置的主机端回归用例位于 `tests/xiaozhi_server`，覆盖地址校验、旧配置兼容、
+草稿与生效地址隔离、官方/自建切换、缓存清理和 NVS 失败恢复。
+可在具有 C++ 编译器的终端单独运行：
+
+```powershell
+rtk proxy cmake -S tests/xiaozhi_server -B .tmp/xiaozhi-server-config-test
+rtk proxy cmake --build .tmp/xiaozhi-server-config-test --config Debug
+rtk proxy ctest --test-dir .tmp/xiaozhi-server-config-test -C Debug --output-on-failure
+```
+
+完整 ESP-IDF 编译通过后，仍需在设备上验收唤醒、连续对话、打断、断网重连和 MCP 执行。

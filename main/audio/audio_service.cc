@@ -57,6 +57,10 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        // Keep the token from the producer's entry point.  AFE::Stop only
+        // clears its run bit; it does not join a callback already executing.
+        const uint32_t production_generation =
+            network_audio_production_generation_.load(std::memory_order_acquire);
 #if CONFIG_USE_AUDIO_PROCESSOR
         if (listening_audio_enabled_.load(std::memory_order_acquire)) {
             // AFE has already denoised/AEC'd this 60 ms frame.  Analyze it
@@ -66,14 +70,6 @@ void AudioService::Initialize(AudioCodec* codec) {
 #else
         listening_audio_features_.PublishActivity(0.0f, false);
 #endif
-        // This is the only point where AFE-processed 16 kHz mono frames are
-        // available.  The Hermes recorder is strictly copy-only here.
-        {
-            std::lock_guard<std::mutex> lock(processed_pcm_callback_mutex_);
-            if (processed_pcm_callback_) {
-                processed_pcm_callback_(data.data(), data.size());
-            }
-        }
         {
             std::lock_guard<std::mutex> lock(
                 external_recording_pcm_callback_mutex_);
@@ -81,8 +77,9 @@ void AudioService::Initialize(AudioCodec* codec) {
                 external_recording_pcm_callback_(data.data(), data.size());
             }
         }
-        if (network_audio_enabled_.load(std::memory_order_acquire)) {
-            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        if (CanEnqueueNetworkAudio(production_generation)) {
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data),
+                                  production_generation);
         }
     });
 
@@ -164,6 +161,8 @@ void AudioService::Stop() {
     listening_audio_noise_floor_reset_pending_.store(
         true, std::memory_order_release);
     listening_audio_features_.Clear();
+    network_audio_production_active_.store(false, std::memory_order_release);
+    network_audio_production_generation_.fetch_add(1, std::memory_order_acq_rel);
     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
         AS_EVENT_WAKE_WORD_RUNNING |
         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
@@ -318,21 +317,9 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
-        const bool is_pcm_playback = task->type == kAudioTaskTypePcmPlaybackQueue;
-        if (is_pcm_playback) pcm_playback_active_.fetch_add(1, std::memory_order_acq_rel);
+        audio_playback_active_.fetch_add(1, std::memory_order_acq_rel);
         audio_queue_cv_.notify_all();
         lock.unlock();
-
-        std::unique_lock<std::mutex> pcm_output_lock(pcm_output_mutex_, std::defer_lock);
-        if (is_pcm_playback) {
-            pcm_output_lock.lock();
-            if (task->pcm_playback_generation !=
-                pcm_playback_generation_.load(std::memory_order_acquire)) {
-                pcm_playback_active_.fetch_sub(1, std::memory_order_acq_rel);
-                audio_queue_cv_.notify_all();
-                continue;
-            }
-        }
 
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
@@ -340,10 +327,8 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
-        if (is_pcm_playback) {
-            pcm_playback_active_.fetch_sub(1, std::memory_order_acq_rel);
-            audio_queue_cv_.notify_all();
-        }
+        audio_playback_active_.fetch_sub(1, std::memory_order_acq_rel);
+        audio_queue_cv_.notify_all();
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -387,6 +372,7 @@ void AudioService::OpusCodecTask() {
             auto task = std::make_unique<AudioTask>();
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
+            task->playback_gain_percent = packet->playback_gain_percent;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
@@ -396,6 +382,13 @@ void AudioService::OpusCodecTask() {
                     std::vector<int16_t> resampled(target_size);
                     output_resampler_.Process(task->pcm.data(), task->pcm.size(), resampled.data());
                     task->pcm = std::move(resampled);
+                }
+                if (task->playback_gain_percent < 100) {
+                    for (auto& sample : task->pcm) {
+                        const int32_t scaled = static_cast<int32_t>(sample) *
+                            task->playback_gain_percent / 100;
+                        sample = static_cast<int16_t>(scaled);
+                    }
                 }
 
                 lock.lock();
@@ -427,9 +420,8 @@ void AudioService::OpusCodecTask() {
                     bool notify = false;
                     {
                         std::lock_guard<std::mutex> queue_lock(audio_queue_mutex_);
-                        if (network_audio_enabled_.load(std::memory_order_acquire) &&
-                            task->network_audio_generation ==
-                                network_audio_generation_.load(std::memory_order_acquire)) {
+                        if (IsCurrentNetworkAudioGeneration(
+                                task->network_audio_generation)) {
                             pending_send_packets_.fetch_sub(1);
                             notify = true;
                         }
@@ -447,9 +439,8 @@ void AudioService::OpusCodecTask() {
             if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                 {
                     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-                    if (network_audio_enabled_.load(std::memory_order_acquire) &&
-                        task->network_audio_generation ==
-                            network_audio_generation_.load(std::memory_order_acquire)) {
+                    if (IsCurrentNetworkAudioGeneration(
+                            task->network_audio_generation)) {
                         audio_send_queue_.push_back(std::move(packet));
                     }
                 }
@@ -486,7 +477,9 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
     }
 }
 
-void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
+void AudioService::PushTaskToEncodeQueue(AudioTaskType type,
+                                         std::vector<int16_t>&& pcm,
+                                         uint32_t production_generation) {
     auto task = std::make_unique<AudioTask>();
     task->type = type;
     task->pcm = std::move(pcm);
@@ -495,7 +488,9 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
 
     if (type == kAudioTaskTypeEncodeToSendQueue) {
-        if (!network_audio_enabled_.load(std::memory_order_acquire)) return;
+        // Recheck under the queue lock because Stop can race an AFE callback
+        // after that callback has already sampled the input-route state.
+        if (!CanEnqueueNetworkAudio(production_generation)) return;
         task->network_audio_generation =
             network_audio_generation_.load(std::memory_order_acquire);
     }
@@ -544,12 +539,6 @@ void AudioService::EncodeAudio(
     audio_queue_cv_.notify_all();
 }
 
-void AudioService::SetProcessedPcmCallback(
-        std::function<void(const int16_t*, size_t)> callback) {
-    std::lock_guard<std::mutex> lock(processed_pcm_callback_mutex_);
-    processed_pcm_callback_ = std::move(callback);
-}
-
 void AudioService::SetExternalRecordingPcmCallback(
         std::function<void(const int16_t*, size_t)> callback) {
     std::lock_guard<std::mutex> lock(
@@ -573,43 +562,26 @@ void AudioService::SetExternalPlaybackActive(bool active) {
     }
 }
 
-void AudioService::SetNetworkAudioEnabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    network_audio_enabled_.store(enabled, std::memory_order_release);
-    if (!enabled) {
-        network_audio_generation_.fetch_add(1, std::memory_order_acq_rel);
-        audio_encode_queue_.erase(std::remove_if(audio_encode_queue_.begin(),
-            audio_encode_queue_.end(), [](const std::unique_ptr<AudioTask>& task) {
-                return task->type == kAudioTaskTypeEncodeToSendQueue;
-            }), audio_encode_queue_.end());
-        audio_send_queue_.clear();
-        pending_send_packets_.store(0, std::memory_order_release);
-        audio_queue_cv_.notify_all();
-    }
+bool AudioService::IsCurrentNetworkAudioGeneration(uint32_t generation) const {
+    return generation == network_audio_generation_.load(std::memory_order_acquire);
 }
 
-bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
-                                          uint32_t playback_generation) {
-    if (pcm.empty() || pcm.size() != OPUS_FRAME_DURATION_MS * 16000 / 1000) return false;
+bool AudioService::CanEnqueueNetworkAudio(uint32_t production_generation) const {
+    return network_audio_production_active_.load(std::memory_order_acquire) &&
+        production_generation ==
+            network_audio_production_generation_.load(std::memory_order_acquire);
+}
+
+void AudioService::CancelPendingSendAudio() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    if (playback_generation != pcm_playback_generation_.load(std::memory_order_acquire) ||
-        audio_playback_queue_.size() >= MAX_PLAYBACK_TASKS_IN_QUEUE) return false;
-    auto task = std::make_unique<AudioTask>();
-    task->type = kAudioTaskTypePcmPlaybackQueue;
-    task->pcm_playback_generation = playback_generation;
-    task->pcm = std::move(pcm);
-    audio_playback_queue_.push_back(std::move(task));
+    network_audio_generation_.fetch_add(1, std::memory_order_acq_rel);
+    audio_encode_queue_.erase(std::remove_if(audio_encode_queue_.begin(),
+        audio_encode_queue_.end(), [](const std::unique_ptr<AudioTask>& task) {
+            return task->type == kAudioTaskTypeEncodeToSendQueue;
+        }), audio_encode_queue_.end());
+    audio_send_queue_.clear();
+    pending_send_packets_.store(0, std::memory_order_release);
     audio_queue_cv_.notify_all();
-    return true;
-}
-
-bool AudioService::IsPcmPlaybackIdle() const {
-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return pcm_playback_active_.load(std::memory_order_acquire) == 0 &&
-        std::none_of(audio_playback_queue_.begin(), audio_playback_queue_.end(),
-        [](const std::unique_ptr<AudioTask>& task) {
-            return task->type == kAudioTaskTypePcmPlaybackQueue;
-        });
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
@@ -703,6 +675,8 @@ void AudioService::ApplyVoiceProcessingLocked(bool enable) {
     if (enable == currently_enabled) return;
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
+        network_audio_production_generation_.fetch_add(1, std::memory_order_acq_rel);
+        network_audio_production_active_.store(true, std::memory_order_release);
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
             audio_processor_initialized_ = true;
@@ -718,6 +692,10 @@ void AudioService::ApplyVoiceProcessingLocked(bool enable) {
         audio_processor_->Start();
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
+        // AFE::Stop resets its buffer but does not join an output callback.
+        // Invalidate that producer before clearing queued Codex audio.
+        network_audio_production_active_.store(false, std::memory_order_release);
+        network_audio_production_generation_.fetch_add(1, std::memory_order_acq_rel);
         listening_audio_enabled_.store(false, std::memory_order_release);
         voice_detected_.store(false, std::memory_order_release);
         listening_audio_noise_floor_reset_pending_.store(
@@ -825,9 +803,9 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
 }
 
-void AudioService::PlaySound(const std::string_view& ogg) {
+bool AudioService::PlaySound(const std::string_view& ogg, uint8_t gain_percent) {
     if (ogg.empty()) {
-        return;
+        return false;
     }
 
     if (!codec_->output_enabled()) {
@@ -849,6 +827,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
     bool seen_head = false;
     bool seen_tags = false;
+    bool queued = false;
     int sample_rate = 16000; // 默认值
 
     while (true) {
@@ -919,27 +898,31 @@ void AudioService::PlaySound(const std::string_view& ogg) {
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->sample_rate = sample_rate;
             packet->frame_duration = 60;
+            packet->playback_gain_percent = gain_percent;
             packet->payload.resize(pkt_len);
             std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
-            PushPacketToDecodeQueue(std::move(packet), true);
+            if (!PushPacketToDecodeQueue(std::move(packet), false)) {
+                ESP_LOGW(TAG, "Sound decode queue is full");
+                return queued;
+            }
+            queued = true;
         }
 
         offset = body_off + body_size;
     }
+    if (!queued) ESP_LOGW(TAG, "Sound did not contain an Opus packet");
+    return queued;
 }
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return audio_playback_active_.load(std::memory_order_acquire) == 0 &&
+        audio_encode_queue_.empty() && audio_decode_queue_.empty() &&
+        audio_playback_queue_.empty() && audio_testing_queue_.empty();
 }
 
 void AudioService::ResetDecoder() {
-    // Serialize cancellation with the start of a PCM OutputData call. A frame
-    // already being written may finish, but no stale frame can start after
-    // this method returns.
-    std::lock_guard<std::mutex> output_lock(pcm_output_mutex_);
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    pcm_playback_generation_.fetch_add(1, std::memory_order_acq_rel);
     opus_decoder_->ResetState();
     timestamp_queue_.clear();
     audio_decode_queue_.clear();

@@ -1,5 +1,6 @@
 # ESP-IDF build and managed dependencies
 /build/
+/build-idf*/
 /managed_components/
 **/build/
 /external_apps/examples/*/managed_components/
@@ -22,6 +23,8 @@
 /main/assets/locales/**/*.ogg
 /main/assets/common/*.ogg
 !/main/assets/common/ratchet_detent.ogg
+!/main/assets/common/codex_attention.ogg
+!/main/assets/common/codex_success.ogg
 
 # Credentials, local configuration and editor files
 .env
@@ -34,3 +37,15 @@
 .idea/
 Thumbs.db
 .DS_Store
+
+# Temporary snapshots and host compilation output
+/.tmp/
+*.tmp
+*.bak
+*.obj
+**/build-*/
+
+# Local tests and validation scripts
+/tests/
+/scripts/test-*
+/docs/codex-micro-voice.md

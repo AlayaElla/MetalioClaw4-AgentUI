@@ -12,6 +12,8 @@
 #include <new>
 #include <unistd.h>
 
+extern "C" void codex_remote_handle_notification_json(const char* json);
+
 static const char* TAG = "CodexWsClient";
 static const char* NVS_NAMESPACE = "codex_remote";
 
@@ -36,7 +38,6 @@ CodexWsClient& CodexWsClient::GetInstance() {
 
 CodexWsClient::CodexWsClient()
     : client_handle_(nullptr)
-    , connected_(false)
     , discovery_running_(false)
     , current_port_(8765) {
 }
@@ -118,6 +119,12 @@ bool CodexWsClient::Connect(const std::string& ip, int port) {
 
     esp_websocket_client_config_t ws_cfg = {};
     ws_cfg.uri = uri_buf;
+    ws_cfg.ping_interval_sec = codex_remote::transport::kPingIntervalSeconds;
+    ws_cfg.pingpong_timeout_sec = codex_remote::transport::kPongTimeoutSeconds;
+    ws_cfg.reconnect_timeout_ms = codex_remote::transport::kReconnectTimeoutMs;
+    ws_cfg.network_timeout_ms = codex_remote::transport::kNetworkTimeoutMs;
+    // Retain the same client for reconnects, including a clean bridge close.
+    ws_cfg.enable_close_reconnect = true;
     auth_header_ = "Authorization: Bearer " + token + "\r\n";
     ws_cfg.headers = auth_header_.c_str();
 
@@ -146,7 +153,7 @@ bool CodexWsClient::HasToken() const {
 }
 
 bool CodexWsClient::StartDiscovery(int timeout_ms, int initial_delay_ms) {
-    if (connected_.load() || timeout_ms <= 0) return false;
+    if (transport_state_.IsConnected() || timeout_ms <= 0) return false;
 
     bool expected = false;
     if (!discovery_running_.compare_exchange_strong(expected, true)) return false;
@@ -183,7 +190,7 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
     }
 
     int sock = -1;
-    if (!client->connected_.load()) {
+    if (!client->transport_state_.IsConnected()) {
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     }
 
@@ -205,7 +212,7 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
         const TickType_t started_at = xTaskGetTickCount();
         const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
 
-        while (!client->connected_.load() &&
+        while (!client->transport_state_.IsConnected() &&
                xTaskGetTickCount() - started_at < timeout_ticks) {
             sendto(sock, kDiscoveryRequest, strlen(kDiscoveryRequest), 0,
                    reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
@@ -264,7 +271,7 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
         }
 
         close(sock);
-    } else if (!client->connected_.load()) {
+    } else if (!client->transport_state_.IsConnected()) {
         ESP_LOGW(TAG, "Could not create LAN discovery socket");
     }
 
@@ -273,29 +280,44 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
 }
 
 void CodexWsClient::Disconnect() {
-    if (client_handle_) {
-        esp_websocket_client_stop(client_handle_);
-        esp_websocket_client_destroy(client_handle_);
-        client_handle_ = nullptr;
-    }
-    connected_ = false;
-    if (on_status_cb_) {
-        on_status_cb_(false);
+    // Clear the active handle before stop/destroy: an event from this explicit
+    // shutdown is stale by definition and must not alter a later connection.
+    esp_websocket_client_handle_t handle = client_handle_;
+    client_handle_ = nullptr;
+    NotifyDisconnected();
+    rx_buffer_.clear();
+    if (handle) {
+        esp_websocket_client_stop(handle);
+        esp_websocket_client_destroy(handle);
     }
 }
 
-bool CodexWsClient::SendTextMessage(const std::string& json_str) {
-    if (!client_handle_ || !connected_.load()) {
+bool CodexWsClient::Reconnect() {
+    const bool has_endpoint = !current_ip_.empty() &&
+        current_port_ >= 1 && current_port_ <= 65535;
+    if (!codex_remote::transport::CanReconnect(has_endpoint, HasToken())) {
+        ESP_LOGW(TAG, "Cannot reconnect without a saved peer and token");
+        return false;
+    }
+
+    const std::string ip = current_ip_;
+    const int port = current_port_;
+    Disconnect();
+    return Connect(ip, port);
+}
+
+bool CodexWsClient::SendTextMessage(const std::string& json_str, TickType_t timeout_ticks) {
+    if (!client_handle_ || !transport_state_.IsConnected()) {
         ESP_LOGE(TAG, "Cannot send text: Client not connected");
         return false;
     }
 
-    int res = esp_websocket_client_send_text(client_handle_, json_str.c_str(), json_str.length(), portMAX_DELAY);
-    return res >= 0;
+    int res = esp_websocket_client_send_text(client_handle_, json_str.c_str(), json_str.length(), timeout_ticks);
+    return res == static_cast<int>(json_str.length());
 }
 
 bool CodexWsClient::SendOpusAudioFrame(const uint8_t* data, size_t length) {
-    if (!client_handle_ || !connected_.load()) {
+    if (!client_handle_ || !transport_state_.IsConnected()) {
         ESP_LOGE(TAG, "Cannot send audio: Client not connected");
         return false;
     }
@@ -307,30 +329,31 @@ bool CodexWsClient::SendOpusAudioFrame(const uint8_t* data, size_t length) {
 void CodexWsClient::EventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
     CodexWsClient* client = static_cast<CodexWsClient*>(handler_args);
     esp_websocket_event_data_t* data = (esp_websocket_event_data_t*)event_data;
+    if (!client || !data || data->client != client->client_handle_) {
+        ESP_LOGW(TAG, "Ignoring WebSocket event from an inactive client");
+        return;
+    }
 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "WEBSOCKET_EVENT_CONNECTED");
-            client->connected_ = true;
-            if (client->on_status_cb_) {
-                client->on_status_cb_(true);
-            }
+            client->NotifyConnected();
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
-            client->connected_ = false;
-            client->rx_buffer_.clear();
-            if (client->on_status_cb_) {
-                client->on_status_cb_(false);
-            }
-            if (client->HasToken()) client->StartDiscovery(5000, 1500);
+            client->NotifyDisconnected();
             break;
 
         case WEBSOCKET_EVENT_DATA:
             // A text frame can be delivered in several events by ESP-IDF.
             if (data->op_code == 0x01 && data->data_ptr && data->data_len > 0) {
                 if (data->payload_offset == 0) client->rx_buffer_.clear();
+                if (data->payload_len > 512 * 1024 || data->payload_offset != static_cast<int>(client->rx_buffer_.size()) ||
+                    client->rx_buffer_.size() + data->data_len > 512 * 1024) {
+                    client->rx_buffer_.clear();
+                    break;
+                }
                 client->rx_buffer_.append(data->data_ptr, data->data_len);
 
                 const int payload_length = data->payload_len > 0
@@ -339,6 +362,7 @@ void CodexWsClient::EventHandler(void* handler_args, esp_event_base_t base, int3
                 if (data->payload_offset + data->data_len >= payload_length) {
                     ESP_LOGI(TAG, "Received text message (%u bytes)",
                              static_cast<unsigned>(client->rx_buffer_.size()));
+                    codex_remote_handle_notification_json(client->rx_buffer_.c_str());
                     if (client->on_message_cb_) {
                         client->on_message_cb_(client->rx_buffer_);
                     }
@@ -348,7 +372,23 @@ void CodexWsClient::EventHandler(void* handler_args, esp_event_base_t base, int3
             break;
 
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
+            ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR: type=%d errno=%d",
+                     static_cast<int>(data->error_handle.error_type),
+                     data->error_handle.esp_transport_sock_errno);
+            client->NotifyDisconnected();
             break;
+    }
+}
+
+void CodexWsClient::NotifyConnected() {
+    if (transport_state_.MarkConnected() && on_status_cb_) {
+        on_status_cb_(true);
+    }
+}
+
+void CodexWsClient::NotifyDisconnected() {
+    rx_buffer_.clear();
+    if (transport_state_.MarkDisconnected() && on_status_cb_) {
+        on_status_cb_(false);
     }
 }

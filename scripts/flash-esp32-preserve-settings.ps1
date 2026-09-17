@@ -3,6 +3,7 @@ param(
     [ValidateRange(115200, 2000000)]
     [int]$Baud = 921600,
     [string]$IdfPath = "D:\esp\v6.0.2\esp-idf",
+    [switch]$PromptForPort,
     [switch]$DryRun
 )
 
@@ -17,6 +18,11 @@ $PartitionTablePath = Join-Path $ProjectDirectory "partitions\v1\32m.csv"
 $FirmwarePath = Join-Path $RepositoryDirectory "build\esp32\Agent-ESP32P4-app.bin"
 $FirmwarePath = [System.IO.Path]::GetFullPath($FirmwarePath)
 
+if ($PromptForPort -and -not $PSBoundParameters.ContainsKey("Port")) {
+    $Port = Select-AgentSerialPort
+}
+$SerialPort = Resolve-AgentSerialPort -RequestedPort $Port
+
 $FactoryOffset = 0x200000
 $FactorySize = 14MB
 $PartitionTable = Get-Content -Raw -LiteralPath $PartitionTablePath
@@ -30,7 +36,6 @@ if ((Get-Item -LiteralPath $FirmwarePath).Length -gt $FactorySize) {
     throw "App firmware exceeds the 14 MB factory partition: $FirmwarePath"
 }
 
-$SerialPort = Resolve-AgentSerialPort -RequestedPort $Port
 if ($DryRun) {
     Write-Host "Dry run: would flash only the app image."
     Write-Host "  Image:  $FirmwarePath"

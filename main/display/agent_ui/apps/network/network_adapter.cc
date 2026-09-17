@@ -27,6 +27,7 @@
 #include "settings.h"
 #include "ssid_manager.h"
 #include "wifi_station.h"
+#include "wifi_connection_ownership.h"
 
 namespace agent_ui::network {
 namespace {
@@ -117,6 +118,9 @@ struct Adapter::Impl {
     esp_event_handler_instance_t ip_event_instance = nullptr;
     EventGroupHandle_t events = nullptr;
     bool wifi_station_was_active = false;
+    bool manual_wifi_owned = false;
+    bool wifi_driver_initialized = false;
+    std::recursive_mutex wifi_lifecycle_mutex;
     uint8_t last_disconnect_reason = 0;
 
     void Emit(const Event& event) {
@@ -217,12 +221,9 @@ struct Adapter::Impl {
     }
 
     bool InitializeWifi() {
+        std::lock_guard<std::recursive_mutex> lock(wifi_lifecycle_mutex);
+        if (!active.load(std::memory_order_acquire)) return false;
         if (wifi_initialized.load(std::memory_order_acquire)) return true;
-
-        wifi_mode_t mode = WIFI_MODE_NULL;
-        const esp_err_t mode_error = esp_wifi_get_mode(&mode);
-        wifi_station_was_active = mode_error == ESP_OK && mode != WIFI_MODE_NULL;
-        if (wifi_station_was_active) WifiStation::GetInstance().Stop();
 
         if (events == nullptr) {
             events = xEventGroupCreate();
@@ -234,40 +235,53 @@ struct Adapter::Impl {
             xEventGroupClearBits(events, kScanDone | kConnected | kDisconnected);
         }
 
+        WifiConnectionOwnership::GetInstance().AcquireManual([this]() {
+            wifi_mode_t mode = WIFI_MODE_NULL;
+            const esp_err_t mode_error = esp_wifi_get_mode(&mode);
+            wifi_station_was_active = mode_error == ESP_OK && mode != WIFI_MODE_NULL;
+            if (wifi_station_was_active) WifiStation::GetInstance().Stop();
+            manual_wifi_owned = true;
+        });
+        auto fail = [this]() {
+            TeardownWifi();
+            return false;
+        };
         esp_err_t error = esp_netif_init();
-        if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) return false;
+        if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) return fail();
         error = esp_event_loop_create_default();
-        if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) return false;
+        if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) return fail();
 
         netif = esp_netif_create_default_wifi_sta();
-        if (netif == nullptr) return false;
+        if (netif == nullptr) return fail();
 
         wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
         config.nvs_enable = false;
         error = esp_wifi_init(&config);
-        if (error != ESP_OK) {
-            netif = nullptr;
-            return false;
-        }
+        if (error != ESP_OK) return fail();
+        wifi_driver_initialized = true;
 
         error = esp_event_handler_instance_register(
             WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiEvent, this, &wifi_event_instance);
-        if (error != ESP_OK) return false;
+        if (error != ESP_OK) return fail();
         error = esp_event_handler_instance_register(
             IP_EVENT, IP_EVENT_STA_GOT_IP, &WifiEvent, this, &ip_event_instance);
-        if (error != ESP_OK) return false;
+        if (error != ESP_OK) return fail();
 
         if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_start() != ESP_OK) {
-            return false;
+            return fail();
         }
         wifi_initialized.store(true, std::memory_order_release);
         return true;
     }
 
     void TeardownWifi() {
-        if (!wifi_initialized.exchange(false, std::memory_order_acq_rel)) return;
-        esp_wifi_scan_stop();
-        esp_wifi_disconnect();
+        std::lock_guard<std::recursive_mutex> lock(wifi_lifecycle_mutex);
+        wifi_initialized.store(false, std::memory_order_release);
+        if (!manual_wifi_owned) return;
+        if (wifi_driver_initialized) {
+            esp_wifi_scan_stop();
+            esp_wifi_disconnect();
+        }
         if (wifi_event_instance != nullptr) {
             esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                                   wifi_event_instance);
@@ -278,13 +292,19 @@ struct Adapter::Impl {
                                                   ip_event_instance);
             ip_event_instance = nullptr;
         }
-        esp_wifi_stop();
-        esp_wifi_deinit();
+        if (wifi_driver_initialized) {
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            wifi_driver_initialized = false;
+        }
         if (netif != nullptr) {
-            esp_netif_destroy(netif);
+            esp_netif_destroy_default_wifi(netif);
             netif = nullptr;
         }
-        if (wifi_station_was_active) WifiStation::GetInstance().Start();
+        WifiConnectionOwnership::GetInstance().ReleaseManual([this]() {
+            if (wifi_station_was_active) WifiStation::GetInstance().Start();
+        });
+        manual_wifi_owned = false;
         wifi_station_was_active = false;
     }
 

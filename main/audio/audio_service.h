@@ -74,7 +74,6 @@ enum AudioTaskType {
     kAudioTaskTypeEncodeToTestingQueue,
     kAudioTaskTypeEncodeForCallback,
     kAudioTaskTypeDecodeToPlaybackQueue,
-    kAudioTaskTypePcmPlaybackQueue,
 };
 
 struct AudioTask {
@@ -82,7 +81,7 @@ struct AudioTask {
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
     uint32_t network_audio_generation = 0;
-    uint32_t pcm_playback_generation = 0;
+    uint8_t playback_gain_percent = 100;
     std::function<void(std::unique_ptr<AudioStreamPacket>)> on_encoded;
 };
 
@@ -125,9 +124,6 @@ public:
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
-    // Called on the AFE/input task with processed 16 kHz mono PCM.  Keep the
-    // callback bounded: it must only copy into a preallocated recorder.
-    void SetProcessedPcmCallback(std::function<void(const int16_t*, size_t)> callback);
     // Independent host recording tap. It must remain copy-only and must not
     // perform filesystem I/O on the audio input task.
     void SetExternalRecordingPcmCallback(
@@ -139,21 +135,19 @@ public:
     // Prevents the power timer from disabling the shared codec while an
     // external App is feeding PCM directly instead of using AudioOutputTask.
     void SetExternalPlaybackActive(bool active);
-    // Hermes uses a separate PCM route, never the Opus decoder queue.
-    bool PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm,
-                                uint32_t playback_generation);
-    uint32_t pcm_playback_generation() const {
-        return pcm_playback_generation_.load(std::memory_order_acquire);
-    }
-    bool IsPcmPlaybackIdle() const;
-    void SetNetworkAudioEnabled(bool enabled);
+    // Invalidates only queued network-audio work. Callers must own the active
+    // microphone route before using this to abandon a failed transport.
+    void CancelPendingSendAudio();
+    bool IsCurrentNetworkAudioGeneration(uint32_t generation) const;
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
     bool HasPendingSendAudio() const { return pending_send_packets_.load() > 0; }
     void EncodeAudio(std::vector<int16_t>&& pcm,
         std::function<void(std::unique_ptr<AudioStreamPacket>)> callback);
-    void PlaySound(const std::string_view& sound);
+    // Enqueues a local Ogg/Opus sound at a per-sound PCM gain. This never
+    // changes AudioCodec's persisted output volume.
+    bool PlaySound(const std::string_view& sound, uint8_t gain_percent = 100);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     uint32_t GetInputSequence() const { return input_sequence_.load(); }
     void ResetDecoder();
@@ -187,13 +181,13 @@ private:
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
     std::atomic<size_t> pending_send_packets_{0};
-    std::atomic<size_t> pcm_playback_active_{0};
-    std::atomic<uint32_t> pcm_playback_generation_{0};
-    std::mutex pcm_output_mutex_;
-    std::atomic<bool> network_audio_enabled_{true};
+    std::atomic<size_t> audio_playback_active_{0};
     std::atomic<uint32_t> network_audio_generation_{0};
-    std::function<void(const int16_t*, size_t)> processed_pcm_callback_;
-    std::mutex processed_pcm_callback_mutex_;
+    // The AFE runs on its own task.  This generation prevents an output frame
+    // that was already in flight when voice processing stopped from being
+    // attached to a later network-audio session.
+    std::atomic<bool> network_audio_production_active_{false};
+    std::atomic<uint32_t> network_audio_production_generation_{0};
     std::function<void(const int16_t*, size_t)>
         external_recording_pcm_callback_;
     std::mutex external_recording_pcm_callback_mutex_;
@@ -223,7 +217,9 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
-    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm,
+                               uint32_t production_generation = 0);
+    bool CanEnqueueNetworkAudio(uint32_t production_generation) const;
     void UpdateInputRoutesLocked();
     void ApplyWakeWordDetectionLocked(bool enable);
     void ApplyVoiceProcessingLocked(bool enable);

@@ -32,30 +32,25 @@ struct GeneralHandles {
 
 struct AiModel {
     bool wake_enabled = true;
-    bool hermes_selected = false;
-    const char* hermes_dashboard_url = nullptr;
-    const char* hermes_username = nullptr;
-    bool hermes_password_configured = false;
-    const char* hermes_profile = nullptr;
-    const char* hermes_test_status = nullptr;
-    const char* hermes_apply_status = nullptr;
+    bool custom_server = false;
+    const char* custom_url = "";
+    const char* status = "";
 };
 
 struct AiCallbacks {
     lv_event_cb_t wake_changed = nullptr;
-    lv_event_cb_t provider_changed = nullptr;
-    lv_event_cb_t hermes_field_committed = nullptr;
-    lv_event_cb_t hermes_save = nullptr;
-    lv_event_cb_t hermes_test = nullptr;
+    lv_event_cb_t server_changed = nullptr;
+    lv_event_cb_t url_ready = nullptr;
+    lv_event_cb_t apply = nullptr;
 };
 
 struct AiHandles {
-    lv_obj_t* hermes_dashboard_url = nullptr;
-    lv_obj_t* hermes_username = nullptr;
-    lv_obj_t* hermes_password = nullptr;
-    lv_obj_t* hermes_profile = nullptr;
-    lv_obj_t* hermes_test_status = nullptr;
-    lv_obj_t* hermes_apply_status = nullptr;
+    lv_obj_t* official_tab = nullptr;
+    lv_obj_t* custom_tab = nullptr;
+    lv_obj_t* custom_panel = nullptr;
+    lv_obj_t* url = nullptr;
+    lv_obj_t* status = nullptr;
+    lv_obj_t* apply = nullptr;
 };
 
 struct LanguageOption {

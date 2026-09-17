@@ -1,5 +1,8 @@
 #include "ui_components.h"
 
+#include <algorithm>
+#include <cstring>
+
 #include <font_awesome.h>
 #include "lvgl_private.h"
 
@@ -159,6 +162,373 @@ lv_obj_t* CreateButton(lv_obj_t* parent) {
     lv_obj_t* button = lv_button_create(parent);
     AttachButtonHaptic(button);
     return button;
+}
+
+lv_obj_t* CreateLineIcon(lv_obj_t* parent, LineIcon icon, int size) {
+    auto* object = lv_obj_create(parent);
+    lv_obj_remove_style_all(object);
+    lv_obj_set_size(object, size, size);
+    lv_obj_remove_flag(object, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
+    lv_obj_set_style_text_color(object, lv_color_hex(Theme::Get().colors().accent), LV_PART_MAIN);
+    lv_obj_add_event_cb(object, [](lv_event_t* event) {
+        // Small stroke icons share the same theme color and 24-unit grid.
+        // Negative coordinates lift the pen between separate paths.
+        static const int8_t tasks[][2] = {{3,3},{21,3},{21,21},{3,21},{3,3},{-1,-1},{3,8},{21,8},{-1,-1},{9,8},{9,21}};
+        static const int8_t sliders[][2] = {{3,5},{7,5},{-1,-1},{7,2},{7,8},{-1,-1},{7,5},{21,5},{-1,-1},{3,12},{16,12},{-1,-1},{16,9},{16,15},{-1,-1},{16,12},{21,12},{-1,-1},{3,19},{9,19},{-1,-1},{9,16},{9,22},{-1,-1},{9,19},{21,19}};
+        static const int8_t plus[][2] = {{12,3},{12,21},{-1,-1},{3,12},{21,12}};
+        static const int8_t sparkles[][2] = {{11,3},{13,10},{20,12},{13,14},{11,21},{9,14},{2,12},{9,10},{11,3},{-1,-1},{19,2},{19,6},{-1,-1},{17,4},{21,4}};
+        static const int8_t zap[][2] = {{13,2},{3,14},{11,14},{10,22},{21,9},{13,9},{13,2}};
+        static const int8_t monitor[][2] = {{2,3},{22,3},{22,17},{2,17},{2,3},{-1,-1},{12,17},{12,22},{-1,-1},{8,22},{16,22},{-1,-1},{8,10},{11,13},{16,8}};
+        static const int8_t keyboard[][2] = {{2,4},{22,4},{22,20},{2,20},{2,4},{-1,-1},{6,8},{7,8},{-1,-1},{10,8},{11,8},{-1,-1},{14,8},{15,8},{-1,-1},{18,8},{19,8},{-1,-1},{6,12},{7,12},{-1,-1},{10,12},{11,12},{-1,-1},{14,12},{15,12},{-1,-1},{18,12},{19,12},{-1,-1},{7,16},{17,16}};
+        static const int8_t link[][2] = {{10,8},{14,4},{18,3},{21,6},{20,10},{16,14},{-1,-1},{14,16},{10,20},{6,21},{3,18},{4,14},{8,10},{-1,-1},{8,16},{16,8}};
+        const int8_t (*points)[2] = nullptr;
+        size_t count = 0;
+        const auto kind = static_cast<LineIcon>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+#define ICON_POINTS(name) points = name; count = sizeof(name) / sizeof(name[0]); break
+        switch (kind) {
+            case LineIcon::Tasks: ICON_POINTS(tasks);
+            case LineIcon::Sliders: ICON_POINTS(sliders);
+            case LineIcon::Plus: ICON_POINTS(plus);
+            case LineIcon::Sparkles: ICON_POINTS(sparkles);
+            case LineIcon::Zap: ICON_POINTS(zap);
+            case LineIcon::Monitor: ICON_POINTS(monitor);
+            case LineIcon::Keyboard: ICON_POINTS(keyboard);
+            case LineIcon::Link: ICON_POINTS(link);
+        }
+#undef ICON_POINTS
+        auto* target = lv_event_get_target_obj(event);
+        lv_area_t area;
+        lv_obj_get_coords(target, &area);
+        const int scale = lv_obj_get_width(target);
+        lv_draw_line_dsc_t line;
+        lv_draw_line_dsc_init(&line);
+        line.color = lv_obj_get_style_text_color(target, LV_PART_MAIN);
+        line.opa = lv_obj_get_style_opa_recursive(target, LV_PART_MAIN);
+        line.width = scale >= 36 ? 3 : 2;
+        line.round_start = line.round_end = 1;
+        for (size_t i = 1; i < count; ++i) {
+            if (points[i-1][0] < 0 || points[i][0] < 0) continue;
+            line.p1 = {static_cast<lv_value_precise_t>(area.x1 + points[i-1][0] * scale / 24), static_cast<lv_value_precise_t>(area.y1 + points[i-1][1] * scale / 24)};
+            line.p2 = {static_cast<lv_value_precise_t>(area.x1 + points[i][0] * scale / 24), static_cast<lv_value_precise_t>(area.y1 + points[i][1] * scale / 24)};
+            lv_draw_line(lv_event_get_layer(event), &line);
+        }
+    }, LV_EVENT_DRAW_MAIN, reinterpret_cast<void*>(static_cast<uintptr_t>(icon)));
+    return object;
+}
+
+void SetCompactRowIcon(CompactRowParts& row, LineIcon icon, int size) {
+    if (row.icon) lv_obj_delete(row.icon);
+    row.icon = CreateLineIcon(row.root, icon, size);
+    lv_obj_align(row.icon, LV_ALIGN_LEFT_MID, 4, 0);
+}
+
+DrawerParts CreateRightDrawer(lv_obj_t* parent, lv_event_cb_t dismiss) {
+    DrawerParts parts;
+    const auto& colors = Theme::Get().colors();
+    parts.overlay = CreateModalOverlay(parent);
+    const int height = metrics::kDisplaySize - metrics::kStatusBarHeight;
+    lv_obj_set_size(parts.overlay, metrics::kDisplaySize, height);
+    lv_obj_set_y(parts.overlay, metrics::kStatusBarHeight);
+    lv_obj_set_style_bg_opa(parts.overlay, LV_OPA_30, LV_PART_MAIN);
+    if (dismiss) lv_obj_add_event_cb(parts.overlay, dismiss, LV_EVENT_CLICKED, nullptr);
+    parts.surface = CreateModalSurface(parts.overlay, 540, height);
+    lv_obj_align(parts.surface, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_bg_color(parts.surface, lv_color_hex(colors.background), LV_PART_MAIN);
+    lv_obj_set_style_border_width(parts.surface, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(parts.surface, 0, LV_PART_MAIN);
+    parts.content = CreateContentPanel(parts.surface, height - 84);
+    lv_obj_set_style_pad_hor(parts.content, 30, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(parts.content, 20, LV_PART_MAIN);
+    lv_obj_add_flag(parts.content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(parts.content, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLL_CHAIN_VER | LV_OBJ_FLAG_SCROLL_ELASTIC));
+    lv_obj_set_scroll_dir(parts.content, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(parts.content, LV_SCROLLBAR_MODE_AUTO);
+    parts.tabs = CreateContentPanel(parts.surface, 84);
+    lv_obj_set_y(parts.tabs, height - 84);
+    lv_obj_set_flex_flow(parts.tabs, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_hor(parts.tabs, 14, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(parts.tabs, 6, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(parts.tabs, 8, LV_PART_MAIN);
+    lv_obj_set_style_border_side(parts.tabs, LV_BORDER_SIDE_TOP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(parts.tabs, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(parts.tabs, lv_color_hex(colors.border), LV_PART_MAIN);
+    return parts;
+}
+
+void StyleSettingsCard(lv_obj_t* card, bool selected, bool outlined) {
+    const auto& colors = Theme::Get().colors();
+    lv_obj_set_style_bg_color(card, selected
+        ? lv_color_mix(lv_color_hex(colors.accent), lv_color_hex(colors.background), kAccentSoftOpacity)
+        : lv_color_hex(colors.raised), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_side(card, LV_BORDER_SIDE_FULL, LV_PART_MAIN);
+    lv_obj_set_style_border_width(card, selected ? 2 : outlined ? 1 : 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(card, lv_color_hex(selected ? colors.accent : colors.border), LV_PART_MAIN);
+    lv_obj_set_style_border_opa(card, selected || outlined ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, metrics::kRadiusControl, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(card, 0, LV_PART_MAIN);
+    lv_obj_set_style_opa(card, LV_OPA_50, LV_STATE_DISABLED);
+}
+
+ActionButtonParts AddDrawerTab(lv_obj_t* bar, LineIcon icon, const char* label,
+                               lv_event_cb_t callback, void* data) {
+    ActionButtonParts parts;
+    parts.root = CreateButton(bar);
+    lv_obj_remove_style_all(parts.root);
+    lv_obj_set_size(parts.root, 0, 70);
+    lv_obj_set_flex_grow(parts.root, 1);
+    lv_obj_set_style_radius(parts.root, 12, LV_PART_MAIN);
+    lv_obj_set_flex_flow(parts.root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(parts.root, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(parts.root, 5, LV_PART_MAIN);
+    parts.icon = CreateLineIcon(parts.root, icon);
+    parts.label = lv_label_create(parts.root);
+    lv_label_set_text(parts.label, label);
+    lv_obj_set_style_text_font(parts.label, fonts::SmallBold(), LV_PART_MAIN);
+    if (callback) lv_obj_add_event_cb(parts.root, callback, LV_EVENT_CLICKED, data);
+    SetDrawerTabSelected(parts.root, false);
+    return parts;
+}
+
+void SetDrawerTabSelected(lv_obj_t* button, bool selected) {
+    const auto& colors = Theme::Get().colors();
+    lv_obj_set_style_bg_color(button, lv_color_hex(colors.accent), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(button, selected ? kAccentSoftOpacity : static_cast<lv_opa_t>(LV_OPA_TRANSP), LV_PART_MAIN);
+    for (uint32_t i = 0; i < lv_obj_get_child_count(button); ++i)
+        lv_obj_set_style_text_color(lv_obj_get_child(button, i), lv_color_hex(selected ? colors.accent : colors.muted), LV_PART_MAIN);
+}
+
+void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
+    if (label && std::strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+StatusCardParts CreateStatusCard(lv_obj_t* parent, const char* heading,
+                                 lv_event_cb_t callback, void* data) {
+    StatusCardParts parts;
+    const auto row = CreateCompactRow(parent, nullptr, "未绑定", heading, nullptr,
+                                      112, false, false, callback, data);
+    parts.root = row.root;
+    parts.title = row.title;
+    parts.heading = row.detail;
+    StyleSettingsCard(parts.root, false, false);
+    lv_obj_set_style_pad_hor(parts.root, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(parts.root, 12, LV_PART_MAIN);
+    const auto& colors = Theme::Get().colors();
+    lv_obj_set_width(parts.title, LV_PCT(90));
+    lv_obj_set_height(parts.title, fonts::MediumBold()->line_height);
+    lv_obj_align(parts.title, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_width(parts.heading, 100);
+    lv_obj_set_height(parts.heading, fonts::Small()->line_height);
+    lv_obj_align(parts.heading, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    auto* status_row = CreateContentPanel(parts.root, fonts::Small()->line_height);
+    lv_obj_set_width(status_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(status_row, 8, LV_PART_MAIN);
+    lv_obj_align(status_row, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    parts.dot = lv_obj_create(status_row);
+    lv_obj_remove_style_all(parts.dot);
+    lv_obj_set_size(parts.dot, 8, 8);
+    lv_obj_remove_flag(parts.dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(parts.dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(parts.dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(parts.dot, LV_OPA_COVER, LV_PART_MAIN);
+    parts.status = lv_label_create(status_row);
+    lv_label_set_text(parts.status, "未绑定");
+    lv_obj_set_size(parts.status, LV_SIZE_CONTENT, fonts::Small()->line_height);
+    lv_obj_set_style_text_font(parts.status, fonts::Small(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(parts.status, lv_color_hex(colors.muted), LV_PART_MAIN);
+    parts.check = lv_label_create(parts.root);
+    lv_label_set_text(parts.check, FONT_AWESOME_CHECK);
+    lv_obj_set_style_text_font(parts.check, fonts::Icon(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(parts.check, lv_color_hex(colors.accent), LV_PART_MAIN);
+    lv_obj_align(parts.check, LV_ALIGN_TOP_RIGHT, 0, 8);
+    lv_obj_add_flag(parts.check, LV_OBJ_FLAG_HIDDEN);
+    return parts;
+}
+
+namespace {
+struct ChoiceSliderState {
+    ChoiceSliderParts parts;
+    lv_event_cb_t commit = nullptr;
+    std::vector<std::string> options;
+    std::string context;
+    int confirmed = 0;
+    bool enabled = false, pending = false, pressed = false, cancelled = false;
+};
+
+void RenderChoiceSlider(ChoiceSliderState* state, bool keep_position = false) {
+    auto* slider = state->parts.slider;
+    const int maximum = std::max(1, static_cast<int>(state->options.size()) - 1);
+    if (lv_slider_get_max_value(slider) != maximum) lv_slider_set_range(slider, 0, maximum);
+    if (!keep_position && state->confirmed >= 0 && lv_slider_get_value(slider) != state->confirmed)
+        lv_slider_set_value(slider, state->confirmed, LV_ANIM_OFF);
+    const char* text = state->pending ? "同步中" : state->options.empty() ? "待同步"
+        : state->confirmed < 0 ? "请选择" : state->options[state->confirmed].c_str();
+    SetLabelTextIfChanged(state->parts.value, text);
+    if (state->enabled && !state->pending && state->options.size() > 1)
+        lv_obj_remove_state(slider, LV_STATE_DISABLED);
+    else lv_obj_add_state(slider, LV_STATE_DISABLED);
+}
+
+void PreviewChoiceAtPointer(ChoiceSliderState* state) {
+    auto* input = lv_indev_active();
+    if (!input || lv_indev_get_type(input) != LV_INDEV_TYPE_POINTER ||
+        lv_indev_get_state(input) != LV_INDEV_STATE_PRESSED || lv_indev_get_scroll_obj(input)) return;
+    auto* slider = state->parts.slider;
+    lv_point_t point{}; lv_indev_get_point(input, &point);
+    lv_obj_transform_point(slider, &point, LV_OBJ_POINT_TRANSFORM_FLAG_INVERSE_RECURSIVE);
+    lv_area_t area{}; lv_obj_get_coords(slider, &area);
+    const int left = lv_obj_get_style_pad_left(slider, LV_PART_MAIN);
+    const int right = lv_obj_get_style_pad_right(slider, LV_PART_MAIN);
+    const int width = lv_obj_get_width(slider) - left - right;
+    if (width <= 0) return;
+    const int offset = lv_obj_get_style_base_dir(slider, LV_PART_MAIN) == LV_BASE_DIR_RTL
+        ? area.x2 - right - point.x : point.x - area.x1 - left;
+    const int maximum = lv_slider_get_max_value(slider);
+    const int choice = std::clamp((offset * maximum + width / 2) / width, 0, maximum);
+    if (choice == lv_slider_get_value(slider)) {
+        if (choice < static_cast<int>(state->options.size())) SetLabelTextIfChanged(state->parts.value, state->options[choice].c_str());
+        return;
+    }
+    // Capture a track tap while the pointer is still down. The common release
+    // guard can then reject a spurious (0, 0) release without undoing the tap.
+    lv_slider_set_value(slider, choice, LV_ANIM_OFF);
+    lv_obj_send_event(slider, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void OnChoiceSlider(lv_event_t* event) {
+    auto* state = static_cast<ChoiceSliderState*>(lv_event_get_user_data(event));
+    const auto code = lv_event_get_code(event);
+    if (code == LV_EVENT_DELETE) { delete state; return; }
+    if (code == LV_EVENT_PRESSED) {
+        if (!state->enabled || state->pending || state->options.size() < 2) return;
+        state->pressed = true; state->cancelled = false;
+        lv_obj_remove_flag(state->parts.slider, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+        PreviewChoiceAtPointer(state);
+    } else if (code == LV_EVENT_PRESSING && state->pressed && !state->cancelled) {
+        PreviewChoiceAtPointer(state);
+    } else if (code == LV_EVENT_VALUE_CHANGED && state->pressed && !state->cancelled) {
+        const int value = lv_slider_get_value(state->parts.slider);
+        if (value >= 0 && value < static_cast<int>(state->options.size()))
+            SetLabelTextIfChanged(state->parts.value, state->options[value].c_str());
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        const bool commit = code == LV_EVENT_RELEASED && state->pressed && !state->cancelled &&
+            state->enabled && !state->pending && lv_slider_get_value(state->parts.slider) != state->confirmed;
+        state->pressed = false;
+        if (commit && state->commit) { state->commit(event); return; }
+        RenderChoiceSlider(state);
+    }
+}
+}  // namespace
+
+ChoiceSliderParts CreateChoiceSlider(lv_obj_t* parent, const char* title, lv_event_cb_t commit) {
+    ChoiceSliderParts parts;
+    parts.root = CreateContentPanel(parent, LV_SIZE_CONTENT, 10);
+    auto* heading = CreateSectionHeading(parts.root, title);
+    lv_obj_set_height(heading, fonts::MediumBold()->line_height);
+    parts.value = AddValueLabel(heading, "待同步", 120);
+    lv_obj_set_style_text_font(parts.value, fonts::MediumBold(), LV_PART_MAIN);
+    auto* row = CreateContentPanel(parts.root, 76);
+    lv_obj_set_layout(row, LV_LAYOUT_NONE);
+    lv_obj_set_style_pad_hor(row, 26, LV_PART_MAIN);
+    parts.slider = AddSlider(row, 0, 1, 0, nullptr, 0);
+    lv_obj_set_width(parts.slider, LV_PCT(100));
+    lv_obj_center(parts.slider);
+    lv_obj_set_style_pad_all(parts.slider, 10, LV_PART_KNOB);
+    lv_obj_set_style_opa(parts.slider, LV_OPA_50, LV_STATE_DISABLED);
+    lv_obj_set_ext_click_area(parts.slider, 26);
+    lv_obj_remove_flag(parts.slider, LV_OBJ_FLAG_ADV_HITTEST);
+    lv_obj_add_flag(parts.slider, LV_OBJ_FLAG_PRESS_LOCK);
+    auto* state = new ChoiceSliderState{};
+    state->parts = parts; state->commit = commit;
+    lv_obj_set_user_data(parts.slider, state);
+    lv_obj_add_event_cb(parts.slider, OnChoiceSlider, LV_EVENT_ALL, state);
+    RenderChoiceSlider(state);
+    return parts;
+}
+
+void UpdateChoiceSlider(const ChoiceSliderParts& parts, const std::vector<std::string>& options,
+                        uint32_t selected, bool enabled, bool pending, const std::string& context) {
+    if (!parts.slider) return;
+    auto* state = static_cast<ChoiceSliderState*>(lv_obj_get_user_data(parts.slider));
+    const bool same_target = state->context == context && state->options == options;
+    if (state->pressed && (!same_target || !enabled || pending)) state->cancelled = true;
+    state->options = options; state->context = context;
+    state->confirmed = selected < options.size() ? static_cast<int>(selected) : -1;
+    state->enabled = enabled; state->pending = pending;
+    // Cache the latest confirmed state while touching, without changing the
+    // range, position, label or disabled state under the user's finger.
+    if (!state->pressed) RenderChoiceSlider(state, pending && same_target);
+}
+
+lv_obj_t* CreateDropdownField(lv_obj_t* parent, LineIcon icon, lv_event_cb_t callback) {
+    auto row = CreateCompactRow(parent, nullptr, "", nullptr, nullptr, 72, false, false);
+    SetCompactRowIcon(row, icon);
+    StyleSettingsCard(row.root);
+    lv_obj_delete(row.title);
+    lv_obj_t* dropdown = lv_dropdown_create(row.root);
+    lv_obj_remove_style_all(dropdown);
+    lv_obj_set_size(dropdown, LV_PCT(100), 70);
+    lv_obj_align(dropdown, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_pad_top(dropdown, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(dropdown, 42, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(dropdown, 10, LV_PART_MAIN);
+    lv_obj_set_style_text_font(dropdown, fonts::MediumBold(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(dropdown, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+    lv_obj_set_style_opa(dropdown, LV_OPA_50, LV_STATE_DISABLED);
+    lv_dropdown_set_options(dropdown, "待同步");
+    lv_dropdown_set_symbol(dropdown, FONT_AWESOME_ANGLE_DOWN);
+    lv_obj_set_style_text_font(dropdown, fonts::Icon(), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(dropdown, lv_color_hex(Theme::Get().colors().muted), LV_PART_INDICATOR);
+    auto* list = lv_dropdown_get_list(dropdown);
+    StyleSurface(list);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_style_max_height(list, 320, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(list, 16, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(list, 8, LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(list, 8, LV_PART_MAIN);
+    lv_obj_set_style_text_font(list, fonts::Medium(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(list, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(list, lv_color_hex(Theme::Get().colors().accent), LV_PART_SELECTED);
+    lv_obj_set_style_bg_opa(list, kAccentSoftOpacity, LV_PART_SELECTED);
+    if (callback) lv_obj_add_event_cb(dropdown, callback, LV_EVENT_VALUE_CHANGED, nullptr);
+    return dropdown;
+}
+
+lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder, lv_event_cb_t callback) {
+    auto* row = CreateContentPanel(parent, 72);
+    lv_obj_set_layout(row, LV_LAYOUT_NONE);
+    StyleSettingsCard(row);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    auto* field = lv_textarea_create(row);
+    StyleTextInput(field);
+    lv_textarea_set_one_line(field, true);
+    lv_textarea_set_placeholder_text(field, placeholder);
+    lv_obj_set_style_pad_hor(field, 18, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(field, 16, LV_PART_MAIN);
+    lv_obj_set_size(field, 406, 70);
+    lv_obj_set_style_bg_opa(field, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(field, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(field, 0, Selector(LV_PART_MAIN, LV_STATE_FOCUSED));
+    if (callback) lv_obj_add_event_cb(field, callback, LV_EVENT_VALUE_CHANGED, nullptr);
+    auto* keyboard = CreateButton(row);
+    lv_obj_remove_style_all(keyboard);
+    lv_obj_set_size(keyboard, 72, 70);
+    lv_obj_align(keyboard, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_style_border_width(keyboard, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_side(keyboard, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
+    lv_obj_set_style_border_color(keyboard, lv_color_hex(Theme::Get().colors().border), LV_PART_MAIN);
+    auto* icon = CreateLineIcon(keyboard, LineIcon::Keyboard, 28);
+    lv_obj_set_style_text_color(icon, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+    lv_obj_center(icon);
+    lv_obj_add_event_cb(keyboard, [](lv_event_t* event) {
+        auto* input = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+        lv_obj_add_state(input, LV_STATE_FOCUSED);
+        lv_obj_send_event(input, LV_EVENT_FOCUSED, nullptr);
+    }, LV_EVENT_CLICKED, field);
+    return field;
 }
 
 lv_obj_t* CreateModalOverlay(lv_obj_t* parent) {
@@ -727,6 +1097,7 @@ CompactRowParts CreateCompactRow(
     int text_x = 0;
     if (icon != nullptr && icon[0] != '\0') {
         lv_obj_t* icon_label = lv_label_create(parts.root);
+        parts.icon = icon_label;
         lv_label_set_text(icon_label, icon);
         lv_obj_set_style_text_font(icon_label, fonts::Icon(), LV_PART_MAIN);
         lv_obj_set_style_text_color(icon_label, lv_color_hex(colors.accent), LV_PART_MAIN);
@@ -827,6 +1198,7 @@ lv_obj_t* AddSwitch(lv_obj_t* row, bool checked, lv_event_cb_t callback,
     lv_obj_set_size(control, 88, 48);
     lv_obj_align(control, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.raised), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(control, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(control, lv_color_hex(colors.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(control, 2, LV_PART_MAIN);
     lv_obj_set_style_border_color(
@@ -835,8 +1207,12 @@ lv_obj_t* AddSwitch(lv_obj_t* row, bool checked, lv_event_cb_t callback,
     lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.accent),
                               Selector(LV_PART_INDICATOR, LV_STATE_CHECKED));
+    lv_obj_set_style_bg_opa(control, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(control, LV_OPA_COVER,
+                            Selector(LV_PART_INDICATOR, LV_STATE_CHECKED));
     lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.muted), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(control, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_bg_color(control, lv_color_hex(colors.accent_ink),
                               Selector(LV_PART_KNOB, LV_STATE_CHECKED));
     lv_obj_set_style_radius(control, LV_RADIUS_CIRCLE, LV_PART_KNOB);

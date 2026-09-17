@@ -17,6 +17,33 @@ function Import-AgentEspIdfEnvironment {
     return $PythonCommand.Source
 }
 
+function Select-AgentSerialPort {
+    $AvailablePorts = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
+    if ($AvailablePorts.Count -eq 0) {
+        throw "No serial ports found. Connect Agent and try again."
+    }
+
+    $PnpDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\(COM\d+\)$' })
+    Write-Host "Available serial ports:"
+    for ($Index = 0; $Index -lt $AvailablePorts.Count; $Index++) {
+        $AvailablePort = $AvailablePorts[$Index]
+        $Device = $PnpDevices |
+            Where-Object { $_.Name -match "\($([regex]::Escape($AvailablePort))\)$" } |
+            Select-Object -First 1
+        $DisplayName = if ($null -ne $Device) { $Device.Name } else { $AvailablePort }
+        Write-Host ("  [{0}] {1}" -f ($Index + 1), $DisplayName)
+    }
+
+    $SelectionText = Read-Host "Select the Agent serial port number"
+    $Selection = 0
+    if (-not [int]::TryParse($SelectionText, [ref]$Selection) -or
+        $Selection -lt 1 -or $Selection -gt $AvailablePorts.Count) {
+        throw "Invalid serial-port selection: $SelectionText"
+    }
+    return $AvailablePorts[$Selection - 1]
+}
+
 function Resolve-AgentSerialPort {
     param(
         [string]$RequestedPort

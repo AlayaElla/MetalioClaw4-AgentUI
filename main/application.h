@@ -17,8 +17,7 @@
 #include "provisioning_client.h"
 #include "audio_service.h"
 #include "device_state_event.h"
-#include "ai_provider_config.h"
-#include "hermes_voice_session.h"
+#include "codex_battery_reporter.h"
 
 
 #define MAIN_EVENT_SCHEDULE (1 << 0)
@@ -26,9 +25,7 @@
 #define MAIN_EVENT_WAKE_WORD_DETECTED (1 << 2)
 #define MAIN_EVENT_VAD_CHANGE (1 << 3)
 #define MAIN_EVENT_ERROR (1 << 4)
-#define MAIN_EVENT_HERMES_ENDPOINT (1 << 5)
 #define MAIN_EVENT_CLOCK_TICK (1 << 6)
-#define MAIN_EVENT_HERMES_SILENCE (1 << 7)
 
 
 enum AecMode {
@@ -66,8 +63,6 @@ public:
     void ToggleChatState();
     void StartListening();
     void StopListening();
-    // Changes are serialized on the main event loop.
-    void ApplyAiProviderSelection(const AiProviderConfig& config);
     void StartCodexVoiceCapture();
     void StopCodexVoiceCapture(std::function<void()> on_stopped = {});
     void Reboot();
@@ -77,12 +72,11 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
+    // Returns false while voice capture or another audio stream owns output,
+    // allowing a notification caller to defer without disrupting speech.
+    bool PlayCodexNotificationSound(const std::string_view& sound,
+                                    uint8_t gain_percent);
     AudioService& GetAudioService() { return audio_service_; }
-    bool IsHermesVoiceBusy() const {
-        return hermes_worker_active_.load(std::memory_order_acquire) ||
-            hermes_voice_.state() != hermes_voice::State::Idle;
-    }
-
     bool HasPendingActivation() const {
         return !activation_suspended_ && !pending_activation_code_.empty();
     }
@@ -108,7 +102,6 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
-    esp_timer_handle_t hermes_silence_timer_handle_ = nullptr;
     volatile DeviceState device_state_ = kDeviceStateUnknown;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
@@ -117,20 +110,11 @@ private:
     std::string pending_activation_code_;
     volatile bool activation_suspended_ = false;
     bool codex_voice_start_pending_ = false;
+    int64_t codex_voice_start_wait_started_at_us_ = 0;
     std::atomic<bool> codex_voice_capture_active_{false};
     bool codex_voice_stop_pending_ = false;
+    int64_t codex_voice_stop_wait_started_at_us_ = 0;
     bool codex_voice_restore_wake_word_ = false;
-    std::atomic<bool> hermes_provider_selected_{false};
-    std::atomic<bool> hermes_worker_active_{false};
-    std::atomic<uint32_t> xiaozhi_provider_epoch_{1};
-    std::atomic<uint32_t> xiaozhi_error_epoch_{0};
-    AiProviderConfig hermes_config_;
-    std::string hermes_stored_session_id_;
-    hermes_voice::Session hermes_voice_;
-    bool hermes_speech_detected_ = false;
-    int64_t hermes_recording_started_at_us_ = 0;
-    int64_t hermes_silence_deadline_us_ = 0;
-    uint32_t hermes_silence_epoch_ = 0;
     std::function<void()> codex_voice_stopped_callback_;
     std::atomic<bool> low_power_standby_{false};
     bool standby_restore_wake_word_ = false;
@@ -138,6 +122,7 @@ private:
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;
+    codex_battery::Reporter codex_battery_reporter_;
     TaskHandle_t main_event_loop_task_handle_ = nullptr;
     SpecialInteraction active_special_interaction_ = SpecialInteraction::None;
 
@@ -150,20 +135,7 @@ private:
     void CancelSpecialInteraction();
     void TryStartCodexVoiceCapture();
     void TryFinishCodexVoiceCapture();
-    void ToggleHermesVoice();
-    void StartHermesRecording();
-    void SubmitHermesRecording();
-    void HandleHermesVadChange();
-    void CheckHermesRecordingTimeouts();
-    void StopHermesSilenceTimer();
-    void RunHermesVoiceTurn(uint32_t epoch, AiProviderConfig config,
-                            std::vector<int16_t>&& pcm,
-                            std::string stored_session_id);
-    void CancelHermesVoice();
-    bool IsXiaozhiEpochCurrent(uint32_t epoch) const {
-        return !hermes_provider_selected_.load(std::memory_order_acquire) &&
-            xiaozhi_provider_epoch_.load(std::memory_order_acquire) == epoch;
-    }
+    void FailCodexVoiceCaptureTransport();
 };
 
 

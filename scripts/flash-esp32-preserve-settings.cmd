@@ -2,7 +2,7 @@
 setlocal
 title Agent - Flash Firmware (Preserve Settings)
 
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0flash-esp32-preserve-settings.ps1" %*
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0flash-esp32-preserve-settings.ps1" -PromptForPort %*
 set "SCRIPT_EXIT_CODE=%ERRORLEVEL%"
 
 echo.

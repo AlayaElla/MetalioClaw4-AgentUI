@@ -11,6 +11,9 @@ struct AudioStreamPacket {
     int sample_rate = 0;
     int frame_duration = 0;
     uint32_t timestamp = 0;
+    // Local sound effects can reduce only their own PCM output without
+    // changing the user's persisted codec volume. Network audio remains 100.
+    uint8_t playback_gain_percent = 100;
     std::vector<uint8_t> payload;
 };
 

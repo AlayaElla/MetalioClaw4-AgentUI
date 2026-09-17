@@ -24,6 +24,7 @@ public:
     std::string GetEndpointUrl();
 
 private:
+    std::string endpoint_url_;
     std::string activation_message_;
     std::string activation_code_;
     bool has_mqtt_config_ = false;

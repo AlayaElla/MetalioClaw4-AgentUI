@@ -1,6 +1,7 @@
 #include "provisioning_client.h"
 #include "system_info.h"
 #include "settings.h"
+#include "xiaozhi_server_settings.h"
 #include "assets/lang_config.h"
 
 #include <cJSON.h>
@@ -14,7 +15,8 @@
 #include <cstring>
 #define TAG "Provisioning"
 
-ProvisioningClient::ProvisioningClient() {
+ProvisioningClient::ProvisioningClient()
+    : endpoint_url_(xiaozhi_server_settings::Load(CONFIG_PROVISIONING_URL).endpoint) {
 #ifdef ESP_EFUSE_BLOCK_USR_DATA
     // Read Serial Number from efuse user_data
     uint8_t serial_number[33] = {0};
@@ -33,12 +35,7 @@ ProvisioningClient::~ProvisioningClient() {
 }
 
 std::string ProvisioningClient::GetEndpointUrl() {
-    Settings settings("wifi", false);
-    std::string url = settings.GetString("provisioning_url");
-    if (url.empty()) {
-        url = CONFIG_PROVISIONING_URL;
-    }
-    return url;
+    return endpoint_url_;
 }
 
 std::unique_ptr<Http> ProvisioningClient::SetupHttp() {
@@ -66,6 +63,16 @@ std::unique_ptr<Http> ProvisioningClient::SetupHttp() {
  */
 esp_err_t ProvisioningClient::FetchConfiguration() {
     auto& board = Board::GetInstance();
+
+    has_mqtt_config_ = false;
+    has_websocket_config_ = false;
+    has_activation_code_ = false;
+    has_activation_challenge_ = false;
+    has_server_time_ = false;
+    if (!xiaozhi_server_settings::PrepareConnectionCache(endpoint_url_)) {
+        ESP_LOGE(TAG, "Failed to reset connection settings for selected server");
+        return ESP_FAIL;
+    }
 
     std::string url = GetEndpointUrl();
     if (url.length() < 10) {
@@ -126,7 +133,9 @@ esp_err_t ProvisioningClient::FetchConfiguration() {
 
     has_mqtt_config_ = false;
     cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
-    if (cJSON_IsObject(mqtt)) {
+    const auto* mqtt_endpoint = cJSON_GetObjectItem(mqtt, "endpoint");
+    if (cJSON_IsObject(mqtt) && cJSON_IsString(mqtt_endpoint) &&
+        mqtt_endpoint->valuestring[0] != '\0') {
         Settings settings("mqtt", true);
         cJSON *item = NULL;
         cJSON_ArrayForEach(item, mqtt) {
@@ -147,7 +156,10 @@ esp_err_t ProvisioningClient::FetchConfiguration() {
 
     has_websocket_config_ = false;
     cJSON *websocket = cJSON_GetObjectItem(root, "websocket");
-    if (cJSON_IsObject(websocket)) {
+    const auto* websocket_url = cJSON_GetObjectItem(websocket, "url");
+    if (cJSON_IsObject(websocket) && cJSON_IsString(websocket_url) &&
+        (std::strncmp(websocket_url->valuestring, "ws://", 5) == 0 ||
+         std::strncmp(websocket_url->valuestring, "wss://", 6) == 0)) {
         Settings settings("websocket", true);
         cJSON *item = NULL;
         cJSON_ArrayForEach(item, websocket) {

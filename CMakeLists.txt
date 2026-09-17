@@ -15,6 +15,8 @@ add_compile_options(-Wno-missing-field-initializers)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(agent)
 
+include("${CMAKE_CURRENT_LIST_DIR}/main/boards/metalio-claw-4/validate_wifi_config.cmake")
+
 # elf_loader 1.3.2 drops the executable allocation capability on ESP32-P4's
 # unified segment path. Runtime heap fragmentation can also exhaust the
 # contiguous executable heap even for small apps. Apply a narrow P4 allocator

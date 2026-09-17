@@ -8,6 +8,7 @@
 #include <cstdint>
 #include "esp_err.h"
 #include "esp_websocket_client.h"
+#include "codex_ws_transport_policy.h"
 
 class CodexWsClient {
 public:
@@ -23,6 +24,10 @@ public:
     bool Connect(const std::string& ip, int port = 8765);
     bool StartDiscovery(int timeout_ms = 5000, int initial_delay_ms = 0);
     void Disconnect();
+    // Retry the current peer after an application-level failure. Do not call
+    // this from a WebSocket event callback, because it stops and destroys the
+    // active client before creating its replacement.
+    bool Reconnect();
 
     // NVS 配置存取
     bool SaveToken(const std::string& token);
@@ -30,7 +35,7 @@ public:
     bool HasToken() const;
 
     // 发送文本 JSON 控制消息
-    bool SendTextMessage(const std::string& json_str);
+    bool SendTextMessage(const std::string& json_str, TickType_t timeout_ticks = portMAX_DELAY);
 
     // 发送二进制 Opus 语音数据帧
     bool SendOpusAudioFrame(const uint8_t* data, size_t length);
@@ -39,7 +44,8 @@ public:
     void SetOnStatusCallback(StatusCallback cb) { on_status_cb_ = cb; }
     void SetOnDiscoveryCallback(DiscoveryCallback cb) { on_discovery_cb_ = cb; }
 
-    bool IsConnected() const { return connected_.load(); }
+    bool IsConnected() const { return transport_state_.IsConnected(); }
+    uint32_t GetConnectionGeneration() const { return transport_state_.Generation(); }
     std::string GetCurrentIp() const { return current_ip_; }
     int GetCurrentPort() const { return current_port_; }
 
@@ -49,9 +55,11 @@ private:
 
     static void EventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data);
     static void DiscoveryTask(void* task_args);
+    void NotifyConnected();
+    void NotifyDisconnected();
 
     esp_websocket_client_handle_t client_handle_;
-    std::atomic<bool> connected_;
+    codex_remote::transport::ConnectionState transport_state_;
     std::atomic<bool> discovery_running_;
     std::string current_ip_;
     int current_port_;

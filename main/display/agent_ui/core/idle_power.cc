@@ -4,6 +4,7 @@
 
 #include "application.h"
 #include "board.h"
+#include "backlight.h"
 #include "settings.h"
 #include "apps/home/home_renderer.h"
 #include "apps/standby/standby_view.h"
@@ -33,6 +34,8 @@ void IdlePower::Initialize(Board& board) {
 void IdlePower::NotifyActivity() {
     if (StandbyView::IsActive()) return;
     last_activity_tick_ = lv_tick_get();
+    micro_display_.Activity(last_activity_tick_);
+    if (micro_display_.active()) UpdateMicroBacklight();
     expression_sleep_triggered_ = false;
     PerformanceManager::Get().NotifyActivity();
     home::Renderer::NotifyUserActivity();
@@ -61,6 +64,27 @@ int IdlePower::standby_minutes() const {
     const int32_t minutes =
         settings.GetInt(kStandbyKey, kDefaultStandbyMinutes);
     return NormalizeStandbyMinutes(static_cast<int>(minutes));
+}
+
+void IdlePower::SetMicroDisplay(const MicroDisplayConfig& config) {
+    const bool was_active = micro_display_.active();
+    if (!micro_display_.Apply(config, lv_tick_get())) return;
+    if (micro_display_.active()) {
+        UpdateMicroBacklight();
+    } else if (was_active) {
+        micro_brightness_ = -1;
+        if (auto* backlight = Board::GetInstance().GetBacklight()) backlight->RestoreBrightness();
+        NotifyActivity();
+    }
+}
+
+void IdlePower::UpdateMicroBacklight() {
+    const int brightness = micro_display_.Brightness(lv_tick_get());
+    if (brightness == micro_brightness_) return;
+    if (auto* backlight = Board::GetInstance().GetBacklight()) {
+        backlight->SetBrightness(static_cast<uint8_t>(brightness), false);
+        micro_brightness_ = brightness;
+    }
 }
 
 void IdlePower::SetStandbyMinutes(int minutes) {
@@ -129,6 +153,16 @@ void IdlePower::Tick() {
         if (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
             NotifyActivity();
             return;
+        }
+    }
+
+    if (micro_display_.active()) {
+        if (Navigation::Get().current() != ScreenId::Codex) {
+            SetMicroDisplay({});
+        } else {
+            if (realtime_audio_busy) NotifyActivity();
+            UpdateMicroBacklight();
+            return;  // Keep the Codex screen visible instead of entering black standby.
         }
     }
 

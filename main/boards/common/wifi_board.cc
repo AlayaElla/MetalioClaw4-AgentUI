@@ -1,4 +1,5 @@
 #include "wifi_board.h"
+#include "wifi_connection_ownership.h"
 
 #include "application.h"
 #include "assets/lang_config.h"
@@ -107,14 +108,24 @@ void WifiBoard::StartNetwork() {
         notification += ssid;
         display->ShowNotification(notification.c_str(), 30000);
     });
-    wifi_station.Start();
+    auto& ownership = WifiConnectionOwnership::GetInstance();
+    const auto generation = ownership.StartAutomatic([&wifi_station]() {
+        wifi_station.Start();
+    });
+    if (generation == 0) return;
 
-    // Try to connect to WiFi, if failed, launch the WiFi configuration AP
-    if (!wifi_station.WaitForConnected(60 * 1000)) {
-        wifi_station.Stop();
-        // wifi_config_mode_ = true;
-        // EnterWifiConfigMode();
-        return;
+    // Settings can take over while boot is still waiting for a saved network.
+    // Never let that stale wait stop the stack now owned by settings.
+    const TickType_t started = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(60000);
+    while (ownership.IsCurrent(generation)) {
+        if (wifi_station.WaitForConnected(100)) return;
+        if (xTaskGetTickCount() - started >= timeout) {
+            ownership.StopAutomatic(generation, [&wifi_station]() {
+                wifi_station.Stop();
+            });
+            return;
+        }
     }
 }
 

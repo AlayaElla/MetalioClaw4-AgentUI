@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "lvgl.h"
+#include "micro_display_policy.h"
 
 class Board;
 
@@ -20,6 +21,7 @@ public:
 
     void Initialize(Board& board);
     void NotifyActivity();
+    void SetMicroDisplay(const MicroDisplayConfig& config);
     void RestoreExpressionSleep();
     void SetStandbyActive(bool active);
     int standby_minutes() const;
@@ -31,6 +33,9 @@ private:
     IdlePower() = default;
     static void TimerCallback(lv_timer_t* timer);
     void Tick();
+    void UpdateMicroBacklight();
+    MicroDisplayPolicy micro_display_;
+    int micro_brightness_ = -1;
 
     lv_timer_t* timer_ = nullptr;
     uint32_t last_activity_tick_ = 0;

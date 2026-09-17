@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
+#include <vector>
 
 #include "lvgl.h"
 
@@ -24,6 +26,7 @@ struct ToolbarParts {
 
 struct CompactRowParts {
     lv_obj_t* root = nullptr;
+    lv_obj_t* icon = nullptr;
     lv_obj_t* title = nullptr;
     lv_obj_t* detail = nullptr;
     lv_obj_t* trailing = nullptr;
@@ -34,6 +37,42 @@ struct ActionButtonParts {
     lv_obj_t* icon = nullptr;
     lv_obj_t* label = nullptr;
 };
+
+struct DrawerParts {
+    lv_obj_t *overlay = nullptr, *surface = nullptr, *content = nullptr, *tabs = nullptr;
+};
+struct StatusCardParts {
+    lv_obj_t *root = nullptr, *heading = nullptr, *title = nullptr;
+    lv_obj_t *status = nullptr, *dot = nullptr, *check = nullptr;
+};
+struct ChoiceSliderParts {
+    lv_obj_t *root = nullptr, *slider = nullptr, *value = nullptr;
+};
+
+enum class LineIcon { Tasks, Sliders, Plus, Sparkles, Zap, Monitor, Keyboard, Link };
+lv_obj_t* CreateLineIcon(lv_obj_t* parent, LineIcon icon, int size = 28);
+void SetCompactRowIcon(CompactRowParts& row, LineIcon icon, int size = 28);
+
+// A drawer has a scroll viewport above its own tab bar, independent of the
+// application's full-width bottom action bar.
+DrawerParts CreateRightDrawer(lv_obj_t* parent, lv_event_cb_t dismiss);
+ActionButtonParts AddDrawerTab(lv_obj_t* bar, LineIcon icon, const char* label,
+                               lv_event_cb_t callback, void* data = nullptr);
+void SetDrawerTabSelected(lv_obj_t* button, bool selected);
+void SetLabelTextIfChanged(lv_obj_t* label, const char* text);
+void StyleSettingsCard(lv_obj_t* card, bool selected = false, bool outlined = true);
+StatusCardParts CreateStatusCard(lv_obj_t* parent, const char* heading,
+                                 lv_event_cb_t callback, void* data = nullptr);
+lv_obj_t* CreateDropdownField(lv_obj_t* parent, LineIcon icon,
+                              lv_event_cb_t callback);
+// Preview while pressed; commit one final choice on release. Context identifies
+// the setting being edited, so changing targets cancels the active gesture.
+ChoiceSliderParts CreateChoiceSlider(lv_obj_t* parent, const char* title, lv_event_cb_t commit);
+void UpdateChoiceSlider(const ChoiceSliderParts& parts, const std::vector<std::string>& options,
+                        uint32_t selected, bool enabled, bool pending = false,
+                        const std::string& context = {});
+lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder,
+                          lv_event_cb_t callback);
 
 constexpr size_t kVoiceWaveCount = 6;
 

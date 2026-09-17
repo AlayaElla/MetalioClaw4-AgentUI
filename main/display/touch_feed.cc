@@ -26,11 +26,12 @@ struct TouchSnapshot {
 };
 
 TouchSnapshot s_snap;
+TouchSnapshot s_last_read;
 
 void ClearSnapshot() {
     if (s_mutex != nullptr &&
         xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        s_snap = TouchSnapshot{};
+        s_snap.pressed = false;
         xSemaphoreGive(s_mutex);
     }
 }
@@ -93,6 +94,9 @@ esp_err_t UpdateSnapshotFromChip() {
 
     if (s_mutex != nullptr &&
         xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        // LVGL resolves dropdown choices on release. Preserve the last touch
+        // coordinates when the controller reports zero contacts.
+        if (!next.pressed) { next.x = s_snap.x; next.y = s_snap.y; }
         s_snap = next;
         xSemaphoreGive(s_mutex);
     }
@@ -142,10 +146,13 @@ void IndevReadCb(lv_indev_t* indev, lv_indev_data_t* data) {
         return;
     }
 
-    TouchSnapshot snap{};
+    // The reader only holds the mutex while copying a small snapshot. Never
+    // block the UI task or fabricate a release if that copy is in progress.
+    TouchSnapshot snap = s_last_read;
     if (s_mutex != nullptr &&
-        xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        xSemaphoreTake(s_mutex, 0) == pdTRUE) {
         snap = s_snap;
+        s_last_read = snap;
         xSemaphoreGive(s_mutex);
     }
 
@@ -203,6 +210,7 @@ void touch_feed_attach_indev(lv_indev_t* indev) {
         ESP_LOGW(kTag, "attach_indev: null indev");
         return;
     }
+    s_last_read = {};
     lv_indev_set_read_cb(indev, IndevReadCb);
 }
 

@@ -2,7 +2,7 @@
 setlocal
 title Agent - Flash Firmware
 
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0flash-esp32.ps1" %*
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0flash-esp32.ps1" -PromptForPort %*
 set "SCRIPT_EXIT_CODE=%ERRORLEVEL%"
 
 echo.

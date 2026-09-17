@@ -1,5 +1,5 @@
 param(
-    [string]$Port = "COM6",
+    [string]$Port = "",
     [ValidateRange(9600, 2000000)]
     [int]$Baud = 115200,
     [string]$IdfPath = "D:\esp\v6.0.2\esp-idf"
@@ -18,7 +18,9 @@ if (-not (Test-Path -LiteralPath $ElfPath -PathType Leaf)) {
 $SerialPort = Resolve-AgentSerialPort -RequestedPort $Port
 
 Push-Location $ProjectDirectory
+$PreviousPythonIoEncoding = $env:PYTHONIOENCODING
 try {
+    $env:PYTHONIOENCODING = "utf-8"
     $null = Import-AgentEspIdfEnvironment -IdfPath $IdfPath
 
     Write-Host "Monitoring Agent on $SerialPort at $Baud baud..."
@@ -27,5 +29,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "ESP32 monitor exited with code $LASTEXITCODE." }
 }
 finally {
+    $env:PYTHONIOENCODING = $PreviousPythonIoEncoding
     Pop-Location
 }
