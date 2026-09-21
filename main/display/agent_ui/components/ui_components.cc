@@ -181,6 +181,7 @@ lv_obj_t* CreateLineIcon(lv_obj_t* parent, LineIcon icon, int size) {
         static const int8_t monitor[][2] = {{2,3},{22,3},{22,17},{2,17},{2,3},{-1,-1},{12,17},{12,22},{-1,-1},{8,22},{16,22},{-1,-1},{8,10},{11,13},{16,8}};
         static const int8_t keyboard[][2] = {{2,4},{22,4},{22,20},{2,20},{2,4},{-1,-1},{6,8},{7,8},{-1,-1},{10,8},{11,8},{-1,-1},{14,8},{15,8},{-1,-1},{18,8},{19,8},{-1,-1},{6,12},{7,12},{-1,-1},{10,12},{11,12},{-1,-1},{14,12},{15,12},{-1,-1},{18,12},{19,12},{-1,-1},{7,16},{17,16}};
         static const int8_t link[][2] = {{10,8},{14,4},{18,3},{21,6},{20,10},{16,14},{-1,-1},{14,16},{10,20},{6,21},{3,18},{4,14},{8,10},{-1,-1},{8,16},{16,8}};
+        static const int8_t eye[][2] = {{2,12},{5,8},{9,6},{15,6},{19,8},{22,12},{19,16},{15,18},{9,18},{5,16},{2,12},{-1,-1},{9,12},{10,9},{14,9},{15,12},{14,15},{10,15},{9,12}};
         const int8_t (*points)[2] = nullptr;
         size_t count = 0;
         const auto kind = static_cast<LineIcon>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
@@ -194,6 +195,7 @@ lv_obj_t* CreateLineIcon(lv_obj_t* parent, LineIcon icon, int size) {
             case LineIcon::Monitor: ICON_POINTS(monitor);
             case LineIcon::Keyboard: ICON_POINTS(keyboard);
             case LineIcon::Link: ICON_POINTS(link);
+            case LineIcon::Eye: ICON_POINTS(eye);
         }
 #undef ICON_POINTS
         auto* target = lv_event_get_target_obj(event);
@@ -497,7 +499,7 @@ lv_obj_t* CreateDropdownField(lv_obj_t* parent, LineIcon icon, lv_event_cb_t cal
     return dropdown;
 }
 
-lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder, lv_event_cb_t callback) {
+lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder, lv_event_cb_t callback, bool password) {
     auto* row = CreateContentPanel(parent, 72);
     lv_obj_set_layout(row, LV_LAYOUT_NONE);
     StyleSettingsCard(row);
@@ -505,6 +507,7 @@ lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder, lv_event_cb
     auto* field = lv_textarea_create(row);
     StyleTextInput(field);
     lv_textarea_set_one_line(field, true);
+    lv_textarea_set_password_mode(field, password);
     lv_textarea_set_placeholder_text(field, placeholder);
     lv_obj_set_style_pad_hor(field, 18, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(field, 16, LV_PART_MAIN);
@@ -520,10 +523,16 @@ lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder, lv_event_cb
     lv_obj_set_style_border_width(keyboard, 1, LV_PART_MAIN);
     lv_obj_set_style_border_side(keyboard, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
     lv_obj_set_style_border_color(keyboard, lv_color_hex(Theme::Get().colors().border), LV_PART_MAIN);
-    auto* icon = CreateLineIcon(keyboard, LineIcon::Keyboard, 28);
+    auto* icon = CreateLineIcon(keyboard, password ? LineIcon::Eye : LineIcon::Keyboard, 28);
     lv_obj_set_style_text_color(icon, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
     lv_obj_center(icon);
-    lv_obj_add_event_cb(keyboard, [](lv_event_t* event) {
+    if (password) {
+        lv_obj_remove_flag(keyboard, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        lv_obj_add_event_cb(keyboard, [](lv_event_t* event) {
+            auto* input = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+            lv_textarea_set_password_mode(input, !lv_textarea_get_password_mode(input));
+        }, LV_EVENT_CLICKED, field);
+    } else lv_obj_add_event_cb(keyboard, [](lv_event_t* event) {
         auto* input = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
         lv_obj_add_state(input, LV_STATE_FOCUSED);
         lv_obj_send_event(input, LV_EVENT_FOCUSED, nullptr);

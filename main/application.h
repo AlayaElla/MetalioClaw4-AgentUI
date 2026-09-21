@@ -65,6 +65,16 @@ public:
     void StopListening();
     void StartCodexVoiceCapture();
     void StopCodexVoiceCapture(std::function<void()> on_stopped = {});
+    // Realtime capture uses the same 16 kHz / 60 ms encoder, but every
+    // packet is envelope-bound to this request instead of the legacy binary
+    // WebSocket path.
+    void StartCodexRealtimeCapture(const std::string& request_id);
+    // Pause only microphone uplink; playback and the request sequence survive
+    // a half-duplex speaking/thinking transition.
+    void StopCodexRealtimeCapture();
+    void EndCodexRealtimeSession();
+    bool PushCodexRealtimeAudio(std::unique_ptr<AudioStreamPacket> packet);
+    void ClearCodexRealtimeAudio();
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool CanEnterSleepMode();
@@ -116,6 +126,10 @@ private:
     int64_t codex_voice_stop_wait_started_at_us_ = 0;
     bool codex_voice_restore_wake_word_ = false;
     std::function<void()> codex_voice_stopped_callback_;
+    std::string codex_realtime_request_id_;
+    uint32_t codex_realtime_audio_sequence_ = 0;
+    bool codex_realtime_playback_active_ = false;
+    bool codex_realtime_restore_wake_word_ = false;
     std::atomic<bool> low_power_standby_{false};
     bool standby_restore_wake_word_ = false;
 

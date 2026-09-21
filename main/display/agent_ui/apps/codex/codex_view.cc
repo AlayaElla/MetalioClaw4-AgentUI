@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <sstream>
@@ -11,9 +12,11 @@
 #include <esp_log.h>
 #include <esp_random.h>
 #include <font_awesome.h>
+#include <mbedtls/base64.h>
 
 #include "cJSON.h"
 #include "codex_ws_client.h"
+#include "codex_ws_endpoint.h"
 #include "codex_bridge_connection_state.h"
 #include "codex_menu_state.h"
 #include "codex_menu_ui.h"
@@ -21,6 +24,7 @@
 #include "codex_notification_service.h"
 #include "codex_status_ring.h"
 #include "application.h"
+#include "board.h"
 #include "settings.h"
 #include "core/app_shell.h"
 #include "core/fonts.h"
@@ -57,11 +61,13 @@ enum class VoiceStage {
 };
 
 enum class VoiceMode { Micro, Api };
+enum class RealtimeVisual { Connecting, Listening, Thinking, Speaking, Muted, Error };
 enum class MenuTab : uint8_t { Tasks, Model, Connection };
 
 struct UiState {
     std::atomic<lv_obj_t*> root{nullptr};
     lv_obj_t* chat = nullptr;
+    lv_obj_t* task_actions = nullptr;
     std::unique_ptr<CodexConversationUi> conversation_ui;
     lv_obj_t* action_button = nullptr;
     lv_obj_t* action_icon = nullptr;
@@ -83,6 +89,7 @@ struct UiState {
     lv_obj_t* menu_panels[3]{};
     lv_obj_t* task_cards[6]{};
     lv_obj_t* new_task_button = nullptr;
+    lv_obj_t* realtime_button = nullptr;
     lv_obj_t* model_summary = nullptr;
     lv_obj_t* model_dropdown = nullptr;
     lv_obj_t* fast_switch = nullptr;
@@ -93,6 +100,23 @@ struct UiState {
     std::string discovered_name;
     std::string discovered_ip;
     std::string voice_request_id;
+    std::string realtime_request_id;
+    std::string realtime_host_id;
+    std::string realtime_thread_id;
+    std::string realtime_stream_id;
+    uint32_t realtime_generation = 0;
+    uint32_t realtime_last_sequence = 0;
+    bool realtime_capture_started = false;
+    lv_obj_t* realtime_root = nullptr;
+    lv_obj_t* realtime_canvas = nullptr;
+    lv_obj_t* realtime_status = nullptr;
+    lv_obj_t* realtime_mute = nullptr;
+    lv_obj_t* realtime_volume = nullptr;
+    lv_obj_t* realtime_end = nullptr;
+    lv_timer_t* realtime_timer = nullptr;
+    RealtimeVisual realtime_visual = RealtimeVisual::Connecting;
+    bool realtime_muted = false;
+    int realtime_volume_percent = 70;
     bool pending_new_task = false;
     std::string stop_request_id;
     std::string stop_target;
@@ -285,12 +309,15 @@ void UpdateStatusRing();
 void OnMenuTab(lv_event_t* event);
 void OnTaskSlot(lv_event_t* event);
 void OnMenuNewTask(lv_event_t* event);
+void OnMenuRealtime(lv_event_t* event);
 void OnModelDropdown(lv_event_t* event);
 void OnEffortReleased(lv_event_t* event);
 void OnFastChanged(lv_event_t* event);
 void OnRingChanged(lv_event_t* event);
 void SetMenuTab(MenuTab tab);
 void RefreshBridgeUi(uint32_t now_ms);
+bool MenuVoiceBusy();
+void HideConfig();
 
 void StopDeviceVoiceCapture(std::function<void()> on_stopped = {}) {
     if (s_ui.voice_capture_started) {
@@ -300,6 +327,177 @@ void StopDeviceVoiceCapture(std::function<void()> on_stopped = {}) {
         on_stopped();
     }
 }
+
+bool IsCurrentRealtime(const cJSON* root) {
+    const cJSON* request = cJSON_GetObjectItemCaseSensitive(root, "requestId");
+    const cJSON* host = cJSON_GetObjectItemCaseSensitive(root, "host_id");
+    const cJSON* thread = cJSON_GetObjectItemCaseSensitive(root, "thread_id");
+    const cJSON* stream = cJSON_GetObjectItemCaseSensitive(root, "stream_id");
+    return cJSON_IsString(request) && cJSON_IsString(host) && cJSON_IsString(thread) &&
+           cJSON_IsString(stream) && !s_ui.realtime_request_id.empty() &&
+           s_ui.realtime_request_id == request->valuestring &&
+           s_ui.realtime_host_id == host->valuestring &&
+           s_ui.realtime_thread_id == thread->valuestring &&
+           s_ui.realtime_stream_id == stream->valuestring;
+}
+
+void RenderRealtimePixels(lv_event_t* event) {
+    auto* target = lv_event_get_target_obj(event);
+    lv_area_t area;
+    lv_obj_get_coords(target, &area);
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.radius = 0;
+    dsc.bg_opa = LV_OPA_COVER;
+    dsc.border_width = 0;
+    const auto& colors = Theme::Get().colors();
+    dsc.bg_color = lv_color_hex(colors.accent);
+    // Match the demo: 56 cells across 600 px, each square exactly 7 px.
+    // Geometry is computed once; the small central motif uses only nearby cells.
+    struct Pixel { int x, y; float dx, dy, r, angle; };
+    static const std::vector<Pixel> pixels = [] {
+        std::vector<Pixel> result;
+        const float scale = 48.0f / 56.0f * (600.0f / 288.0f);
+        for (int gy = 0; gy < 56; ++gy) for (int gx = 0; gx < 56; ++gx) {
+            const float dx = (gx - 27.5f) * scale, dy = (gy - 27.5f) * scale;
+            const float r = std::hypot(dx, dy);
+            if (r > 26) continue;
+            result.push_back({static_cast<int>(std::floor((gx + .5f) * 600 / 56 - 3.5f)),
+                              static_cast<int>(std::floor((gy + .5f) * 600 / 56 - 3.5f)) - 85,
+                              dx, dy, r, std::atan2(dy, dx)});
+        }
+        return result;
+    }();
+    const float t = static_cast<float>(lv_tick_get()) / 1000.0f;
+    const float edge = 18 + std::round(std::sin(t * 1.7f));
+    const float scan = 22 - std::fmod(t * 5, 20.0f);
+    const float sweep = std::sin(t * 1.6f) * 10;
+    for (const auto& pixel : pixels) {
+        const float dx = pixel.dx, dy = pixel.dy, r = pixel.r, angle = pixel.angle;
+        float light = 0.0f;
+        if (s_ui.realtime_visual == RealtimeVisual::Listening) {
+            if (r < edge) light = .22f + .35f * (1 - r / edge);
+            if (std::abs(r - edge) < .8f || (std::abs(r - scan) < 1 && r < edge) ||
+                (std::abs(dy - sweep) < 1 && r < edge - 2)) light = 1;
+        } else if (s_ui.realtime_visual == RealtimeVisual::Thinking) {
+            if (r > 5 && r < 21) { float strand=(std::cos((angle+t*1.8f+r*.17f)*3)+1)/2; light=strand>.88f?1:strand>.65f?.45f:.08f; }
+            if (std::abs(dx)<=2 && std::abs(dy)<=2) light=.85f;
+        } else if (s_ui.realtime_visual == RealtimeVisual::Speaking) {
+            const float crest=16+std::round(2*std::sin(angle*5+t*7)+std::sin(angle*9-t*4));
+            if (std::abs(r-crest)<1.5f) light=1;
+            if (std::abs(r-(18+std::fmod(t*8,7.0f)))<.7f) light=.3f;
+            const int col=static_cast<int>(std::floor((dx+10)/4)); const int h=2+static_cast<int>(std::floor((std::sin(col*1.7f+t*8)+1)*3));
+            if (std::abs(dx)<10 && std::abs(dy)<=h && (static_cast<int>(std::floor(dx+10))%4)<2) light=1;
+        } else if (s_ui.realtime_visual == RealtimeVisual::Connecting) {
+            const int sector=static_cast<int>(std::floor((angle+static_cast<float>(M_PI))/(static_cast<float>(M_PI)/4))); const int head=static_cast<int>(t*8)%8;
+            if (r > 16 && r < 19) light = sector == head ? 1 : sector == (head + 7) % 8 ? .5f : .12f;
+            if (r < 2) light = .8f;
+        } else if (s_ui.realtime_visual == RealtimeVisual::Muted) { dsc.bg_color=lv_color_hex(colors.muted); if(std::abs(r-18)<1)light=.25f; if(std::abs(dy)<7&&((dx>=-6&&dx<=-3)||(dx>=3&&dx<=6)))light=.8f; }
+        else { dsc.bg_color=lv_color_hex(colors.danger); if(std::abs(r-18)<1&&std::abs(dy)>3)light=.3f; if(std::abs(dx)<7&&std::abs(dy)<7&&std::abs(std::abs(dx)-std::abs(dy))<1.1f)light=1; }
+        if (light <= 0) continue;
+        dsc.bg_opa=static_cast<lv_opa_t>(std::round(light*255));
+        const int x = area.x1 + pixel.x, y = area.y1 + pixel.y;
+        lv_area_t cell{x,y,x+6,y+6}; lv_draw_rect(lv_event_get_layer(event),&dsc,&cell);
+    }
+}
+
+void SetRealtimeVisual(RealtimeVisual visual, const char* label) {
+    s_ui.realtime_visual = visual;
+    if (s_ui.realtime_status != nullptr) lv_label_set_text(s_ui.realtime_status, label);
+    if (s_ui.realtime_canvas != nullptr) lv_obj_invalidate(s_ui.realtime_canvas);
+}
+
+void ShowRealtimePage(bool show) {
+    if (s_ui.realtime_root == nullptr) return;
+    if (show) {
+        if (s_ui.task_actions) lv_obj_add_flag(s_ui.task_actions, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.chat, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.action_button) lv_obj_add_flag(s_ui.action_button, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.stop_button) lv_obj_add_flag(s_ui.stop_button, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (s_ui.task_actions) lv_obj_remove_flag(s_ui.task_actions, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_ui.chat, LV_OBJ_FLAG_HIDDEN);
+        if (s_ui.action_button) lv_obj_remove_flag(s_ui.action_button, LV_OBJ_FLAG_HIDDEN);
+        UpdateActionButton();
+    }
+}
+
+void EndRealtimeSession(bool notify_pc) {
+    const std::string request_id = s_ui.realtime_request_id;
+    s_ui.realtime_capture_started = false;
+    s_ui.realtime_request_id.clear();
+    s_ui.realtime_host_id.clear();
+    s_ui.realtime_thread_id.clear();
+    s_ui.realtime_stream_id.clear();
+    s_ui.realtime_generation = 0;
+    s_ui.realtime_last_sequence = 0;
+    Application::GetInstance().EndCodexRealtimeSession();
+    ShowRealtimePage(false);
+    if (notify_pc && !request_id.empty() && CodexWsClient::GetInstance().IsConnected()) {
+        CodexWsClient::GetInstance().SendTextMessage(
+            "{\"type\":\"realtime_end\",\"requestId\":\"" + request_id + "\"}",
+            pdMS_TO_TICKS(200));
+    }
+}
+
+void StartRealtimeSession() {
+    if (!CanUseCodex() || !s_ui.realtime_request_id.empty() || MenuVoiceBusy()) return;
+    const auto* target = codex_menu::SelectedTask(s_ui.menu_state);
+    if (target == nullptr || target->host_id.empty() || target->thread_id.empty() ||
+        s_ui.menu_state.stream_id.empty()) {
+        SetStatus(true, "请先选择已同步任务");
+        return;
+    }
+    const std::string request_id = "esp32-realtime-" + std::to_string(s_ui.menu_boot_nonce) +
+        "-" + std::to_string(++s_ui.request_counter);
+    const std::string request = TargetedRequest("realtime_start", request_id);
+    if (request.empty() || !CodexWsClient::GetInstance().SendTextMessage(request)) {
+        SetStatus(false, "实时语音连接请求失败");
+        return;
+    }
+    s_ui.realtime_request_id = request_id;
+    s_ui.realtime_host_id = target->host_id;
+    s_ui.realtime_thread_id = target->thread_id;
+    s_ui.realtime_stream_id = s_ui.menu_state.stream_id;
+    s_ui.realtime_generation = 0;
+    s_ui.realtime_last_sequence = 0;
+    s_ui.realtime_muted = false;
+    if (auto* codec = Board::GetInstance().GetAudioCodec()) {
+        s_ui.realtime_volume_percent = codec->output_volume();
+        if (s_ui.realtime_volume) {
+            std::string label = "音量 " + std::to_string(s_ui.realtime_volume_percent) + "%";
+            lv_label_set_text(lv_obj_get_child(s_ui.realtime_volume, 0), label.c_str());
+        }
+    }
+    SetRealtimeVisual(RealtimeVisual::Connecting, "连接中");
+    ShowRealtimePage(true);
+    SetStatus(true, "实时语音连接中…");
+    HideConfig();
+}
+
+void OnRealtimeMute(lv_event_t*) {
+    if (s_ui.realtime_request_id.empty()) return;
+    const bool muted = !s_ui.realtime_muted;
+    const std::string message = "{\"type\":\"realtime_mute\",\"requestId\":\"" +
+        s_ui.realtime_request_id + "\",\"muted\":" + (muted ? "true}" : "false}");
+    if (CodexWsClient::GetInstance().SendTextMessage(message, pdMS_TO_TICKS(200))) {
+        // The visual state changes only when the PC confirms it in realtime_status.
+        if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "静音中…");
+    }
+}
+
+void OnRealtimeVolume(lv_event_t*) {
+    s_ui.realtime_volume_percent = s_ui.realtime_volume_percent >= 100 ? 40 : s_ui.realtime_volume_percent + 10;
+    if (auto* codec = Board::GetInstance().GetAudioCodec()) codec->SetOutputVolume(s_ui.realtime_volume_percent);
+    if (s_ui.realtime_volume != nullptr) {
+        std::string label = "音量 " + std::to_string(s_ui.realtime_volume_percent) + "%";
+        lv_label_set_text(lv_obj_get_child(s_ui.realtime_volume, 0), label.c_str());
+    }
+}
+
+void OnRealtimeEnd(lv_event_t*) { EndRealtimeSession(true); }
 
 bool ShouldCaptureDeviceAudio(const cJSON* mode, const cJSON* audio_source,
                               const cJSON* accepts_audio) {
@@ -684,6 +882,105 @@ void HandleMessage(const std::string& message) {
             if (IsIdleState(state->valuestring)) SetTaskActive(false);
             UpdateStatusRing();
         }
+    } else if (std::strcmp(type, "realtime_status") == 0) {
+        if (!IsCurrentRealtime(root)) {
+            cJSON_Delete(root);
+            return;
+        }
+        const cJSON* state = cJSON_GetObjectItemCaseSensitive(root, "state");
+        const cJSON* accepts_audio = cJSON_GetObjectItemCaseSensitive(root, "acceptsAudio");
+        const cJSON* detail = cJSON_GetObjectItemCaseSensitive(root, "message");
+        if (!cJSON_IsString(state)) {
+            cJSON_Delete(root);
+            return;
+        }
+        const char* value = state->valuestring;
+        const bool input_phase = std::strcmp(value, "listening") == 0 ||
+                                 std::strcmp(value, "thinking") == 0;
+        if (input_phase && cJSON_IsTrue(accepts_audio) && !s_ui.realtime_capture_started) {
+            s_ui.realtime_capture_started = true;
+            Application::GetInstance().StartCodexRealtimeCapture(s_ui.realtime_request_id);
+        } else if ((!input_phase || !cJSON_IsTrue(accepts_audio)) && s_ui.realtime_capture_started) {
+            s_ui.realtime_capture_started = false;
+            Application::GetInstance().StopCodexRealtimeCapture();
+        }
+        if (std::strcmp(value, "listening") == 0) {
+            // Sending realtime_start only asks the PC to prepare. Capture
+            // starts solely after its matching, identity-bound ready status.
+            s_ui.realtime_muted = false;
+            SetRealtimeVisual(RealtimeVisual::Listening, "聆听中");
+            if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "静音");
+            SetStatus(true, cJSON_IsTrue(accepts_audio) ? "实时语音正在聆听" : "实时语音等待麦克风");
+        } else if (std::strcmp(value, "connecting") == 0) {
+            SetRealtimeVisual(RealtimeVisual::Connecting, "连接中");
+            SetStatus(true, "实时语音连接中…");
+        } else if (std::strcmp(value, "thinking") == 0 || std::strcmp(value, "speaking") == 0 ||
+                   std::strcmp(value, "muted") == 0) {
+            if (std::strcmp(value, "speaking") == 0) SetRealtimeVisual(RealtimeVisual::Speaking, "说话中");
+            else if (std::strcmp(value, "muted") == 0) {
+                s_ui.realtime_muted = true;
+                SetRealtimeVisual(RealtimeVisual::Muted, "已静音");
+                if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "取消静音");
+            } else SetRealtimeVisual(RealtimeVisual::Thinking, "思考中");
+            SetStatus(true, std::strcmp(value, "speaking") == 0 ? "实时语音正在说话" :
+                            std::strcmp(value, "muted") == 0 ? "实时语音已静音" : "实时语音思考中");
+        } else if (std::strcmp(value, "ended") == 0 || std::strcmp(value, "error") == 0 ||
+                   std::strcmp(value, "disconnected") == 0) {
+            const bool failed = std::strcmp(value, "error") == 0 || std::strcmp(value, "disconnected") == 0;
+            EndRealtimeSession(false);
+            SetRealtimeVisual(failed ? RealtimeVisual::Error : RealtimeVisual::Connecting,
+                              cJSON_IsString(detail) ? detail->valuestring : "已结束");
+            SetStatus(!failed, cJSON_IsString(detail) ? detail->valuestring :
+                      (failed ? "实时语音已断开" : "实时语音已结束"));
+            // The PC-provided setup failure must remain readable; do not
+            // reduce it to an icon after the standalone call surface closes.
+            if (failed) ShowConfig();
+        }
+    } else if (std::strcmp(type, "realtime_audio_clear") == 0) {
+        if (IsCurrentRealtime(root)) {
+            const cJSON* generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
+            if (cJSON_IsNumber(generation) && generation->valuedouble > s_ui.realtime_generation) {
+                s_ui.realtime_generation = static_cast<uint32_t>(generation->valuedouble);
+                s_ui.realtime_last_sequence = 0;
+                Application::GetInstance().ClearCodexRealtimeAudio();
+            }
+        }
+    } else if (std::strcmp(type, "realtime_audio") == 0) {
+        if (IsCurrentRealtime(root)) {
+            const cJSON* generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
+            const cJSON* sequence = cJSON_GetObjectItemCaseSensitive(root, "sequence");
+            const cJSON* rate = cJSON_GetObjectItemCaseSensitive(root, "sampleRate");
+            const cJSON* duration = cJSON_GetObjectItemCaseSensitive(root, "frameDuration");
+            const cJSON* codec = cJSON_GetObjectItemCaseSensitive(root, "codec");
+            const cJSON* encoded = cJSON_GetObjectItemCaseSensitive(root, "data");
+            if (cJSON_IsNumber(generation) && cJSON_IsNumber(sequence) && cJSON_IsNumber(rate) &&
+                cJSON_IsNumber(duration) && cJSON_IsString(codec) && cJSON_IsString(encoded) &&
+                std::strcmp(codec->valuestring, "opus") == 0 && rate->valueint == 16000 &&
+                duration->valueint == 20 && std::strlen(encoded->valuestring) <= 5464) {
+                const uint32_t frame_generation = static_cast<uint32_t>(generation->valuedouble);
+                const uint32_t frame_sequence = static_cast<uint32_t>(sequence->valuedouble);
+                if (frame_generation == s_ui.realtime_generation && frame_sequence > s_ui.realtime_last_sequence) {
+                    size_t decoded_size = 0;
+                    const int sizing = mbedtls_base64_decode(nullptr, 0, &decoded_size,
+                        reinterpret_cast<const unsigned char*>(encoded->valuestring),
+                        std::strlen(encoded->valuestring));
+                    if (sizing == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decoded_size > 0 && decoded_size <= 4096) {
+                        auto packet = std::make_unique<AudioStreamPacket>();
+                        packet->payload.resize(decoded_size);
+                        size_t written = 0;
+                        if (mbedtls_base64_decode(packet->payload.data(), packet->payload.size(), &written,
+                                reinterpret_cast<const unsigned char*>(encoded->valuestring),
+                                std::strlen(encoded->valuestring)) == 0 && written == decoded_size) {
+                            packet->sample_rate = 16000;
+                            packet->frame_duration = 20;
+                            if (Application::GetInstance().PushCodexRealtimeAudio(std::move(packet))) {
+                                s_ui.realtime_last_sequence = frame_sequence;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else if (std::strcmp(type, "turn_stop_result") == 0) {
         const cJSON* request = cJSON_GetObjectItemCaseSensitive(root, "requestId");
         if (cJSON_IsString(request) && !s_ui.stop_request_id.empty() &&
@@ -853,6 +1150,9 @@ void FinishVoiceCapture(bool cancelled) {
 }
 
 void InvalidateCodexSession() {
+    // A bridge/session replacement must never leave its microphone or queued
+    // playback attached to a task that is no longer selected.
+    EndRealtimeSession(false);
     if (s_ui.pending_menu_request.empty()) s_task_entry.Remember(s_ui.menu_state);
     s_task_entry.Begin();
     s_ui.pending_menu_request.clear();
@@ -1079,15 +1379,25 @@ void OnSaveToken(lv_event_t*) {
         HideConfig();
         return;
     }
+    std::string remote_uri;
+    if (s_ui.remote_mode) {
+        std::string host;
+        int port = 0;
+        if (!codex_remote::ParseEndpoint(TextareaText(s_ui.remote_ip), remote_uri, host, port)) {
+            return;
+        }
+    }
     const char* token = lv_textarea_get_text(s_ui.token);
     if (token == nullptr || !client.SaveToken(token)) return;
     Keyboard::Get().Hide();
     if (s_ui.remote_mode) {
-        const char* remote_ip = s_ui.remote_ip != nullptr
-                                    ? lv_textarea_get_text(s_ui.remote_ip)
-                                    : nullptr;
-        if (remote_ip == nullptr || remote_ip[0] == '\0') return;
-        client.Connect(remote_ip, 8765);
+        {
+            Settings settings("codex", true);
+            if (settings.GetString("remote_url") != remote_uri) {
+                settings.SetString("remote_url", remote_uri);
+            }
+        }
+        client.Connect(remote_uri);
     } else {
         const std::string ip = !s_ui.discovered_ip.empty()
                                    ? s_ui.discovered_ip
@@ -1102,6 +1412,7 @@ void OnSaveToken(lv_event_t*) {
 
 void SetConnectionMode(bool remote) {
     s_ui.remote_mode = remote;
+    CodexWsClient::GetInstance().SetDiscoveryEnabled(!remote);
     for (size_t i = 0; i < 2; ++i) {
         controls::SetSegmentButtonSelected(s_ui.connection_modes[i],
                                            i == static_cast<size_t>(remote));
@@ -1146,6 +1457,7 @@ void BuildConfigDialog(lv_obj_t* root) {
     callbacks.tab = OnMenuTab;
     callbacks.task = OnTaskSlot;
     callbacks.new_task = OnMenuNewTask;
+    callbacks.realtime = OnMenuRealtime;
     callbacks.model = OnModelDropdown;
     callbacks.effort = OnEffortReleased;
     callbacks.fast = OnFastChanged;
@@ -1178,6 +1490,7 @@ void BuildConfigDialog(lv_obj_t* root) {
     s_ui.remote_ip = parts.remote_ip;
     s_ui.token = parts.token;
     s_ui.new_task_button = parts.new_task;
+    s_ui.realtime_button = parts.realtime;
     s_ui.model_summary = parts.model_context;
     s_ui.model_dropdown = parts.model_dropdown;
     s_ui.fast_switch = parts.fast_switch;
@@ -1185,9 +1498,11 @@ void BuildConfigDialog(lv_obj_t* root) {
     if (CodexWsClient::GetInstance().LoadToken(saved_token)) {
         lv_textarea_set_text(s_ui.token, saved_token.c_str());
     }
-    Keyboard::Get().Bind(s_ui.remote_ip, "公网 IP", LV_KEYBOARD_MODE_TEXT_LOWER);
+    Keyboard::Get().Bind(s_ui.remote_ip, "服务器地址", LV_KEYBOARD_MODE_TEXT_LOWER);
     Keyboard::Get().Bind(s_ui.token, "Codex Token");
     Settings settings("codex", false);
+    const std::string saved_remote_url = settings.GetString("remote_url");
+    lv_textarea_set_text(s_ui.remote_ip, saved_remote_url.c_str());
     s_ui.ring_enabled = settings.GetBool("status_ring", true);
     if (s_ui.ring_enabled) lv_obj_add_state(parts.ring_switch, LV_STATE_CHECKED);
     else lv_obj_remove_state(parts.ring_switch, LV_STATE_CHECKED);
@@ -1201,7 +1516,7 @@ void SetMenuTab(MenuTab tab) {
     RefreshCodexMenu();
 }
 
-bool MenuVoiceBusy() { return s_ui.voice_pressed || s_ui.voice_stage != VoiceStage::Idle; }
+bool MenuVoiceBusy() { return !s_ui.realtime_request_id.empty() || s_ui.voice_pressed || s_ui.voice_stage != VoiceStage::Idle; }
 
 bool SendMenuAction(const char* action, int slot = -1, const std::string& model = {},
                     const std::string& effort = {}, int fast = -1) {
@@ -1278,6 +1593,8 @@ void OnTaskSlot(lv_event_t* event) {
 
 void OnMenuNewTask(lv_event_t*) { if (CanUseCodex() && !MenuVoiceBusy() && s_ui.menu_state.can_new_task) SendMenuAction("new_task"); }
 
+void OnMenuRealtime(lv_event_t*) { StartRealtimeSession(); }
+
 void OnModelDropdown(lv_event_t* event) {
     const int selected = s_ui.menu_state.selected_slot;
     const auto* target = codex_menu::SettingsTarget(s_ui.menu_state);
@@ -1339,14 +1656,17 @@ void RefreshCodexMenu(bool force) {
 void OnDeleted(lv_event_t*) {
     IdlePower::Get().SetMicroDisplay({});
     if (s_ui.pending_menu_request.empty()) s_task_entry.Remember(s_ui.menu_state);
+    EndRealtimeSession(true);
     auto& client = CodexWsClient::GetInstance();
     client.SetOnMessageCallback({});
     client.SetOnStatusCallback({});
     client.SetOnDiscoveryCallback({});
     FinishVoiceCapture(true);
+    client.SetAppActive(false);
     ResetStopHoldProgress();
     if (s_ui.menu_pending_timer) { lv_timer_delete(s_ui.menu_pending_timer); s_ui.menu_pending_timer = nullptr; }
     if (s_ui.bridge_status_timer) { lv_timer_delete(s_ui.bridge_status_timer); s_ui.bridge_status_timer = nullptr; }
+    if (s_ui.realtime_timer) { lv_timer_delete(s_ui.realtime_timer); s_ui.realtime_timer = nullptr; }
     s_ui.stop_hold_progress = nullptr;
     CancelVoiceLabelTimer();
     controls::SetVoiceButtonAnimating(s_ui.voice_button, false);
@@ -1356,6 +1676,7 @@ void OnDeleted(lv_event_t*) {
     s_ui.root.store(nullptr);
     s_ui.chat = nullptr;
     s_ui.action_button = nullptr;
+    s_ui.task_actions = nullptr;
     s_ui.action_icon = nullptr;
     s_ui.action_label = nullptr;
     s_ui.stop_button = nullptr;
@@ -1383,6 +1704,13 @@ void OnDeleted(lv_event_t*) {
     for (size_t i = 0; i < 3; ++i) { s_ui.menu_tabs[i] = nullptr; s_ui.menu_panels[i] = nullptr; }
     for (size_t i = 0; i < 6; ++i) s_ui.task_cards[i] = nullptr;
     s_ui.new_task_button = nullptr;
+    s_ui.realtime_button = nullptr;
+    s_ui.realtime_root = nullptr;
+    s_ui.realtime_canvas = nullptr;
+    s_ui.realtime_status = nullptr;
+    s_ui.realtime_mute = nullptr;
+    s_ui.realtime_volume = nullptr;
+    s_ui.realtime_end = nullptr;
     s_ui.voice_stage = VoiceStage::Idle;
     s_ui.voice_mode = VoiceMode::Micro;
     s_ui.voice_pressed = false;
@@ -1413,6 +1741,7 @@ void OnDeleted(lv_event_t*) {
 lv_obj_t* CodexView::Create() {
     s_task_entry.Begin();
     auto shell = CreateAppShell("Codex", "自动发现 PC 服务");
+    s_ui.task_actions = shell.actions;
     s_ui.root.store(shell.root);
     lv_obj_add_event_cb(shell.root, OnDeleted, LV_EVENT_DELETE, nullptr);
 
@@ -1427,6 +1756,46 @@ lv_obj_t* CodexView::Create() {
     lv_obj_set_flex_flow(s_ui.chat, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scroll_dir(s_ui.chat, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_ui.chat, LV_SCROLLBAR_MODE_OFF);
+
+    // Realtime is a dedicated, no-transcript surface. Its 600 px reference
+    // field is drawn procedurally at 30 FPS from sparse 56x56 logical cells.
+    s_ui.realtime_root = lv_obj_create(shell.content);
+    lv_obj_remove_style_all(s_ui.realtime_root);
+    lv_obj_set_size(s_ui.realtime_root, 720, metrics::kBottomActionContentHeight);
+    lv_obj_set_pos(s_ui.realtime_root, 0, 0);
+    lv_obj_set_style_bg_color(s_ui.realtime_root, lv_color_hex(Theme::Get().colors().background), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_ui.realtime_root, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(s_ui.realtime_root, LV_OBJ_FLAG_SCROLLABLE);
+    s_ui.realtime_canvas = lv_obj_create(s_ui.realtime_root);
+    lv_obj_remove_style_all(s_ui.realtime_canvas);
+    lv_obj_set_size(s_ui.realtime_canvas, 600, 430);
+    lv_obj_align(s_ui.realtime_canvas, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_add_event_cb(s_ui.realtime_canvas, RenderRealtimePixels, LV_EVENT_DRAW_MAIN, nullptr);
+    s_ui.realtime_status = lv_label_create(s_ui.realtime_root);
+    lv_label_set_text(s_ui.realtime_status, "连接中");
+    lv_obj_set_style_text_font(s_ui.realtime_status, fonts::MediumBold(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_ui.realtime_status, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+    lv_obj_align(s_ui.realtime_status, LV_ALIGN_TOP_MID, 0, 450);
+    auto make_realtime_button = [&](const char* label, int x, lv_event_cb_t cb) {
+        lv_obj_t* button = lv_btn_create(s_ui.realtime_root);
+        lv_obj_set_size(button, 170, 58);
+        lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, 500);
+        lv_obj_set_style_bg_color(button, lv_color_hex(Theme::Get().colors().surface), LV_PART_MAIN);
+        lv_obj_t* text = lv_label_create(button);
+        lv_label_set_text(text, label);
+        lv_obj_center(text);
+        lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, nullptr);
+        return button;
+    };
+    s_ui.realtime_mute = make_realtime_button("静音", 82, OnRealtimeMute);
+    s_ui.realtime_volume = make_realtime_button("音量 70%", 275, OnRealtimeVolume);
+    s_ui.realtime_end = make_realtime_button("结束", 468, OnRealtimeEnd);
+    lv_obj_set_style_bg_color(s_ui.realtime_end, lv_color_hex(Theme::Get().colors().danger), LV_PART_MAIN);
+    lv_obj_add_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN);
+    s_ui.realtime_timer = lv_timer_create([](lv_timer_t*) {
+        if (s_ui.realtime_root != nullptr && !lv_obj_has_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN) &&
+            s_ui.realtime_canvas != nullptr) lv_obj_invalidate(s_ui.realtime_canvas);
+    }, 33, nullptr);
 
     auto voice = controls::AddBottomVoiceButton(
         shell.actions, "按住说话", nullptr);
@@ -1483,11 +1852,13 @@ lv_obj_t* CodexView::Create() {
     client.SetOnMessageCallback(PostMessage);
     client.SetOnStatusCallback(PostStatus);
     client.SetOnDiscoveryCallback(PostDiscovery);
+    client.SetAppActive(true);
     s_ui.bridge_connection.SetTransportConnected(client.IsConnected(), lv_tick_get());
     s_ui.bridge_status_timer = lv_timer_create([](lv_timer_t*) {
         RefreshBridgeUi(lv_tick_get());
     }, 1000, nullptr);
     RefreshBridgeUi(lv_tick_get());
+    client.SetDiscoveryEnabled(!s_ui.remote_mode);
     if (!client.IsConnected()) client.StartDiscovery(8000);
     if (!client.HasToken()) ShowConfig();
     SyncConversation();

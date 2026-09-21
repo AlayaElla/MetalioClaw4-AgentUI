@@ -62,6 +62,12 @@ Parts Build(lv_obj_t* root, const Callbacks& callbacks) {
     lv_obj_align(create.title, LV_ALIGN_TOP_LEFT, 54, 7);
     lv_obj_align(create.detail, LV_ALIGN_BOTTOM_LEFT, 54, -7);
     p.new_task = create.root;
+    auto realtime = controls::CreateCompactRow(tasks, FONT_AWESOME_MICROPHONE,
+        "实时语音", "与当前任务进行实时通话", nullptr,
+        72, true, false, callbacks.realtime);
+    controls::StyleSettingsCard(realtime.root, true, false);
+    lv_obj_set_style_margin_top(realtime.root, 16, LV_PART_MAIN);
+    p.realtime = realtime.root;
     auto* list = controls::CreateContentPanel(tasks, LV_SIZE_CONTENT, 14);
     lv_obj_set_style_margin_top(list, 16, LV_PART_MAIN);
     for (int i = 0; i < 6; ++i) {
@@ -140,14 +146,20 @@ Parts Build(lv_obj_t* root, const Callbacks& callbacks) {
     p.discovery_name = device.title;
     p.connection_panels[1] = controls::CreateContentPanel(connection, LV_SIZE_CONTENT, 8);
     lv_obj_set_style_margin_top(p.connection_panels[1], 16, LV_PART_MAIN);
-    Label(p.connection_panels[1], "公网 IP 地址");
-    p.remote_ip = controls::CreateTextField(p.connection_panels[1], "例如 203.0.113.10", callbacks.connection_changed);
+    Label(p.connection_panels[1], "服务器地址");
+    p.remote_ip = controls::CreateTextField(p.connection_panels[1], "输入服务器地址", callbacks.connection_changed);
     lv_obj_add_flag(p.connection_panels[1], LV_OBJ_FLAG_HIDDEN);
     auto* token = controls::CreateContentPanel(connection, LV_SIZE_CONTENT, 8);
     lv_obj_set_style_margin_top(token, 24, LV_PART_MAIN);
     Label(token, "认证 Token");
-    p.token = controls::CreateTextField(token, "输入认证 Token", callbacks.connection_changed);
-    lv_textarea_set_password_mode(p.token, true);
+    p.token = controls::CreateTextField(token, "输入认证 Token", callbacks.connection_changed, true);
+    const auto scroll_to_input = [](lv_event_t* event) {
+        auto* content = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+        lv_obj_update_layout(content);
+        lv_obj_scroll_to_y(content, LV_COORD_MAX, LV_ANIM_OFF);
+    };
+    lv_obj_add_event_cb(p.token, scroll_to_input, LV_EVENT_FOCUSED, p.content);
+    lv_obj_add_event_cb(p.token, scroll_to_input, LV_EVENT_CLICKED, p.content);
     p.connect = controls::AddWideActionButton(connection, FONT_AWESOME_LINK, "连接", callbacks.connect);
     lv_obj_set_style_margin_top(p.connect.root, 18, LV_PART_MAIN);
     auto* display_heading = controls::CreateSectionHeading(connection, "显示设置");
@@ -165,12 +177,10 @@ Parts Build(lv_obj_t* root, const Callbacks& callbacks) {
     lv_obj_set_style_margin_top(notification_heading, 28, LV_PART_MAIN);
     lv_obj_set_style_margin_bottom(notification_heading, 12, LV_PART_MAIN);
     auto notification = controls::CreateCompactRow(connection, FONT_AWESOME_BELL,
-        "Codex 任务提醒", "审批、提问和完成时提示", nullptr, 84, false, false);
+        "Codex 任务提醒", nullptr, nullptr, 84, false, false);
     controls::StyleSettingsCard(notification.root);
     lv_obj_set_style_bg_opa(notification.root, LV_OPA_TRANSP, LV_PART_MAIN);
     FitRow(notification, 280);
-    lv_obj_align(notification.title, LV_ALIGN_TOP_LEFT, 54, 10);
-    lv_obj_align(notification.detail, LV_ALIGN_BOTTOM_LEFT, 54, -10);
     p.notification_switch = controls::AddSwitch(notification.root, true, callbacks.notification_enabled);
     lv_obj_set_size(p.notification_switch, 72, 38);
 

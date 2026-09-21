@@ -1,7 +1,10 @@
 #include "codex_ws_client.h"
+#include "codex_ws_endpoint.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include <algorithm>
 #include <esp_log.h>
+#include <mbedtls/base64.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <lwip/inet.h>
@@ -28,6 +31,7 @@ struct DiscoveryTaskArgs {
     CodexWsClient* client;
     int timeout_ms;
     int initial_delay_ms;
+    uint32_t epoch;
 };
 }
 
@@ -99,6 +103,19 @@ bool CodexWsClient::LoadToken(std::string& out_token) const {
 }
 
 bool CodexWsClient::Connect(const std::string& ip, int port) {
+    if (port < 1 || port > 65535) return false;
+    return Connect(ip + ":" + std::to_string(port));
+}
+
+bool CodexWsClient::Connect(const std::string& address) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (!app_active_) return false;
+    std::string uri, host;
+    int port = 0;
+    if (!codex_remote::ParseEndpoint(address, uri, host, port)) {
+        ESP_LOGW(TAG, "Invalid server address: explicit port (1-65535) required");
+        return false;
+    }
     std::string token;
     if (!LoadToken(token)) {
         ESP_LOGW(TAG, "Authentication token is required before connecting");
@@ -108,17 +125,16 @@ bool CodexWsClient::Connect(const std::string& ip, int port) {
         Disconnect();
     }
 
-    current_ip_ = ip;
+    current_ip_ = host;
+    current_uri_ = uri;
     current_port_ = port;
     rx_buffer_.clear();
 
-    char uri_buf[128];
-    snprintf(uri_buf, sizeof(uri_buf), "ws://%s:%d", ip.c_str(), port);
-
-    ESP_LOGI(TAG, "Connecting to WebSocket URL: %s", uri_buf);
+    ESP_LOGI(TAG, "Connecting to WebSocket server: %s:%d", host.c_str(), port);
 
     esp_websocket_client_config_t ws_cfg = {};
-    ws_cfg.uri = uri_buf;
+    ws_cfg.uri = current_uri_.c_str();
+    if (uri.compare(0, 6, "wss://") == 0) ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
     ws_cfg.ping_interval_sec = codex_remote::transport::kPingIntervalSeconds;
     ws_cfg.pingpong_timeout_sec = codex_remote::transport::kPongTimeoutSeconds;
     ws_cfg.reconnect_timeout_ms = codex_remote::transport::kReconnectTimeoutMs;
@@ -153,6 +169,8 @@ bool CodexWsClient::HasToken() const {
 }
 
 bool CodexWsClient::StartDiscovery(int timeout_ms, int initial_delay_ms) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (!app_active_ || !discovery_enabled_) return false;
     if (transport_state_.IsConnected() || timeout_ms <= 0) return false;
 
     bool expected = false;
@@ -161,7 +179,8 @@ bool CodexWsClient::StartDiscovery(int timeout_ms, int initial_delay_ms) {
     auto* args = new (std::nothrow) DiscoveryTaskArgs{
         this,
         timeout_ms,
-        std::max(0, initial_delay_ms)
+        std::max(0, initial_delay_ms),
+        discovery_epoch_.load()
     };
     if (!args) {
         discovery_running_ = false;
@@ -178,11 +197,27 @@ bool CodexWsClient::StartDiscovery(int timeout_ms, int initial_delay_ms) {
     return true;
 }
 
+void CodexWsClient::SetAppActive(bool active) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (app_active_ == active) return;
+    app_active_ = active;
+    ++discovery_epoch_;
+    if (!active) Disconnect();
+}
+
+void CodexWsClient::SetDiscoveryEnabled(bool enabled) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (discovery_enabled_ == enabled) return;
+    discovery_enabled_ = enabled;
+    ++discovery_epoch_;
+}
+
 void CodexWsClient::DiscoveryTask(void* task_args) {
     auto* args = static_cast<DiscoveryTaskArgs*>(task_args);
     CodexWsClient* client = args->client;
     const int timeout_ms = args->timeout_ms;
     const int initial_delay_ms = args->initial_delay_ms;
+    const uint32_t epoch = args->epoch;
     delete args;
 
     if (initial_delay_ms > 0) {
@@ -190,7 +225,8 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
     }
 
     int sock = -1;
-    if (!client->transport_state_.IsConnected()) {
+    if (client->app_active_ && client->discovery_enabled_ &&
+        client->discovery_epoch_ == epoch && !client->transport_state_.IsConnected()) {
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     }
 
@@ -212,10 +248,15 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
         const TickType_t started_at = xTaskGetTickCount();
         const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
 
-        while (!client->transport_state_.IsConnected() &&
+        while (client->app_active_ && client->discovery_enabled_ && client->discovery_epoch_ == epoch &&
+               !client->transport_state_.IsConnected() &&
                xTaskGetTickCount() - started_at < timeout_ticks) {
-            sendto(sock, kDiscoveryRequest, strlen(kDiscoveryRequest), 0,
-                   reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+            {
+                std::lock_guard<std::recursive_mutex> lock(client->endpoint_mutex_);
+                if (!client->app_active_ || !client->discovery_enabled_ || client->discovery_epoch_ != epoch) break;
+                sendto(sock, kDiscoveryRequest, strlen(kDiscoveryRequest), 0,
+                       reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+            }
 
             char response_buffer[384] = {0};
             sockaddr_in source = {};
@@ -256,6 +297,8 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
                 continue;
             }
 
+            std::lock_guard<std::recursive_mutex> lock(client->endpoint_mutex_);
+            if (!client->app_active_ || !client->discovery_enabled_ || client->discovery_epoch_ != epoch) break;
             ESP_LOGI(TAG, "Discovered Codex Remote PC at %s:%d",
                      discovered_ip, discovered_port);
             client->current_ip_ = discovered_ip;
@@ -271,15 +314,22 @@ void CodexWsClient::DiscoveryTask(void* task_args) {
         }
 
         close(sock);
-    } else if (!client->transport_state_.IsConnected()) {
+    } else if (client->app_active_ && client->discovery_epoch_ == epoch && !client->transport_state_.IsConnected()) {
         ESP_LOGW(TAG, "Could not create LAN discovery socket");
     }
 
-    client->discovery_running_ = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(client->endpoint_mutex_);
+        client->discovery_running_ = false;
+        if (client->app_active_ && client->discovery_enabled_ && client->discovery_epoch_ != epoch) {
+            client->StartDiscovery(timeout_ms);
+        }
+    }
     vTaskDelete(nullptr);
 }
 
 void CodexWsClient::Disconnect() {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
     // Clear the active handle before stop/destroy: an event from this explicit
     // shutdown is stale by definition and must not alter a later connection.
     esp_websocket_client_handle_t handle = client_handle_;
@@ -293,6 +343,8 @@ void CodexWsClient::Disconnect() {
 }
 
 bool CodexWsClient::Reconnect() {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (!app_active_) return false;
     const bool has_endpoint = !current_ip_.empty() &&
         current_port_ >= 1 && current_port_ <= 65535;
     if (!codex_remote::transport::CanReconnect(has_endpoint, HasToken())) {
@@ -300,14 +352,13 @@ bool CodexWsClient::Reconnect() {
         return false;
     }
 
-    const std::string ip = current_ip_;
-    const int port = current_port_;
-    Disconnect();
-    return Connect(ip, port);
+    const std::string uri = current_uri_;
+    return Connect(uri);
 }
 
 bool CodexWsClient::SendTextMessage(const std::string& json_str, TickType_t timeout_ticks) {
-    if (!client_handle_ || !transport_state_.IsConnected()) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (!app_active_ || !client_handle_ || !transport_state_.IsConnected()) {
         ESP_LOGE(TAG, "Cannot send text: Client not connected");
         return false;
     }
@@ -317,7 +368,8 @@ bool CodexWsClient::SendTextMessage(const std::string& json_str, TickType_t time
 }
 
 bool CodexWsClient::SendOpusAudioFrame(const uint8_t* data, size_t length) {
-    if (!client_handle_ || !transport_state_.IsConnected()) {
+    std::lock_guard<std::recursive_mutex> lock(endpoint_mutex_);
+    if (!app_active_ || !client_handle_ || !transport_state_.IsConnected()) {
         ESP_LOGE(TAG, "Cannot send audio: Client not connected");
         return false;
     }
@@ -326,10 +378,45 @@ bool CodexWsClient::SendOpusAudioFrame(const uint8_t* data, size_t length) {
     return res >= 0;
 }
 
+bool CodexWsClient::SendRealtimeOpusAudioFrame(const std::string& request_id,
+                                                uint32_t sequence,
+                                                const uint8_t* data,
+                                                size_t length) {
+    constexpr size_t kMaxRawOpusBytes = 4096;
+    constexpr size_t kMaxEncodedBytes = 5464;
+    constexpr size_t kMaxRealtimeJsonBytes = 8192;
+    if (request_id.empty() || data == nullptr || length == 0 || length > kMaxRawOpusBytes) {
+        ESP_LOGW(TAG, "Rejecting invalid realtime audio frame");
+        return false;
+    }
+    size_t encoded_length = 0;
+    const int sizing = mbedtls_base64_encode(nullptr, 0, &encoded_length, data, length);
+    if (sizing != MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL || encoded_length > kMaxEncodedBytes) return false;
+    std::string encoded(encoded_length, '\0');
+    size_t written = 0;
+    if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(encoded.data()), encoded.size(),
+                              &written, data, length) != 0) return false;
+    encoded.resize(written);
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "type", "realtime_audio_input");
+    cJSON_AddStringToObject(root, "requestId", request_id.c_str());
+    cJSON_AddNumberToObject(root, "sequence", sequence);
+    cJSON_AddNumberToObject(root, "generation", 1);
+    cJSON_AddNumberToObject(root, "sampleRate", 16000);
+    cJSON_AddNumberToObject(root, "frameDuration", 60);
+    cJSON_AddStringToObject(root, "codec", "opus");
+    cJSON_AddStringToObject(root, "data", encoded.c_str());
+    char* printed = cJSON_PrintUnformatted(root);
+    const std::string message = printed != nullptr ? printed : "";
+    if (printed != nullptr) cJSON_free(printed);
+    cJSON_Delete(root);
+    return !message.empty() && message.size() <= kMaxRealtimeJsonBytes && SendTextMessage(message);
+}
+
 void CodexWsClient::EventHandler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
     CodexWsClient* client = static_cast<CodexWsClient*>(handler_args);
     esp_websocket_event_data_t* data = (esp_websocket_event_data_t*)event_data;
-    if (!client || !data || data->client != client->client_handle_) {
+    if (!client || !client->app_active_ || !data || data->client != client->client_handle_) {
         ESP_LOGW(TAG, "Ignoring WebSocket event from an inactive client");
         return;
     }
@@ -360,7 +447,7 @@ void CodexWsClient::EventHandler(void* handler_args, esp_event_base_t base, int3
                     ? data->payload_len
                     : static_cast<int>(client->rx_buffer_.size());
                 if (data->payload_offset + data->data_len >= payload_length) {
-                    ESP_LOGI(TAG, "Received text message (%u bytes)",
+                    ESP_LOGD(TAG, "Received text message (%u bytes)",
                              static_cast<unsigned>(client->rx_buffer_.size()));
                     codex_remote_handle_notification_json(client->rx_buffer_.c_str());
                     if (client->on_message_cb_) {

@@ -482,6 +482,71 @@ void Application::StartCodexVoiceCapture() {
     });
 }
 
+void Application::StartCodexRealtimeCapture(const std::string& request_id) {
+    if (request_id.empty()) return;
+    Schedule([this, request_id]() {
+        if (low_power_standby_.load() || codex_voice_capture_active_ ||
+            codex_voice_start_pending_) return;
+        if (codex_realtime_request_id_ != request_id) {
+            codex_realtime_request_id_ = request_id;
+            codex_realtime_audio_sequence_ = 0;
+            codex_realtime_restore_wake_word_ = audio_service_.IsWakeWordRunning();
+            if (codex_realtime_restore_wake_word_) audio_service_.EnableWakeWordDetection(false);
+        }
+        codex_voice_stop_pending_ = false;
+        codex_voice_stop_wait_started_at_us_ = 0;
+        codex_voice_restore_wake_word_ = false;
+        codex_voice_stopped_callback_ = {};
+        codex_voice_start_pending_ = true;
+        codex_voice_start_wait_started_at_us_ = esp_timer_get_time();
+        TryStartCodexVoiceCapture();
+    });
+}
+
+void Application::StopCodexRealtimeCapture() {
+    Schedule([this]() {
+        codex_voice_start_pending_ = false;
+        codex_voice_start_wait_started_at_us_ = 0;
+        if (codex_voice_capture_active_) {
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.CancelPendingSendAudio();
+            codex_voice_capture_active_ = false;
+            if (codex_voice_restore_wake_word_ && device_state_ == kDeviceStateIdle &&
+                !low_power_standby_.load()) {
+                audio_service_.EnableWakeWordDetection(true);
+            }
+        }
+        codex_voice_restore_wake_word_ = false;
+        codex_voice_stop_pending_ = false;
+        codex_voice_stopped_callback_ = {};
+    });
+}
+
+void Application::EndCodexRealtimeSession() {
+    StopCodexRealtimeCapture();
+    Schedule([this]() {
+        codex_realtime_request_id_.clear();
+        codex_realtime_audio_sequence_ = 0;
+        ClearCodexRealtimeAudio();
+        if (codex_realtime_restore_wake_word_ && device_state_ == kDeviceStateIdle && !low_power_standby_.load())
+            audio_service_.EnableWakeWordDetection(true);
+        codex_realtime_restore_wake_word_ = false;
+    });
+}
+
+bool Application::PushCodexRealtimeAudio(std::unique_ptr<AudioStreamPacket> packet) {
+    if (!packet) return false;
+    codex_realtime_playback_active_ = true;
+    audio_service_.SetExternalPlaybackActive(true);
+    return audio_service_.PushPacketToDecodeQueue(std::move(packet), false);
+}
+
+void Application::ClearCodexRealtimeAudio() {
+    audio_service_.ResetDecoder();
+    codex_realtime_playback_active_ = false;
+    audio_service_.SetExternalPlaybackActive(false);
+}
+
 void Application::StopCodexVoiceCapture(std::function<void()> on_stopped) {
     Schedule([this, on_stopped = std::move(on_stopped)]() mutable {
         if (codex_voice_start_pending_) {
@@ -584,6 +649,11 @@ void Application::FailCodexVoiceCaptureTransport() {
         codex_voice_stop_pending_ = true;
         codex_voice_stop_wait_started_at_us_ = 0;
         TryFinishCodexVoiceCapture();
+    }
+    if (!codex_realtime_request_id_.empty()) {
+        codex_realtime_request_id_.clear();
+        codex_realtime_audio_sequence_ = 0;
+        ClearCodexRealtimeAudio();
     }
     auto& codex = CodexWsClient::GetInstance();
     if (codex.IsConnected()) codex.Reconnect();
@@ -906,8 +976,13 @@ void Application::MainEventLoop() {
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (codex_voice_capture_active_) {
-                    if (!CodexWsClient::GetInstance().SendOpusAudioFrame(
-                            packet->payload.data(), packet->payload.size())) {
+                    const bool sent = codex_realtime_request_id_.empty()
+                        ? CodexWsClient::GetInstance().SendOpusAudioFrame(
+                              packet->payload.data(), packet->payload.size())
+                        : CodexWsClient::GetInstance().SendRealtimeOpusAudioFrame(
+                              codex_realtime_request_id_, ++codex_realtime_audio_sequence_,
+                              packet->payload.data(), packet->payload.size());
+                    if (!sent) {
                         ESP_LOGW(TAG, "Failed to send Codex voice audio frame");
                         FailCodexVoiceCaptureTransport();
                         break;

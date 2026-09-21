@@ -49,7 +49,7 @@ struct ChoiceSliderParts {
     lv_obj_t *root = nullptr, *slider = nullptr, *value = nullptr;
 };
 
-enum class LineIcon { Tasks, Sliders, Plus, Sparkles, Zap, Monitor, Keyboard, Link };
+enum class LineIcon { Tasks, Sliders, Plus, Sparkles, Zap, Monitor, Keyboard, Link, Eye };
 lv_obj_t* CreateLineIcon(lv_obj_t* parent, LineIcon icon, int size = 28);
 void SetCompactRowIcon(CompactRowParts& row, LineIcon icon, int size = 28);
 
@@ -72,7 +72,7 @@ void UpdateChoiceSlider(const ChoiceSliderParts& parts, const std::vector<std::s
                         uint32_t selected, bool enabled, bool pending = false,
                         const std::string& context = {});
 lv_obj_t* CreateTextField(lv_obj_t* parent, const char* placeholder,
-                          lv_event_cb_t callback);
+                          lv_event_cb_t callback, bool password = false);
 
 constexpr size_t kVoiceWaveCount = 6;
 
