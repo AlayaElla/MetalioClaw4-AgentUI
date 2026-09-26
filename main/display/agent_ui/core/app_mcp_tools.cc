@@ -170,6 +170,18 @@ void RegisterAppMcpTools() {
     Add("files.storage", "Files and storage", "List, read, delete, and inspect files under /sdcard.",
         "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"list\",\"read\",\"preview\",\"delete\",\"storage\"]},\"path\":{\"type\":\"string\"}},\"required\":[\"action\"]}", FilesState, InvokeFiles);
     auto& server = McpServer::GetInstance();
+    server.AddTool("self.camera.capture",
+        "Take a photo now and show it for review. For requests such as 帮我拍照, "
+        "call this tool directly without capabilities.list/describe or app.open. "
+        "Execute before saying the photo was taken. If pending, use "
+        "self.capabilities.result with operationId until succeeded. "
+        "The photo is not saved until the user chooses save.",
+        PropertyList(), [](const PropertyList&) -> ReturnValue {
+            ai::InvokeRequest request;
+            request.capability_id = "camera.control";
+            request.arguments_json = "{\"action\":\"capture\"}";
+            return Render(ai::CapabilityRegistry::Get().Invoke(request));
+        });
     server.AddTool("self.app.open", "Open a built-in Agent UI app.",
         PropertyList({Property("app", kPropertyTypeString)}),
         [](const PropertyList& properties) -> ReturnValue {

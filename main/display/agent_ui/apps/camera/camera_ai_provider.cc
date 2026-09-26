@@ -88,9 +88,11 @@ ai::OperationResult Invoke(const ai::InvokeRequest& request) {
     return ai::UiOperations::Submit(request, [request, action, effect, dark, index, dispatched,
                                              opened = false, generation = uint32_t{}]() mutable {
         if (!opened) {
-            if (Navigation::Get().current() != ScreenId::Camera) Navigation::Get().Open(ScreenId::Camera);
             opened = true;
-            return Pending();
+            if (Navigation::Get().current() != ScreenId::Camera) {
+                Navigation::Get().Open(ScreenId::Camera);
+                return Pending();
+            }
         }
         if (Navigation::Get().current() != ScreenId::Camera || !Module::IsActive())
             return Failure("camera closed before operation completed");

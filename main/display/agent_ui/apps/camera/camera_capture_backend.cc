@@ -836,7 +836,6 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
         if (!running.load(std::memory_order_acquire)) {
             xSemaphoreGive(worker_slot);
             task_handle.store(nullptr, std::memory_order_release);
-            vTaskDelete(nullptr);
             return;
         }
 

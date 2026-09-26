@@ -11,6 +11,7 @@
 
 #include "SdCardManager.hpp"
 #include "esp_timer.h"
+#include "esp_log.h"
 
 namespace agent_ui::camera {
 namespace {
@@ -18,6 +19,7 @@ namespace {
 constexpr char kDcimDirectory[] = "/sdcard/DCIM";
 constexpr char kCameraDirectory[] = "/sdcard/DCIM/Camera";
 constexpr std::size_t kMaxItems = 48;
+constexpr const char* kTag = "CameraGallery";
 
 bool IsJpg(const char* name) {
     if (name == nullptr) return false;
@@ -166,6 +168,9 @@ bool GalleryRepository::WriteJpeg(const std::vector<uint8_t>& jpeg,
                                   std::string* path) const {
     if (jpeg.empty() || !SdCardManager::GetInstance().IsMounted() ||
         !EnsureCameraDirectory()) {
+        ESP_LOGE(kTag, "save unavailable: bytes=%u mounted=%d errno=%d",
+                 static_cast<unsigned>(jpeg.size()),
+                 SdCardManager::GetInstance().IsMounted(), errno);
         return false;
     }
     char output_path[96];
@@ -175,14 +180,27 @@ bool GalleryRepository::WriteJpeg(const std::vector<uint8_t>& jpeg,
     for (unsigned attempt = 0; attempt < 1000 && file == nullptr; ++attempt) {
         std::snprintf(output_path, sizeof(output_path), "%s/IMG_%lu.jpg",
                       kCameraDirectory, timestamp + attempt);
-        if (access(output_path, F_OK) != 0) file = fopen(output_path, "wb");
+        if (access(output_path, F_OK) == 0) continue;
+        if (errno != ENOENT) {
+            ESP_LOGE(kTag, "save path check failed: errno=%d", errno);
+            return false;
+        }
+        file = fopen(output_path, "wb");
+        if (file == nullptr) {
+            ESP_LOGE(kTag, "save open failed: errno=%d", errno);
+            return false;
+        }
     }
     if (file == nullptr) {
         return false;
     }
     const std::size_t written = fwrite(jpeg.data(), 1, jpeg.size(), file);
-    fclose(file);
-    if (written != jpeg.size()) {
+    const int write_error = errno;
+    const int close_result = fclose(file);
+    if (written != jpeg.size() || close_result != 0) {
+        ESP_LOGE(kTag, "save write/close failed: written=%u expected=%u write_errno=%d close=%d errno=%d",
+                 static_cast<unsigned>(written), static_cast<unsigned>(jpeg.size()),
+                 write_error, close_result, errno);
         unlink(output_path);
         return false;
     }

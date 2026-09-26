@@ -88,6 +88,8 @@ void Controller::HandleIntent(const Intent& intent) {
             return;
         case IntentType::DeleteReview:
             if (state_.mode != ViewMode::Review || state_.saving) return;
+            state_.status_code = StatusCode::None;
+            state_.status.clear();
             state_.mode = ViewMode::Camera;
             state_.frozen = false;
             state_.review_ready = false;
@@ -98,6 +100,8 @@ void Controller::HandleIntent(const Intent& intent) {
         case IntentType::SaveReview:
             if (state_.mode != ViewMode::Review || state_.saving) return;
             state_.saving = true;
+            state_.status_code = StatusCode::None;
+            state_.status.clear();
             Dispatch({.type = CommandType::SaveReview, .generation = state_.generation});
             PublishState();
             return;
@@ -255,18 +259,14 @@ void Controller::HandleEvent(const Event& event) {
             break;
         case EventType::SaveStarted:
             next.saving = true;
-            next.mode = ViewMode::Camera;
-            next.frozen = false;
-            next.review_ready = false;
-            next.review_image.reset();
             break;
         case EventType::SaveFinished:
             next.saving = false;
-            next.mode = ViewMode::Camera;
-            next.frozen = false;
-            next.review_ready = false;
-            next.review_image.reset();
-            if (event.status_code == StatusCode::SaveSucceeded) {
+            if (event.success && event.status_code == StatusCode::SaveSucceeded) {
+                next.mode = ViewMode::Camera;
+                next.frozen = false;
+                next.review_ready = false;
+                next.review_image.reset();
                 next.status_code = StatusCode::None;
                 next.status.clear();
             } else {

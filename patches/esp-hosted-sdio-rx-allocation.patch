@@ -1,0 +1,29 @@
+diff --git a/host/drivers/transport/sdio/sdio_drv.c b/host/drivers/transport/sdio/sdio_drv.c
+--- a/host/drivers/transport/sdio/sdio_drv.c
++++ b/host/drivers/transport/sdio/sdio_drv.c
+@@ -923,10 +923,6 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
+ 			/* TODO: Free by caller? */
+ 			return ESP_FAIL;
+ 		}
+-		/* Allocate rx buffer */
+-		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
+-		assert(pkt_rxbuff);
+-
+ 		packet_size = len + offset;
+ 		if (packet_size > buf_len) {
+ 			ESP_LOGE(TAG, "packet size[%lu]>[%lu] too big for remaining stream data",
+@@ -933,6 +929,14 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
+ 					packet_size, buf_len);
+ 			return ESP_FAIL;
+ 		}
++		/* The stream buffer is caller-owned; drop this batch on pressure.
++		 * Do not reset the device just because internal DMA RAM is busy. */
++		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
++		if (!pkt_rxbuff) {
++			ESP_LOGW(TAG, "SDIO RX buffer unavailable; dropping stream batch");
++			return ESP_ERR_NO_MEM;
++		}
++
+ 		memcpy(pkt_rxbuff, buf, packet_size);
+ 
+ 		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset)) {

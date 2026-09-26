@@ -23,6 +23,32 @@ include("${CMAKE_CURRENT_LIST_DIR}/main/boards/metalio-claw-4/validate_wifi_conf
 # patch that keeps one reusable 32 KiB internal executable arena after managed
 # dependencies are restored.
 find_package(Git QUIET)
+# ESP-Hosted streaming RX must tolerate transient internal DMA allocation
+# pressure while the camera and voice pipeline are active.
+set(ESP_HOSTED_DIR "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_hosted")
+set(ESP_HOSTED_RX_PATCH "${CMAKE_SOURCE_DIR}/patches/esp-hosted-sdio-rx-allocation.patch")
+if(EXISTS "${ESP_HOSTED_DIR}/host/drivers/transport/sdio/sdio_drv.c" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check
+        --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_RX_PATCH}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE ESP_HOSTED_RX_PATCH_NEEDED OUTPUT_QUIET ERROR_QUIET)
+    if(ESP_HOSTED_RX_PATCH_NEEDED EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply
+            --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_RX_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" RESULT_VARIABLE ESP_HOSTED_RX_PATCH_RESULT)
+        if(NOT ESP_HOSTED_RX_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to patch ESP-Hosted SDIO RX allocation handling")
+        endif()
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+            --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_RX_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE ESP_HOSTED_RX_PATCH_APPLIED OUTPUT_QUIET ERROR_QUIET)
+        if(NOT ESP_HOSTED_RX_PATCH_APPLIED EQUAL 0)
+            message(FATAL_ERROR "ESP-Hosted sources do not match the tested SDIO RX patch")
+        endif()
+    endif()
+endif()
 set(ELF_LOADER_DIR
     "${CMAKE_SOURCE_DIR}/managed_components/espressif__elf_loader")
 set(ELF_LOADER_EXEC_PATCH

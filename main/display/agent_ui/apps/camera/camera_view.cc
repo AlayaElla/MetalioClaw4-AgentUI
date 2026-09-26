@@ -705,7 +705,7 @@ void View::ResetReviewExitVisual() {
 }
 
 void View::BeginReviewExit(IntentType intent_type) {
-    if (state_.mode != ViewMode::Review || review_exit_active_ ||
+    if (state_.mode != ViewMode::Review || state_.saving || review_exit_active_ ||
         (intent_type != IntentType::SaveReview &&
          intent_type != IntentType::DeleteReview)) {
         return;
@@ -779,7 +779,11 @@ void View::Render(const ViewState& state) {
         return;
     }
     const ViewMode previous_mode = state_.mode;
+    const bool was_saving = state_.saving;
     state_ = state;
+    if (was_saving && !state.saving && state.mode == ViewMode::Review) {
+        CancelReviewExit();
+    }
     const int rendered_style_index = StyleIndex(state.effect_style);
     if (!style_pointer_active_ && rendered_style_index != style_index_) {
         style_index_ = rendered_style_index;
@@ -860,6 +864,7 @@ void View::RenderCamera(const ViewState& state) {
 
 void View::RenderReview(const ViewState& state) {
     Show(camera_panel_);
+    SetReviewActionsEnabled(!state.saving && !review_exit_active_);
     lv_obj_t* review_ = review_image_;
     const bool flash_is_covering = flash_timer_ != nullptr && !flash_fading_out_;
     if (!flash_is_covering) Show(review_mask_);
@@ -877,6 +882,9 @@ void View::RenderReview(const ViewState& state) {
         lv_image_set_src(review_, nullptr);
         review_rotation_ = 0;
         lv_image_set_rotation(review_, 0);
+    }
+    if (state.status_code == StatusCode::SaveFailed && status_ != nullptr) {
+        lv_obj_move_foreground(status_);
     }
 }
 
