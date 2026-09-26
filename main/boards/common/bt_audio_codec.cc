@@ -158,7 +158,7 @@ bool BTAudioCodec::ConfigureI2sChannels(i2s_role_t role,
 
 bool BTAudioCodec::SetI2sClockRole(i2s_role_t role)
 {
-    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    std::scoped_lock lock(input_if_mutex_, output_if_mutex_);
     if (tx_handle_ != nullptr && rx_handle_ != nullptr &&
         clock_role_ == role) {
         return true;
@@ -303,7 +303,7 @@ BTAudioCodecDuplex::BTAudioCodecDuplex(int input_sample_rate, int output_sample_
 
 int BTAudioCodec::Write(const int16_t *data, int samples)
 {
-    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    std::lock_guard<std::mutex> lock(output_if_mutex_);
     if (!output_transport_requested_.load(std::memory_order_acquire)) {
         return 0;
     }
@@ -410,7 +410,7 @@ int BTAudioCodec::Write(const int16_t *data, int samples)
 
 int BTAudioCodec::Read(int16_t *dest, int samples)
 {
-    std::lock_guard<std::mutex> lock(data_if_mutex_);
+    std::lock_guard<std::mutex> lock(input_if_mutex_);
     size_t bytes_read;
 
     std::vector<int32_t> bit32_buffer(samples);

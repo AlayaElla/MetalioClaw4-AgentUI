@@ -131,7 +131,7 @@ class BluetoothAudioRouteRecoveryTest(unittest.TestCase):
         self.assertIn("I2S clock role configured: role=%s", CODEC)
 
         read = function_body(CODEC, "int BTAudioCodec::Read(", "\n    size_t bytes_read;")
-        self.assertIn("std::lock_guard<std::mutex> lock(data_if_mutex_)", read)
+        self.assertIn("std::lock_guard<std::mutex> lock(input_if_mutex_)", read)
 
     def test_route_activation_does_not_guess_module_volume_or_send_burst(self):
         activate = function_body(

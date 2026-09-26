@@ -12,7 +12,11 @@
 
 class BTAudioCodec : public AudioCodec {
 protected:
-    std::mutex data_if_mutex_;
+    // RX and TX have independent DMA channels. A blocking microphone read
+    // must not hold up speaker writes (or an output timeout hold up capture).
+    // Channel recreation must acquire both locks before replacing handles.
+    std::mutex input_if_mutex_;
+    std::mutex output_if_mutex_;
     std::atomic_bool output_started_logged_{false};
     std::atomic_bool output_timeout_logged_{false};
     std::atomic_bool output_transport_requested_{true};

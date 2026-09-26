@@ -54,4 +54,6 @@ Thumbs.db
 !/tests/ai_capabilities_host/CMakeLists.txt
 !/tests/ai_capabilities_host/ai_capabilities_host_test.cc
 /scripts/test-*
+!/scripts/test-bt-audio-duplex.cjs
+!/tests/bt_audio_duplex_test.cc
 /docs/codex-micro-voice.md
