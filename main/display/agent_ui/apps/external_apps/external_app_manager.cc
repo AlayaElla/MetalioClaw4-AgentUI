@@ -1,4 +1,5 @@
 #include "external_app_manager.h"
+#include "external_app_runtime.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
+#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,6 +25,9 @@ constexpr char kStagingPath[] = "/sdcard/metalio/.installed_apps/.installing";
 constexpr char kBackupPath[] = "/sdcard/metalio/.installed_apps/.previous";
 constexpr size_t kTarBlockSize = 512;
 constexpr size_t kMaxManifestBytes = 8192;
+constexpr size_t kMaxAiActions = 12;
+constexpr size_t kMaxAiTextBytes = 512;
+constexpr size_t kMaxAiSchemaBytes = 2048;
 constexpr size_t kMaxPackageEntries = 128;
 constexpr size_t kMaxEntryBytes = 8 * 1024 * 1024;
 constexpr size_t kMaxExtractedBytes = 16 * 1024 * 1024;
@@ -160,6 +165,58 @@ bool ReadRequiredString(cJSON* root, const char* key, std::string* value) {
     return true;
 }
 
+bool IsSafeAiActionId(const std::string& id) {
+    if (id.empty() || id.size() > 80) return false;
+    return std::all_of(id.begin(), id.end(), [](unsigned char character) {
+        return (character >= 'a' && character <= 'z') ||
+               (character >= '0' && character <= '9') || character == '.' ||
+               character == '_' || character == '-';
+    });
+}
+
+bool ParseAiActions(cJSON* root, std::vector<AiActionInfo>* actions,
+                    std::string* error) {
+    actions->clear();
+    cJSON* array = cJSON_GetObjectItemCaseSensitive(root, "ai_actions");
+    if (array == nullptr) return true;
+    if (!cJSON_IsArray(array) || cJSON_GetArraySize(array) > kMaxAiActions) {
+        SetError(error, "manifest ai_actions 不合法");
+        return false;
+    }
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, array) {
+        AiActionInfo action;
+        cJSON* schema = cJSON_GetObjectItemCaseSensitive(item, "args_schema");
+        if (!cJSON_IsObject(item) || !ReadRequiredString(item, "id", &action.id) ||
+            !ReadRequiredString(item, "title", &action.title) ||
+            !ReadRequiredString(item, "description", &action.description) ||
+            !IsSafeAiActionId(action.id) || action.title.size() > kMaxAiTextBytes ||
+            action.description.size() > kMaxAiTextBytes || !cJSON_IsObject(schema)) {
+            SetError(error, "manifest ai_action 字段不合法");
+            return false;
+        }
+        cJSON* type = cJSON_GetObjectItemCaseSensitive(schema, "type");
+        char* schema_text = cJSON_PrintUnformatted(schema);
+        if (!cJSON_IsString(type) || std::strcmp(type->valuestring, "object") != 0 ||
+            schema_text == nullptr) {
+            if (schema_text != nullptr) cJSON_free(schema_text);
+            SetError(error, "manifest ai_action 参数 schema 不合法");
+            return false;
+        }
+        action.args_schema_json = schema_text;
+        cJSON_free(schema_text);
+        if (action.args_schema_json.size() > kMaxAiSchemaBytes ||
+            std::any_of(actions->begin(), actions->end(), [&action](const AiActionInfo& other) {
+                return other.id == action.id;
+            })) {
+            SetError(error, "manifest ai_action 重复或过大");
+            return false;
+        }
+        actions->push_back(std::move(action));
+    }
+    return true;
+}
+
 bool ReadManifestDisplayName(const std::string& path, std::string* name) {
     std::string json;
     if (!ReadBoundedFile(path, kMaxManifestBytes, &json)) return false;
@@ -222,6 +279,14 @@ bool ParseManifest(const std::string& root_path, AppInfo* app, std::string* erro
         }
         if (target != "esp32p4") {
             SetError(error, "App 目标芯片不是 esp32p4");
+            break;
+        }
+        if (!ParseAiActions(root, &app->ai_actions, error)) break;
+        if (std::any_of(app->ai_actions.begin(), app->ai_actions.end(),
+                        [app](const AiActionInfo& action) {
+                            return action.id.rfind(app->id + ".", 0) != 0;
+                        })) {
+            SetError(error, "AI action id 必须属于当前 App 的命名空间");
             break;
         }
 
@@ -511,6 +576,7 @@ Manager& Manager::Get() {
 bool Manager::Refresh(std::string* error,
                       const InstallProgressCallback& progress_callback) {
     apps_.clear();
+    Runtime::RegisterInstalledCapabilities({});
     if (!EnsureDirectoryTree(kPackagesRoot) || !EnsureDirectoryTree(kInstalledRoot)) {
         SetError(error, "SD 卡不可用，无法准备 App 目录");
         return false;
@@ -594,6 +660,7 @@ bool Manager::Refresh(std::string* error,
     });
     ESP_LOGI(kTag, "Discovered %u installed app(s)",
              static_cast<unsigned>(apps_.size()));
+    Runtime::RegisterInstalledCapabilities(apps_);
     return true;
 }
 

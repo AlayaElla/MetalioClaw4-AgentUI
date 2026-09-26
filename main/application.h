@@ -18,6 +18,7 @@
 #include "audio_service.h"
 #include "device_state_event.h"
 #include "codex_battery_reporter.h"
+#include "ai/ai_availability.h"
 
 
 #define MAIN_EVENT_SCHEDULE (1 << 0)
@@ -56,6 +57,9 @@ public:
     DeviceState GetDeviceState() const { return device_state_; }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
     void Schedule(std::function<void()> callback);
+    void ScheduleAi(std::function<void()> callback);
+    void SetAiWakeEnabled(bool enabled);
+    bool IsAiWakeEnabled() const { return ai_wake_enabled_.load(); }
     void SetDeviceState(DeviceState state);
     void Alert(const char* status, const char* message, const char* emotion = "", const std::string_view& sound = "");
     void DismissAlert();
@@ -132,6 +136,13 @@ private:
     bool codex_realtime_restore_wake_word_ = false;
     std::atomic<bool> low_power_standby_{false};
     bool standby_restore_wake_word_ = false;
+    std::atomic<bool> ai_wake_enabled_{true};
+    ai::Availability::Token standby_ai_block_ = 0;
+    ai::Availability::Token codex_voice_ai_block_ = 0;
+    bool audio_initialized_ = false;
+    std::atomic<bool> assistant_listen_pending_{false};
+    void ApplyAiAvailability();
+    bool DeferAssistantForMedia(std::function<void()> continuation);
 
     bool has_server_time_ = false;
     bool aborted_ = false;

@@ -5,5 +5,10 @@
   "version": "1.0.0",
   "api_version": 1,
   "target": "esp32p4",
-  "entry": "elf/esp32p4.elf"
+  "entry": "elf/esp32p4.elf",
+  "ai_actions": [
+    {"id":"com.metalio.calculator.evaluate","title":"计算表达式","description":"计算长度受限的数学表达式。","args_schema":{"type":"object","properties":{"expression":{"type":"string","minLength":1,"maxLength":96}},"required":["expression"],"additionalProperties":false}},
+    {"id":"com.metalio.calculator.mode","title":"切换计算器模式","description":"切换标准或科学计算器。","args_schema":{"type":"object","properties":{"mode":{"type":"string","enum":["standard","scientific"]}},"required":["mode"],"additionalProperties":false}},
+    {"id":"com.metalio.calculator.clear","title":"清空计算器","description":"清空当前表达式和结果。","args_schema":{"type":"object","additionalProperties":false}}
+  ]
 }

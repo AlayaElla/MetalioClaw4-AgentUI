@@ -26,8 +26,14 @@ Lifecycle ToLifecycle(AppLifecycleEvent event) {
 
 Module::Module() : adapter_(Adapter::Get()) {
     controller_.Activate(
-        [this](const ViewState& state) { view_.Render(state); },
+        [this](const ViewState& state) { ++revision_; view_.Render(state); },
         [this](const Command& command) { HandleCommand(command); });
+}
+
+bool Module::SubmitIntent(const Intent& intent) {
+    if (!controller_.state().mounted) return false;
+    controller_.HandleIntent(intent);
+    return true;
 }
 
 void Module::InitializeHardware() {
@@ -46,6 +52,7 @@ void Module::ResetUi() {
 }
 
 void Module::LifecycleCallback(AppLifecycleEvent event) {
+    ++session_;
     const Lifecycle lifecycle = ToLifecycle(event);
     if (lifecycle == Lifecycle::Load || lifecycle == Lifecycle::Resume) {
         adapter_.SetEventSink(

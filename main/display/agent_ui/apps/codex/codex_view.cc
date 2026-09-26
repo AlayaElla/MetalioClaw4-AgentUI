@@ -23,7 +23,10 @@
 #include "codex_conversation_ui.h"
 #include "codex_notification_service.h"
 #include "codex_status_ring.h"
+#include "codex_ai_provider.h"
+#include "codex_realtime_captions.h"
 #include "application.h"
+#include "ai/ai_availability.h"
 #include "board.h"
 #include "settings.h"
 #include "core/app_shell.h"
@@ -44,6 +47,8 @@ constexpr char kTag[] = "AgentCodex";
 constexpr int kMaxMessages = 10;
 constexpr int kUserBubbleWidth = 590;
 constexpr int kAssistantBubbleWidth = 620;
+constexpr float kRealtimeVisualScale = 1.35f;
+constexpr int kRealtimePixelSize = 9;
 // A press immediately requests voice input; capture waits for the PC's ready
 // reply. The destructive stop action uses a deliberately slower hold gesture.
 constexpr uint32_t kStopHoldDurationMs = 1200;
@@ -104,18 +109,27 @@ struct UiState {
     std::string realtime_host_id;
     std::string realtime_thread_id;
     std::string realtime_stream_id;
+    ai::Availability::Token realtime_availability_token = 0;
     uint32_t realtime_generation = 0;
     uint32_t realtime_last_sequence = 0;
     bool realtime_capture_started = false;
     lv_obj_t* realtime_root = nullptr;
     lv_obj_t* realtime_canvas = nullptr;
+    lv_obj_t* realtime_status_area = nullptr;
     lv_obj_t* realtime_status = nullptr;
-    lv_obj_t* realtime_mute = nullptr;
     lv_obj_t* realtime_volume = nullptr;
     lv_obj_t* realtime_end = nullptr;
+    lv_obj_t* realtime_volume_panel = nullptr;
+    lv_obj_t* realtime_volume_slider = nullptr;
+    lv_obj_t* realtime_volume_value = nullptr;
+    lv_obj_t* realtime_caption_area = nullptr;
+    std::array<lv_obj_t*, 2> realtime_caption_labels{};
+    std::array<codex_realtime::CaptionScroll, 2> realtime_caption_scroll{};
+    lv_obj_t* realtime_caption_toggle = nullptr;
+    codex_realtime::Captions realtime_captions;
+    bool realtime_captions_enabled = true;
     lv_timer_t* realtime_timer = nullptr;
     RealtimeVisual realtime_visual = RealtimeVisual::Connecting;
-    bool realtime_muted = false;
     int realtime_volume_percent = 70;
     bool pending_new_task = false;
     std::string stop_request_id;
@@ -352,8 +366,8 @@ void RenderRealtimePixels(lv_event_t* event) {
     dsc.border_width = 0;
     const auto& colors = Theme::Get().colors();
     dsc.bg_color = lv_color_hex(colors.accent);
-    // Match the demo: 56 cells across 600 px, each square exactly 7 px.
-    // Geometry is computed once; the small central motif uses only nearby cells.
+    // Keep the 56-cell animation, enlarging its presentation around the center.
+    // Integer pixel blocks stay sharp without scaling a rasterized layer.
     struct Pixel { int x, y; float dx, dy, r, angle; };
     static const std::vector<Pixel> pixels = [] {
         std::vector<Pixel> result;
@@ -362,8 +376,8 @@ void RenderRealtimePixels(lv_event_t* event) {
             const float dx = (gx - 27.5f) * scale, dy = (gy - 27.5f) * scale;
             const float r = std::hypot(dx, dy);
             if (r > 26) continue;
-            result.push_back({static_cast<int>(std::floor((gx + .5f) * 600 / 56 - 3.5f)),
-                              static_cast<int>(std::floor((gy + .5f) * 600 / 56 - 3.5f)) - 85,
+            result.push_back({static_cast<int>(std::floor((gx - 27.5f) * 600 / 56 * kRealtimeVisualScale - kRealtimePixelSize / 2.0f)),
+                              static_cast<int>(std::floor((gy - 27.5f) * 600 / 56 * kRealtimeVisualScale - kRealtimePixelSize / 2.0f)),
                               dx, dy, r, std::atan2(dy, dx)});
         }
         return result;
@@ -372,6 +386,12 @@ void RenderRealtimePixels(lv_event_t* event) {
     const float edge = 18 + std::round(std::sin(t * 1.7f));
     const float scan = 22 - std::fmod(t * 5, 20.0f);
     const float sweep = std::sin(t * 1.6f) * 10;
+    const int center_x = area.x1 + lv_area_get_width(&area) / 2;
+    // Leave the multiline failure details clear of the enlarged error ring.
+    const int center_y = area.y1 + (s_ui.realtime_visual == RealtimeVisual::Error
+        ? 180 : lv_area_get_height(&area) / 2);
+    const float presentation_scale = 1.0f;
+    const int pixel_size = kRealtimePixelSize;
     for (const auto& pixel : pixels) {
         const float dx = pixel.dx, dy = pixel.dy, r = pixel.r, angle = pixel.angle;
         float light = 0.0f;
@@ -396,14 +416,130 @@ void RenderRealtimePixels(lv_event_t* event) {
         else { dsc.bg_color=lv_color_hex(colors.danger); if(std::abs(r-18)<1&&std::abs(dy)>3)light=.3f; if(std::abs(dx)<7&&std::abs(dy)<7&&std::abs(std::abs(dx)-std::abs(dy))<1.1f)light=1; }
         if (light <= 0) continue;
         dsc.bg_opa=static_cast<lv_opa_t>(std::round(light*255));
-        const int x = area.x1 + pixel.x, y = area.y1 + pixel.y;
-        lv_area_t cell{x,y,x+6,y+6}; lv_draw_rect(lv_event_get_layer(event),&dsc,&cell);
+        const int x = center_x + static_cast<int>(std::floor(pixel.x * presentation_scale));
+        const int y = center_y + static_cast<int>(std::floor(pixel.y * presentation_scale));
+        lv_area_t cell{x,y,x+pixel_size-1,y+pixel_size-1}; lv_draw_rect(lv_event_get_layer(event),&dsc,&cell);
     }
 }
 
+void UpdateRealtimeCaptionText() {
+    for (size_t i = 0; i < s_ui.realtime_caption_labels.size(); ++i) {
+        auto* label = s_ui.realtime_caption_labels[i];
+        if (label == nullptr) continue;
+        const auto& text = s_ui.realtime_captions.lines[i];
+        const std::string previous = lv_label_get_text(label);
+        if (previous == text) continue;
+        lv_label_set_text(label, text.c_str());
+        lv_obj_update_layout(label);
+        const auto now = lv_tick_get();
+        auto& scroll = s_ui.realtime_caption_scroll[i];
+        scroll.Follow(static_cast<int>(lv_obj_get_width(label)) - 612, now);
+        lv_obj_set_x(label, 24 - scroll.Offset(now));
+    }
+}
+
+void DrawRealtimeCaptionFade(lv_event_t* event) {
+    lv_area_t area;
+    lv_obj_get_coords(lv_event_get_target_obj(event), &area);
+    lv_draw_rect_dsc_t dsc;
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_color = lv_color_hex(Theme::Get().colors().background);
+    for (int x = 0; x < 24; ++x) {
+        dsc.bg_opa = static_cast<lv_opa_t>((24 - x) * 255 / 24);
+        lv_area_t left{area.x1 + x, area.y1, area.x1 + x, area.y2};
+        lv_area_t right{area.x2 - x, area.y1, area.x2 - x, area.y2};
+        lv_draw_rect(lv_event_get_layer(event), &dsc, &left);
+        lv_draw_rect(lv_event_get_layer(event), &dsc, &right);
+    }
+}
+
+void DrawRealtimeControl(lv_event_t* event) {
+    auto* target = lv_event_get_target_obj(event);
+    // Same 24-unit stroke icons and 36 px rendering as the design demo.
+    static const int8_t captions[][2] = {{4,4},{20,4},{21,5},{21,19},{20,20},{4,20},{3,19},{3,5},{4,4},{-1,-1},{7,9},{9,9},{-1,-1},{13,9},{17,9},{-1,-1},{7,15},{11,15},{-1,-1},{15,15},{17,15}};
+    static const int8_t phone[][2] = {{9,3},{9,6},{8,8},{6,9},{8,13},{11,16},{15,18},{16,16},{18,15},{21,16},{21,21},{18,22},{12,20},{7,17},{4,12},{2,6},{3,3},{6,3},{-1,-1},{22,2},{2,22}};
+    static const int8_t volume[][2] = {{11,5},{6,9},{3,9},{3,15},{6,15},{11,19},{11,5},{-1,-1},{15,8},{17,10},{17,14},{15,16},{-1,-1},{18,5},{21,8},{22,12},{21,16},{18,19}};
+    static const int8_t back[][2] = {{12,4},{4,12},{12,20},{-1,-1},{4,12},{21,12}};
+    const int8_t (*points)[2] = captions;
+    size_t count = sizeof(captions) / sizeof(captions[0]);
+    const auto& colors = Theme::Get().colors();
+    uint32_t color = s_ui.realtime_captions_enabled ? colors.background : colors.muted;
+    if (target == s_ui.realtime_volume) { points = volume; count = sizeof(volume) / sizeof(volume[0]); color = colors.muted; }
+    if (target == s_ui.realtime_end) {
+        const bool failed = s_ui.realtime_visual == RealtimeVisual::Error;
+        points = failed ? back : phone;
+        count = failed ? sizeof(back) / sizeof(back[0]) : sizeof(phone) / sizeof(phone[0]);
+        color = colors.accent_ink;
+    }
+    lv_area_t area;
+    lv_obj_get_coords(target, &area);
+    const int x = area.x1 + (lv_area_get_width(&area) - 36) / 2;
+    const int y = area.y1 + (lv_area_get_height(&area) - 36) / 2;
+    lv_draw_line_dsc_t line;
+    lv_draw_line_dsc_init(&line);
+    line.color = lv_color_hex(color); line.width = 3;
+    line.round_start = line.round_end = 1;
+    for (size_t i = 1; i < count; ++i) {
+        if (points[i-1][0] < 0 || points[i][0] < 0) continue;
+        line.p1 = {static_cast<lv_value_precise_t>(x + points[i-1][0] * 36 / 24), static_cast<lv_value_precise_t>(y + points[i-1][1] * 36 / 24)};
+        line.p2 = {static_cast<lv_value_precise_t>(x + points[i][0] * 36 / 24), static_cast<lv_value_precise_t>(y + points[i][1] * 36 / 24)};
+        lv_draw_line(lv_event_get_layer(event), &line);
+    }
+}
+
+void UpdateRealtimeLayout() {
+    const bool failed = s_ui.realtime_visual == RealtimeVisual::Error;
+    const bool captions = s_ui.realtime_captions_enabled && !failed;
+    if (s_ui.realtime_canvas != nullptr) {
+        lv_obj_set_height(s_ui.realtime_canvas, failed ? 350 : captions ? 422 : 526);
+        lv_obj_align(s_ui.realtime_canvas, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_invalidate(s_ui.realtime_canvas);
+    }
+    if (s_ui.realtime_status_area != nullptr) {
+        if (failed) lv_obj_remove_flag(s_ui.realtime_status_area, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_ui.realtime_status_area, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(s_ui.realtime_status_area, 600, 160);
+        lv_obj_align(s_ui.realtime_status_area, LV_ALIGN_TOP_MID, 0, 350);
+        lv_obj_scroll_to_y(s_ui.realtime_status_area, 0, LV_ANIM_OFF);
+    }
+    if (s_ui.realtime_caption_area != nullptr) {
+        if (captions) lv_obj_remove_flag(s_ui.realtime_caption_area, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_ui.realtime_caption_area, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_ui.realtime_caption_toggle != nullptr) {
+        if (failed) lv_obj_add_flag(s_ui.realtime_caption_toggle, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(s_ui.realtime_caption_toggle, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_ui.realtime_caption_toggle, lv_color_hex(s_ui.realtime_captions_enabled
+            ? Theme::Get().colors().text : Theme::Get().colors().raised), LV_PART_MAIN);
+        lv_obj_invalidate(s_ui.realtime_caption_toggle);
+    }
+    if (failed && s_ui.realtime_volume_panel) lv_obj_add_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+void OnRealtimeCaptions(lv_event_t*) {
+    s_ui.realtime_captions_enabled = !s_ui.realtime_captions_enabled;
+    Settings settings("codex", true);
+    settings.SetBool("voice_captions", s_ui.realtime_captions_enabled);
+    UpdateRealtimeLayout();
+    UpdateRealtimeCaptionText();
+}
+
 void SetRealtimeVisual(RealtimeVisual visual, const char* label) {
+    const bool changed = s_ui.realtime_visual != visual;
     s_ui.realtime_visual = visual;
-    if (s_ui.realtime_status != nullptr) lv_label_set_text(s_ui.realtime_status, label);
+    const bool failed = visual == RealtimeVisual::Error;
+    if (changed) UpdateRealtimeLayout();
+    if (s_ui.realtime_status != nullptr) {
+        lv_label_set_text(s_ui.realtime_status, label);
+    }
+    for (auto* button : {s_ui.realtime_caption_toggle, s_ui.realtime_volume}) {
+        if (button == nullptr) continue;
+        if (failed) lv_obj_add_flag(button, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(button, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_ui.realtime_end != nullptr) {
+        lv_obj_invalidate(s_ui.realtime_end);
+    }
     if (s_ui.realtime_canvas != nullptr) lv_obj_invalidate(s_ui.realtime_canvas);
 }
 
@@ -422,10 +558,14 @@ void ShowRealtimePage(bool show) {
         if (s_ui.action_button) lv_obj_remove_flag(s_ui.action_button, LV_OBJ_FLAG_HIDDEN);
         UpdateActionButton();
     }
+    if (s_ui.realtime_volume_panel) lv_obj_add_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN);
+    UpdateStatusRing();
 }
 
-void EndRealtimeSession(bool notify_pc) {
+void EndRealtimeSession(bool notify_pc, bool keep_page = false) {
     const std::string request_id = s_ui.realtime_request_id;
+    const ai::Availability::Token availability_token = s_ui.realtime_availability_token;
+    s_ui.realtime_availability_token = 0;
     s_ui.realtime_capture_started = false;
     s_ui.realtime_request_id.clear();
     s_ui.realtime_host_id.clear();
@@ -433,8 +573,18 @@ void EndRealtimeSession(bool notify_pc) {
     s_ui.realtime_stream_id.clear();
     s_ui.realtime_generation = 0;
     s_ui.realtime_last_sequence = 0;
+    s_ui.realtime_captions.Clear();
+    UpdateRealtimeCaptionText();
     Application::GetInstance().EndCodexRealtimeSession();
-    ShowRealtimePage(false);
+    // EndCodexRealtimeSession schedules capture/audio cleanup. Queue this
+    // release after it so another AI owner cannot begin while the call still
+    // owns microphone, playback, or wake-word state.
+    if (availability_token != 0) {
+        Application::GetInstance().Schedule([availability_token]() {
+            ai::Availability::Get().ReleaseBlock(availability_token);
+        });
+    }
+    if (!keep_page) ShowRealtimePage(false);
     if (notify_pc && !request_id.empty() && CodexWsClient::GetInstance().IsConnected()) {
         CodexWsClient::GetInstance().SendTextMessage(
             "{\"type\":\"realtime_end\",\"requestId\":\"" + request_id + "\"}",
@@ -442,19 +592,40 @@ void EndRealtimeSession(bool notify_pc) {
     }
 }
 
-void StartRealtimeSession() {
+void ShowRealtimeError(const char* message) {
+    // Release the call immediately, while keeping its failure visible until dismissed.
+    EndRealtimeSession(false, true);
+    SetRealtimeVisual(RealtimeVisual::Error, message);
+    ShowRealtimePage(true);
+    HideConfig();
+    SetStatus(false, message);
+}
+
+void StartRealtimeSession(const std::string& provided_request_id = {}) {
     if (!CanUseCodex() || !s_ui.realtime_request_id.empty() || MenuVoiceBusy()) return;
+    if (!ai::Availability::Get().IsAvailable()) {
+        SetStatus(true, "其他功能正在使用音频，请结束后重试");
+        return;
+    }
     const auto* target = codex_menu::SelectedTask(s_ui.menu_state);
     if (target == nullptr || target->host_id.empty() || target->thread_id.empty() ||
         s_ui.menu_state.stream_id.empty()) {
         SetStatus(true, "请先选择已同步任务");
         return;
     }
-    const std::string request_id = "esp32-realtime-" + std::to_string(s_ui.menu_boot_nonce) +
-        "-" + std::to_string(++s_ui.request_counter);
+    const std::string request_id = provided_request_id.empty()
+        ? "esp32-realtime-" + std::to_string(s_ui.menu_boot_nonce) + "-" + std::to_string(++s_ui.request_counter)
+        : provided_request_id;
+    const auto availability_token = ai::Availability::Get().AcquireBlock(
+        "codex.realtime", "Codex 实时语音");
+    if (availability_token == 0) {
+        SetStatus(true, "其他 AI 会话正在使用音频，请结束后重试");
+        return;
+    }
+    s_ui.realtime_availability_token = availability_token;
     const std::string request = TargetedRequest("realtime_start", request_id);
     if (request.empty() || !CodexWsClient::GetInstance().SendTextMessage(request)) {
-        SetStatus(false, "实时语音连接请求失败");
+        ShowRealtimeError("实时语音连接请求失败，请检查 PC 桥接连接后重试。");
         return;
     }
     s_ui.realtime_request_id = request_id;
@@ -463,13 +634,11 @@ void StartRealtimeSession() {
     s_ui.realtime_stream_id = s_ui.menu_state.stream_id;
     s_ui.realtime_generation = 0;
     s_ui.realtime_last_sequence = 0;
-    s_ui.realtime_muted = false;
+    s_ui.realtime_captions.Clear();
+    UpdateRealtimeCaptionText();
     if (auto* codec = Board::GetInstance().GetAudioCodec()) {
         s_ui.realtime_volume_percent = codec->output_volume();
-        if (s_ui.realtime_volume) {
-            std::string label = "音量 " + std::to_string(s_ui.realtime_volume_percent) + "%";
-            lv_label_set_text(lv_obj_get_child(s_ui.realtime_volume, 0), label.c_str());
-        }
+        if (s_ui.realtime_volume_slider) lv_slider_set_value(s_ui.realtime_volume_slider, s_ui.realtime_volume_percent, LV_ANIM_OFF);
     }
     SetRealtimeVisual(RealtimeVisual::Connecting, "连接中");
     ShowRealtimePage(true);
@@ -477,24 +646,18 @@ void StartRealtimeSession() {
     HideConfig();
 }
 
-void OnRealtimeMute(lv_event_t*) {
-    if (s_ui.realtime_request_id.empty()) return;
-    const bool muted = !s_ui.realtime_muted;
-    const std::string message = "{\"type\":\"realtime_mute\",\"requestId\":\"" +
-        s_ui.realtime_request_id + "\",\"muted\":" + (muted ? "true}" : "false}");
-    if (CodexWsClient::GetInstance().SendTextMessage(message, pdMS_TO_TICKS(200))) {
-        // The visual state changes only when the PC confirms it in realtime_status.
-        if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "静音中…");
-    }
+void OnRealtimeVolumeChanged(lv_event_t*) {
+    s_ui.realtime_volume_percent = lv_slider_get_value(s_ui.realtime_volume_slider);
+    if (auto* codec = Board::GetInstance().GetAudioCodec()) codec->SetOutputVolume(s_ui.realtime_volume_percent);
+    lv_label_set_text_fmt(s_ui.realtime_volume_value, "%d%%", s_ui.realtime_volume_percent);
 }
 
 void OnRealtimeVolume(lv_event_t*) {
-    s_ui.realtime_volume_percent = s_ui.realtime_volume_percent >= 100 ? 40 : s_ui.realtime_volume_percent + 10;
-    if (auto* codec = Board::GetInstance().GetAudioCodec()) codec->SetOutputVolume(s_ui.realtime_volume_percent);
-    if (s_ui.realtime_volume != nullptr) {
-        std::string label = "音量 " + std::to_string(s_ui.realtime_volume_percent) + "%";
-        lv_label_set_text(lv_obj_get_child(s_ui.realtime_volume, 0), label.c_str());
-    }
+    if (!s_ui.realtime_volume_panel) return;
+    if (lv_obj_has_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN)) {
+        lv_label_set_text_fmt(s_ui.realtime_volume_value, "%d%%", s_ui.realtime_volume_percent);
+        lv_obj_remove_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN);
+    } else lv_obj_add_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
 void OnRealtimeEnd(lv_event_t*) { EndRealtimeSession(true); }
@@ -796,6 +959,7 @@ void HandleMessage(const std::string& message) {
     if (root == nullptr) return;
     const cJSON* type_item = cJSON_GetObjectItemCaseSensitive(root, "type");
     const char* type = cJSON_IsString(type_item) ? type_item->valuestring : "";
+    codex_ai::ObserveMessage(message);
     if (std::strcmp(type, "bridge_status") == 0) {
         const cJSON* version = cJSON_GetObjectItemCaseSensitive(root, "version");
         const cJSON* state = cJSON_GetObjectItemCaseSensitive(root, "state");
@@ -907,9 +1071,7 @@ void HandleMessage(const std::string& message) {
         if (std::strcmp(value, "listening") == 0) {
             // Sending realtime_start only asks the PC to prepare. Capture
             // starts solely after its matching, identity-bound ready status.
-            s_ui.realtime_muted = false;
             SetRealtimeVisual(RealtimeVisual::Listening, "聆听中");
-            if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "静音");
             SetStatus(true, cJSON_IsTrue(accepts_audio) ? "实时语音正在聆听" : "实时语音等待麦克风");
         } else if (std::strcmp(value, "connecting") == 0) {
             SetRealtimeVisual(RealtimeVisual::Connecting, "连接中");
@@ -918,24 +1080,23 @@ void HandleMessage(const std::string& message) {
                    std::strcmp(value, "muted") == 0) {
             if (std::strcmp(value, "speaking") == 0) SetRealtimeVisual(RealtimeVisual::Speaking, "说话中");
             else if (std::strcmp(value, "muted") == 0) {
-                s_ui.realtime_muted = true;
                 SetRealtimeVisual(RealtimeVisual::Muted, "已静音");
-                if (s_ui.realtime_mute) lv_label_set_text(lv_obj_get_child(s_ui.realtime_mute, 0), "取消静音");
             } else SetRealtimeVisual(RealtimeVisual::Thinking, "思考中");
             SetStatus(true, std::strcmp(value, "speaking") == 0 ? "实时语音正在说话" :
                             std::strcmp(value, "muted") == 0 ? "实时语音已静音" : "实时语音思考中");
         } else if (std::strcmp(value, "ended") == 0 || std::strcmp(value, "error") == 0 ||
                    std::strcmp(value, "disconnected") == 0) {
             const bool failed = std::strcmp(value, "error") == 0 || std::strcmp(value, "disconnected") == 0;
-            EndRealtimeSession(false);
-            SetRealtimeVisual(failed ? RealtimeVisual::Error : RealtimeVisual::Connecting,
-                              cJSON_IsString(detail) ? detail->valuestring : "已结束");
-            SetStatus(!failed, cJSON_IsString(detail) ? detail->valuestring :
-                      (failed ? "实时语音已断开" : "实时语音已结束"));
-            // The PC-provided setup failure must remain readable; do not
-            // reduce it to an icon after the standalone call surface closes.
-            if (failed) ShowConfig();
+            const char* message = cJSON_IsString(detail) && detail->valuestring[0] != '\0'
+                ? detail->valuestring : (failed ? "实时语音已断开，请检查电脑端连接后重试。" : "实时语音已结束");
+            if (failed) ShowRealtimeError(message);
+            else {
+                EndRealtimeSession(false);
+                SetStatus(true, message);
+            }
         }
+    } else if (std::strcmp(type, "realtime_transcript") == 0) {
+        if (IsCurrentRealtime(root) && s_ui.realtime_captions.Apply(root)) UpdateRealtimeCaptionText();
     } else if (std::strcmp(type, "realtime_audio_clear") == 0) {
         if (IsCurrentRealtime(root)) {
             const cJSON* generation = cJSON_GetObjectItemCaseSensitive(root, "generation");
@@ -1150,9 +1311,16 @@ void FinishVoiceCapture(bool cancelled) {
 }
 
 void InvalidateCodexSession() {
+    codex_ai::Invalidate("Codex 桥接或任务连接已变化");
     // A bridge/session replacement must never leave its microphone or queued
     // playback attached to a task that is no longer selected.
-    EndRealtimeSession(false);
+    if (!s_ui.realtime_request_id.empty()) {
+        ShowRealtimeError("PC 桥接或任务连接已中断，请等待连接恢复后重试。");
+    } else {
+        const bool showing_error = s_ui.realtime_visual == RealtimeVisual::Error &&
+            s_ui.realtime_root != nullptr && !lv_obj_has_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN);
+        EndRealtimeSession(false, showing_error);
+    }
     if (s_ui.pending_menu_request.empty()) s_task_entry.Remember(s_ui.menu_state);
     s_task_entry.Begin();
     s_ui.pending_menu_request.clear();
@@ -1519,9 +1687,11 @@ void SetMenuTab(MenuTab tab) {
 bool MenuVoiceBusy() { return !s_ui.realtime_request_id.empty() || s_ui.voice_pressed || s_ui.voice_stage != VoiceStage::Idle; }
 
 bool SendMenuAction(const char* action, int slot = -1, const std::string& model = {},
-                    const std::string& effort = {}, int fast = -1) {
+                    const std::string& effort = {}, int fast = -1, const std::string& provided_request_id = {}) {
     if (!CanUseCodex() || !s_ui.pending_menu_request.empty()) return false;
-    const std::string request_id = "esp32-menu-" + std::to_string(s_ui.menu_boot_nonce) + "-" + std::to_string(++s_ui.request_counter);
+    const std::string request_id = provided_request_id.empty()
+        ? "esp32-menu-" + std::to_string(s_ui.menu_boot_nonce) + "-" + std::to_string(++s_ui.request_counter)
+        : provided_request_id;
     const bool setting = std::strcmp(action, "set_model") == 0 || std::strcmp(action, "set_effort") == 0 || std::strcmp(action, "set_fast") == 0;
     const auto& target = slot >= 0 && slot < 6 ? s_ui.menu_state.slots[slot] :
         setting ? s_ui.menu_state.active_task : codex_menu::Slot{};
@@ -1557,6 +1727,204 @@ bool SendMenuAction(const char* action, int slot = -1, const std::string& model 
     }, draft || new_task ? 25000 : 15000, nullptr);
     RefreshCodexMenu();
     return true;
+}
+
+std::string AiArgumentString(const std::string& json, const char* name) {
+    cJSON* root = cJSON_Parse(json.c_str());
+    const cJSON* value = root ? cJSON_GetObjectItemCaseSensitive(root, name) : nullptr;
+    const std::string result = cJSON_IsString(value) ? value->valuestring : "";
+    cJSON_Delete(root); return result;
+}
+
+int AiArgumentSlot(const std::string& json) {
+    cJSON* root = cJSON_Parse(json.c_str());
+    const cJSON* value = root ? cJSON_GetObjectItemCaseSensitive(root, "slot") : nullptr;
+    const int result = cJSON_IsNumber(value) ? value->valueint : -1;
+    cJSON_Delete(root); return result;
+}
+
+int AiArgumentFast(const std::string& json) {
+    cJSON* root = cJSON_Parse(json.c_str());
+    const cJSON* value = root ? cJSON_GetObjectItemCaseSensitive(root, "fast") : nullptr;
+    const int result = cJSON_IsBool(value) ? cJSON_IsTrue(value) : -1;
+    cJSON_Delete(root); return result;
+}
+
+bool AiTargetMatches(const std::string& json, bool allow_draft = true) {
+    const std::string stream = AiArgumentString(json, "stream_id");
+    const std::string host = AiArgumentString(json, "host_id");
+    const std::string thread = AiArgumentString(json, "thread_id");
+    const std::string draft = AiArgumentString(json, "draft_id");
+    if (stream != s_ui.menu_state.stream_id || host != "local") return false;
+    const auto* current = codex_menu::SelectedTask(s_ui.menu_state);
+    if (current) return draft.empty() && current->host_id == host && current->thread_id == thread;
+    return allow_draft && thread.empty() && !draft.empty() && draft == s_ui.menu_state.draft_request_id &&
+        s_ui.menu_state.draft_status == "editing" && !s_ui.menu_state.draft_settings_loading;
+}
+
+std::string CodexAiSnapshot(bool preferences = false) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "connected", s_ui.menu_state.connected);
+    cJSON_AddStringToObject(root, "stream_id", s_ui.menu_state.stream_id.c_str());
+    cJSON_AddNumberToObject(root, "selected_slot", s_ui.menu_state.selected_slot);
+    cJSON_AddStringToObject(root, "draft_id", s_ui.menu_state.draft_request_id.c_str());
+    cJSON_AddStringToObject(root, "draft_status", s_ui.menu_state.draft_status.c_str());
+    cJSON_AddBoolToObject(root, "captions", s_ui.realtime_captions_enabled);
+    auto add_task = [](const codex_menu::Slot& task) {
+        auto* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "slot", task.slot);
+        cJSON_AddStringToObject(item, "host_id", task.host_id.c_str());
+        cJSON_AddStringToObject(item, "thread_id", task.thread_id.c_str());
+        cJSON_AddStringToObject(item, "title", task.title.c_str());
+        cJSON_AddStringToObject(item, "state", codex_menu::StateLabel(task.state).c_str());
+        cJSON_AddStringToObject(item, "model", task.model.c_str());
+        cJSON_AddStringToObject(item, "effort", task.effort.c_str());
+        cJSON_AddBoolToObject(item, "synced", task.synced);
+        cJSON_AddBoolToObject(item, "fast", task.fast);
+        return item;
+    };
+    if (const auto* selected = codex_menu::SelectedTask(s_ui.menu_state))
+        cJSON_AddItemToObject(root, "selected", add_task(*selected));
+    if (!preferences) {
+        auto* tasks = cJSON_AddArrayToObject(root, "tasks");
+        for (const auto& task : s_ui.menu_state.slots)
+            if (!task.thread_id.empty()) cJSON_AddItemToArray(tasks, add_task(task));
+        auto* interactions = cJSON_AddArrayToObject(root, "interactions");
+        for (const auto& interaction : s_ui.menu_state.conversation.interactions) {
+            if (cJSON_GetArraySize(interactions) >= 4) break;
+            auto* item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "id", interaction.id.c_str());
+            cJSON_AddStringToObject(item, "kind", interaction.kind.c_str());
+            cJSON_AddStringToObject(item, "title", interaction.title.c_str());
+            cJSON_AddBoolToObject(item, "can_respond", interaction.can_respond);
+            auto* options = cJSON_AddArrayToObject(item, "options");
+            for (const auto& option : interaction.options) {
+                auto* entry = cJSON_CreateObject();
+                cJSON_AddStringToObject(entry, "id", option.id.c_str());
+                cJSON_AddStringToObject(entry, "label", option.label.c_str());
+                cJSON_AddItemToArray(options, entry);
+            }
+            cJSON_AddItemToArray(interactions, item);
+        }
+    } else {
+        auto* models = cJSON_AddArrayToObject(root, "models");
+        for (const auto& model : s_ui.menu_state.models) {
+            auto* item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "id", model.id.c_str());
+            cJSON_AddBoolToObject(item, "fast_supported", model.fast_supported);
+            auto* efforts = cJSON_AddArrayToObject(item, "efforts");
+            for (const auto& effort : model.efforts) cJSON_AddItemToArray(efforts, cJSON_CreateString(effort.id.c_str()));
+            cJSON_AddItemToArray(models, item);
+        }
+    }
+    char* encoded = cJSON_PrintUnformatted(root);
+    std::string result = encoded ? encoded : "{}";
+    cJSON_free(encoded); cJSON_Delete(root);
+    return result;
+}
+
+ai::CapabilityState CodexAiCapabilityState() {
+    ai::CapabilityState result;
+    result.available = CanUseCodex();
+    result.enabled = result.available && !MenuVoiceBusy();
+    result.generation = ai::Availability::Get().Generation();
+    result.reason = result.available ? (result.enabled ? "" : "Codex 正在执行语音会话") : "Codex 桥接或状态尚未就绪";
+    result.state_json = CodexAiSnapshot();
+    return result;
+}
+
+codex_ai::DispatchResult DispatchCodexAi(const std::string& action, const std::string& args,
+                                         const std::string& request_id) {
+    codex_ai::DispatchResult result;
+    if (action == "state" || action == "list" || action == "preferences") {
+        if (action == "preferences") {
+            cJSON* preferences = cJSON_Parse(args.c_str());
+            const auto* captions = cJSON_GetObjectItemCaseSensitive(preferences, "captions");
+            if (captions && !cJSON_IsBool(captions)) {
+                cJSON_Delete(preferences); result.error = "captions 必须是布尔值"; return result;
+            }
+            if (captions) {
+                s_ui.realtime_captions_enabled = cJSON_IsTrue(captions);
+                Settings("codex", true).SetBool("voice_captions", s_ui.realtime_captions_enabled);
+                UpdateRealtimeCaptionText();
+            }
+            cJSON_Delete(preferences);
+        }
+        result.accepted = result.immediate = true;
+        result.result_json = CodexAiSnapshot(action == "preferences");
+        return result;
+    }
+    if (action == "reconnect") {
+        result.accepted = CodexWsClient::GetInstance().Reconnect(); result.immediate = result.accepted;
+        result.result_json = result.accepted ? "{\"requested\":true}" : "{}";
+        result.error = result.accepted ? "" : "无法重新连接 Codex 桥接"; return result;
+    }
+    if (!CanUseCodex()) { result.error = "Codex 桥接或状态尚未就绪"; return result; }
+    if (action == "new") {
+        result.accepted = SendMenuAction("new_task", -1, {}, {}, -1, request_id);
+    } else if (action == "select") {
+        const int slot = AiArgumentSlot(args);
+        const auto& task = slot >= 0 && slot < 6 ? s_ui.menu_state.slots[slot] : codex_menu::Slot{};
+        result.accepted = task.thread_id == AiArgumentString(args, "thread_id") && task.host_id == AiArgumentString(args, "host_id") &&
+            AiArgumentString(args, "stream_id") == s_ui.menu_state.stream_id && SendMenuAction("select_task", slot, {}, {}, -1, request_id);
+    } else if (action == "model" || action == "effort" || action == "fast") {
+        if (!AiTargetMatches(args)) { result.error = "目标任务或草稿已变化"; return result; }
+        const int slot = s_ui.menu_state.selected_slot;
+        result.accepted = action == "model" ? SendMenuAction("set_model", slot, AiArgumentString(args, "model"), {}, -1, request_id) :
+            action == "effort" ? SendMenuAction("set_effort", slot, {}, AiArgumentString(args, "effort"), -1, request_id) :
+            SendMenuAction("set_fast", slot, {}, {}, AiArgumentFast(args), request_id);
+    } else if (action == "stop") {
+        if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
+        const std::string message = TargetedRequest("turn_stop", request_id);
+        result.accepted = !message.empty() && CodexWsClient::GetInstance().SendTextMessage(message, pdMS_TO_TICKS(200));
+    } else if (action == "realtime_start") {
+        if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
+        StartRealtimeSession(request_id); result.accepted = s_ui.realtime_request_id == request_id;
+    } else if (action == "realtime_end") {
+        if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
+        EndRealtimeSession(true); result.accepted = true; result.immediate = true; result.result_json = "{\"ended\":true}";
+    } else if (action == "text") {
+        if (!AiTargetMatches(args)) { result.error = "目标任务或草稿已变化"; return result; }
+        const std::string text = AiArgumentString(args, "text");
+        if (text.empty() || text.size() > 32768) { result.error = "文字为空或超过发送上限"; return result; }
+        cJSON* message = cJSON_CreateObject();
+        cJSON_AddStringToObject(message, "type", "text_input"); cJSON_AddStringToObject(message, "request_id", request_id.c_str());
+        cJSON_AddStringToObject(message, "text", text.c_str()); cJSON_AddStringToObject(message, "host_id", "local");
+        cJSON_AddStringToObject(message, "stream_id", s_ui.menu_state.stream_id.c_str());
+        const std::string thread = AiArgumentString(args, "thread_id"), draft = AiArgumentString(args, "draft_id");
+        if (!thread.empty()) cJSON_AddStringToObject(message, "thread_id", thread.c_str()); else cJSON_AddStringToObject(message, "draft_id", draft.c_str());
+        char* printed = cJSON_PrintUnformatted(message); const std::string wire = printed ? printed : "";
+        if (printed) cJSON_free(printed);
+        cJSON_Delete(message);
+        result.accepted = !wire.empty() && CodexWsClient::GetInstance().SendTextMessage(wire, pdMS_TO_TICKS(200));
+    } else if (action == "interaction") {
+        if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
+        const std::string interaction_id = AiArgumentString(args, "interaction_id");
+        const std::string decision = AiArgumentString(args, "decision");
+        // A caller must provide the user's concrete decision. This provider
+        // never manufactures an approval or answers an interaction itself.
+        cJSON* arguments = cJSON_Parse(args.c_str());
+        const auto* answers = cJSON_GetObjectItemCaseSensitive(arguments, "answers");
+        const auto interaction = std::find_if(s_ui.menu_state.conversation.interactions.begin(),
+            s_ui.menu_state.conversation.interactions.end(), [&interaction_id](const auto& item) { return item.id == interaction_id; });
+        if (interaction_id.empty() || interaction == s_ui.menu_state.conversation.interactions.end() ||
+            !interaction->can_respond || (decision.empty() && !cJSON_IsObject(answers))) {
+            cJSON_Delete(arguments); result.error = "需要当前可回应的交互编号及用户明确的决定或答案"; return result;
+        }
+        cJSON* message = cJSON_CreateObject();
+        if (cJSON_IsObject(answers)) cJSON_AddItemToObject(message, "answers", cJSON_Duplicate(answers, true));
+        cJSON_Delete(arguments);
+        cJSON_AddStringToObject(message, "type", "codex_interaction_response"); cJSON_AddStringToObject(message, "request_id", request_id.c_str());
+        cJSON_AddStringToObject(message, "host_id", "local"); cJSON_AddStringToObject(message, "thread_id", AiArgumentString(args, "thread_id").c_str());
+        cJSON_AddStringToObject(message, "id", interaction_id.c_str()); cJSON_AddStringToObject(message, "decision", decision.c_str());
+        char* printed = cJSON_PrintUnformatted(message); const std::string wire = printed ? printed : "";
+        if (printed) cJSON_free(printed);
+        cJSON_Delete(message);
+        result.accepted = !wire.empty() && CodexWsClient::GetInstance().SendTextMessage(wire, pdMS_TO_TICKS(200));
+    } else { result.error = "不支持的 Codex 操作"; return result; }
+    result.correlation_id = request_id;
+    if (!result.accepted && result.error.empty()) result.error = "请求未被 Codex 桥接接受";
+    return result;
 }
 
 void TrySelectEntryTask() {
@@ -1635,6 +2003,10 @@ void OnRingChanged(lv_event_t* event) {
 
 void UpdateStatusRing() {
     if (s_ui.ring_frame == nullptr) return;
+    if (s_ui.realtime_root != nullptr && !lv_obj_has_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN)) {
+        codex_status_ring::Update(s_ui.ring_frame, false, false, Theme::Get().colors().accent);
+        return;
+    }
     const auto* target = codex_menu::SelectedTask(s_ui.menu_state);
     const auto state = target != nullptr ? target->state : codex_menu::SlotState::Unknown;
     const bool recording = s_ui.voice_stage == VoiceStage::Recording;
@@ -1707,10 +2079,18 @@ void OnDeleted(lv_event_t*) {
     s_ui.realtime_button = nullptr;
     s_ui.realtime_root = nullptr;
     s_ui.realtime_canvas = nullptr;
+    s_ui.realtime_status_area = nullptr;
     s_ui.realtime_status = nullptr;
-    s_ui.realtime_mute = nullptr;
     s_ui.realtime_volume = nullptr;
     s_ui.realtime_end = nullptr;
+    s_ui.realtime_volume_panel = nullptr;
+    s_ui.realtime_volume_slider = nullptr;
+    s_ui.realtime_volume_value = nullptr;
+    s_ui.realtime_caption_area = nullptr;
+    s_ui.realtime_caption_labels = {};
+    s_ui.realtime_caption_scroll = {};
+    s_ui.realtime_caption_toggle = nullptr;
+    s_ui.realtime_captions.Clear();
     s_ui.voice_stage = VoiceStage::Idle;
     s_ui.voice_mode = VoiceMode::Micro;
     s_ui.voice_pressed = false;
@@ -1757,12 +2137,15 @@ lv_obj_t* CodexView::Create() {
     lv_obj_set_scroll_dir(s_ui.chat, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_ui.chat, LV_SCROLLBAR_MODE_OFF);
 
-    // Realtime is a dedicated, no-transcript surface. Its 600 px reference
+    // Realtime uses optional captions below the animated expression. Its 600 px reference
     // field is drawn procedurally at 30 FPS from sparse 56x56 logical cells.
-    s_ui.realtime_root = lv_obj_create(shell.content);
+    // Own the area below the status bar, including the hidden chat action bar.
+    // shell.content clips at 526 px and cannot contain the call controls.
+    s_ui.realtime_root = lv_obj_create(shell.root);
     lv_obj_remove_style_all(s_ui.realtime_root);
-    lv_obj_set_size(s_ui.realtime_root, 720, metrics::kBottomActionContentHeight);
-    lv_obj_set_pos(s_ui.realtime_root, 0, 0);
+    lv_obj_set_size(s_ui.realtime_root, metrics::kDisplaySize,
+                    metrics::kDisplaySize - metrics::kStatusBarHeight);
+    lv_obj_set_pos(s_ui.realtime_root, 0, metrics::kStatusBarHeight);
     lv_obj_set_style_bg_color(s_ui.realtime_root, lv_color_hex(Theme::Get().colors().background), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_ui.realtime_root, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_remove_flag(s_ui.realtime_root, LV_OBJ_FLAG_SCROLLABLE);
@@ -1771,30 +2154,101 @@ lv_obj_t* CodexView::Create() {
     lv_obj_set_size(s_ui.realtime_canvas, 600, 430);
     lv_obj_align(s_ui.realtime_canvas, LV_ALIGN_TOP_MID, 0, 12);
     lv_obj_add_event_cb(s_ui.realtime_canvas, RenderRealtimePixels, LV_EVENT_DRAW_MAIN, nullptr);
-    s_ui.realtime_status = lv_label_create(s_ui.realtime_root);
+    // Wrap the complete error and allow vertical reading of unusually long details.
+    s_ui.realtime_status_area = lv_obj_create(s_ui.realtime_root);
+    lv_obj_remove_style_all(s_ui.realtime_status_area);
+    lv_obj_set_size(s_ui.realtime_status_area, 600, 48);
+    lv_obj_align(s_ui.realtime_status_area, LV_ALIGN_TOP_MID, 0, 450);
+    lv_obj_set_scroll_dir(s_ui.realtime_status_area, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_ui.realtime_status_area, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_remove_flag(s_ui.realtime_status_area, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_remove_flag(s_ui.realtime_status_area, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+    s_ui.realtime_status = lv_label_create(s_ui.realtime_status_area);
+    lv_obj_set_size(s_ui.realtime_status, lv_pct(100), LV_SIZE_CONTENT);
+    lv_label_set_long_mode(s_ui.realtime_status, LV_LABEL_LONG_WRAP);
     lv_label_set_text(s_ui.realtime_status, "连接中");
     lv_obj_set_style_text_font(s_ui.realtime_status, fonts::MediumBold(), LV_PART_MAIN);
     lv_obj_set_style_text_color(s_ui.realtime_status, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
-    lv_obj_align(s_ui.realtime_status, LV_ALIGN_TOP_MID, 0, 450);
-    auto make_realtime_button = [&](const char* label, int x, lv_event_cb_t cb) {
-        lv_obj_t* button = lv_btn_create(s_ui.realtime_root);
-        lv_obj_set_size(button, 170, 58);
-        lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, 500);
-        lv_obj_set_style_bg_color(button, lv_color_hex(Theme::Get().colors().surface), LV_PART_MAIN);
-        lv_obj_t* text = lv_label_create(button);
-        lv_label_set_text(text, label);
-        lv_obj_center(text);
+    lv_obj_set_style_text_align(s_ui.realtime_status, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(s_ui.realtime_status, LV_ALIGN_TOP_MID, 0, 0);
+    s_ui.realtime_captions_enabled = Settings("codex", false).GetBool("voice_captions", true);
+    s_ui.realtime_caption_area = lv_obj_create(s_ui.realtime_root);
+    lv_obj_remove_style_all(s_ui.realtime_caption_area);
+    lv_obj_set_size(s_ui.realtime_caption_area, 660, 80);
+    lv_obj_align(s_ui.realtime_caption_area, LV_ALIGN_BOTTOM_MID, 0, -148);
+    lv_obj_remove_flag(s_ui.realtime_caption_area, LV_OBJ_FLAG_SCROLLABLE);
+    for (size_t i = 0; i < s_ui.realtime_caption_labels.size(); ++i) {
+        auto* row = lv_obj_create(s_ui.realtime_caption_area);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, 660, 40);
+        lv_obj_set_pos(row, 0, static_cast<int>(i) * 40);
+        lv_obj_remove_flag(row, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE));
+        auto* label = lv_label_create(row);
+        s_ui.realtime_caption_labels[i] = label;
+        lv_obj_set_size(label, LV_SIZE_CONTENT, 40);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_font(label, fonts::MediumBold(), LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+        lv_obj_set_pos(label, 24, 1);
+        lv_label_set_text(label, "");
+        lv_obj_add_event_cb(row, DrawRealtimeCaptionFade, LV_EVENT_DRAW_POST, nullptr);
+    }
+    auto* realtime_actions = controls::CreateBottomActionBar(s_ui.realtime_root,
+        metrics::kBottomActionBarY - metrics::kStatusBarHeight);
+    lv_obj_set_style_pad_all(realtime_actions, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(realtime_actions, 80, LV_PART_MAIN);
+    lv_obj_set_flex_align(realtime_actions, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    auto make_realtime_button = [&](lv_event_cb_t cb, bool danger = false) {
+        auto* button = controls::CreateButton(realtime_actions);
+        lv_obj_remove_style_all(button);
+        lv_obj_set_size(button, 96, 96);
+        lv_obj_set_style_radius(button, 14, LV_PART_MAIN);
+        lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+        const auto& colors = Theme::Get().colors();
+        const auto background = lv_color_hex(danger ? colors.danger : colors.raised);
+        lv_obj_set_style_bg_color(button, background, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(button, lv_color_darken(background, LV_OPA_20), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(button, DrawRealtimeControl, LV_EVENT_DRAW_MAIN, nullptr);
         lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, nullptr);
         return button;
     };
-    s_ui.realtime_mute = make_realtime_button("静音", 82, OnRealtimeMute);
-    s_ui.realtime_volume = make_realtime_button("音量 70%", 275, OnRealtimeVolume);
-    s_ui.realtime_end = make_realtime_button("结束", 468, OnRealtimeEnd);
-    lv_obj_set_style_bg_color(s_ui.realtime_end, lv_color_hex(Theme::Get().colors().danger), LV_PART_MAIN);
+    s_ui.realtime_caption_toggle = make_realtime_button(OnRealtimeCaptions);
+    s_ui.realtime_end = make_realtime_button(OnRealtimeEnd, true);
+    s_ui.realtime_volume = make_realtime_button(OnRealtimeVolume);
+    s_ui.realtime_volume_panel = lv_obj_create(s_ui.realtime_root);
+    StyleSurface(s_ui.realtime_volume_panel);
+    lv_obj_set_size(s_ui.realtime_volume_panel, 300, 120);
+    lv_obj_align(s_ui.realtime_volume_panel, LV_ALIGN_BOTTOM_RIGHT, -30, -158);
+    lv_obj_remove_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_SCROLLABLE);
+    s_ui.realtime_volume_value = lv_label_create(s_ui.realtime_volume_panel);
+    lv_obj_set_style_text_font(s_ui.realtime_volume_value, fonts::MediumBold(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_ui.realtime_volume_value, lv_color_hex(Theme::Get().colors().text), LV_PART_MAIN);
+    lv_label_set_text(s_ui.realtime_volume_value, "70%");
+    lv_obj_align(s_ui.realtime_volume_value, LV_ALIGN_TOP_MID, 0, 0);
+    s_ui.realtime_volume_slider = lv_slider_create(s_ui.realtime_volume_panel);
+    lv_obj_set_size(s_ui.realtime_volume_slider, 230, 12);
+    lv_obj_align(s_ui.realtime_volume_slider, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_ext_click_area(s_ui.realtime_volume_slider, 18);
+    lv_slider_set_range(s_ui.realtime_volume_slider, 0, 100);
+    lv_slider_set_value(s_ui.realtime_volume_slider, 70, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(s_ui.realtime_volume_slider, lv_color_hex(Theme::Get().colors().accent), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_ui.realtime_volume_slider, lv_color_hex(Theme::Get().colors().accent), LV_PART_KNOB);
+    lv_obj_add_event_cb(s_ui.realtime_volume_slider, OnRealtimeVolumeChanged, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_flag(s_ui.realtime_volume_panel, LV_OBJ_FLAG_HIDDEN);
+    UpdateRealtimeLayout();
     lv_obj_add_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN);
     s_ui.realtime_timer = lv_timer_create([](lv_timer_t*) {
         if (s_ui.realtime_root != nullptr && !lv_obj_has_flag(s_ui.realtime_root, LV_OBJ_FLAG_HIDDEN) &&
-            s_ui.realtime_canvas != nullptr) lv_obj_invalidate(s_ui.realtime_canvas);
+            s_ui.realtime_canvas != nullptr) {
+            lv_obj_invalidate(s_ui.realtime_canvas);
+            if (s_ui.realtime_captions_enabled && s_ui.realtime_visual != RealtimeVisual::Error) {
+                for (size_t i = 0; i < s_ui.realtime_caption_labels.size(); ++i) {
+                    const int offset = s_ui.realtime_caption_scroll[i].Offset(lv_tick_get());
+                    lv_obj_set_x(s_ui.realtime_caption_labels[i], 24 - offset);
+                }
+            }
+        }
     }, 33, nullptr);
 
     auto voice = controls::AddBottomVoiceButton(
@@ -1865,5 +2319,20 @@ lv_obj_t* CodexView::Create() {
     UpdateStatusRing();
     return shell.root;
 }
+
+namespace {
+// Register when this foreground-app module is loaded so discovery is stable
+// before the user opens the page. Until Create establishes bridge state, the
+// state hook truthfully reports the capability as unavailable.
+const bool kCodexAiProviderRegistered = [] {
+    std::string error;
+    const bool registered = codex_ai::Register({CodexAiCapabilityState, DispatchCodexAi,
+        [](const std::string& request_id) {
+            if (s_ui.realtime_request_id == request_id) EndRealtimeSession(true);
+        }}, &error);
+    if (!registered) ESP_LOGW(kTag, "Codex AI capability registration failed: %s", error.c_str());
+    return registered;
+}();
+}  // namespace
 
 }  // namespace agent_ui

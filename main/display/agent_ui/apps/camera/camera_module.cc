@@ -49,6 +49,24 @@ void Module::ResetUi() {
     view_.Reset();
 }
 
+bool Module::SubmitIntent(const Intent& intent) {
+    return s_active_module != nullptr &&
+           s_active_module->SubmitIntentOnUiThread(intent);
+}
+
+const ViewState* Module::ActiveState() {
+    return s_active_module != nullptr ? &s_active_module->controller_.state()
+                                      : nullptr;
+}
+
+bool Module::IsActive() { return s_active_module != nullptr; }
+
+bool Module::SubmitIntentOnUiThread(const Intent& intent) {
+    if (!controller_.state().mounted) return false;
+    controller_.HandleIntent(intent);
+    return true;
+}
+
 void Module::LifecycleCallback(AppLifecycleEvent event) {
     controller_.HandleLifecycle(event);
     if (event == AppLifecycleEvent::Unload) {

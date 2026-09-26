@@ -22,9 +22,6 @@ void Navigation::Start() {
 
 void Navigation::Open(ScreenId id) {
     if (id == current_) return;
-    if (current_ == ScreenId::Home && id != ScreenId::Home) {
-        Application::GetInstance().ForceReturnToIdle();
-    }
     Load(id, TransitionDirection::Forward, true);
 }
 

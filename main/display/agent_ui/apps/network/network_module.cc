@@ -29,8 +29,22 @@ Lifecycle ToLifecycle(AppLifecycleEvent event) {
 Module::Module() {
     adapter_.SetEventSink([this](const Event& event) { PostEvent(event); });
     controller_.Activate(
-        [this](const ViewState& state) { view_.Render(state); },
+        [this](const ViewState& state) { ++revision_; view_.Render(state); },
         [this](const Command& command) { HandleCommand(command); });
+}
+
+bool Module::SubmitIntent(const Intent& intent) {
+    if (!controller_.state().mounted) return false;
+    controller_.HandleIntent(intent);
+    return true;
+}
+
+bool Module::SetMode(int mode) {
+    if (!controller_.state().mounted || mode < 0 || mode > 2) return false;
+    if (mode == 0) {
+        if (controller_.state().cellular) HandleCommand({.type = CommandType::SwitchNetwork});
+    } else HandleCommand({.type = CommandType::SwitchSimSlot, .value = mode == 1 ? 1 : 0});
+    return true;
 }
 
 void Module::BuildInto(lv_obj_t* parent) {
@@ -44,6 +58,7 @@ void Module::ResetUi() {
 }
 
 void Module::LifecycleCallback(AppLifecycleEvent event) {
+    ++session_;
     const Lifecycle lifecycle = ToLifecycle(event);
     if (lifecycle == Lifecycle::Unload) {
         controller_.HandleLifecycle(lifecycle);
@@ -66,6 +81,11 @@ void Module::ApplyEvent(void* data) {
     auto* pending = static_cast<PendingEvent*>(data);
     if (pending == nullptr) return;
     if (pending->module != nullptr) {
+        if (pending->module->state().mounted) {
+            ++pending->module->event_revisions_[static_cast<size_t>(pending->event.type)];
+            if (pending->event.type == EventType::ScanFinished)
+                pending->module->scan_succeeded_ = pending->event.success;
+        }
         pending->module->controller_.HandleEvent(pending->event);
     }
     delete pending;

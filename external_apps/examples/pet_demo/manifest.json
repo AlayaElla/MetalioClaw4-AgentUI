@@ -6,5 +6,8 @@
   "api_version": 1,
   "target": "esp32p4",
   "entry": "elf/esp32p4.elf",
-  "icon": "assets/demo.png"
+  "icon": "assets/demo.png",
+  "ai_actions": [
+    {"id":"com.metalio.pet-demo.animation","title":"播放宠物动画","description":"播放指定的宠物预置动画。","args_schema":{"type":"object","properties":{"animation":{"type":"string","enum":["breathing","bounce","wave"]}},"required":["animation"],"additionalProperties":false}}
+  ]
 }

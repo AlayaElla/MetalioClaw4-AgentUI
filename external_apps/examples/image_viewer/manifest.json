@@ -6,5 +6,8 @@
   "api_version": 1,
   "target": "esp32p4",
   "entry": "elf/esp32p4.elf",
-  "icon": "assets/demo.png"
+  "icon": "assets/demo.png",
+  "ai_actions": [
+    {"id":"com.metalio.image-viewer.navigate","title":"浏览图片","description":"按方向或固定索引切换图片。","args_schema":{"type":"object","properties":{"direction":{"type":"string","enum":["previous","next"]},"index":{"type":"integer","minimum":0,"maximum":4}},"additionalProperties":false}}
+  ]
 }

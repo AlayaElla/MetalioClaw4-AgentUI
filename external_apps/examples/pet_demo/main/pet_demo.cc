@@ -1,4 +1,8 @@
 #include "metalio_app_api.h"
+#include "metalio_app_json.h"
+
+#include <cstddef>
+#include <cstring>
 
 namespace {
 
@@ -278,6 +282,25 @@ void RefreshStats(void*) {
                               s_app.stats_label, text);
 }
 
+int AiAction(void*, const metalio_app_ai_action_request_t* request,
+             metalio_app_ai_action_result_t* result) {
+    if (request == nullptr || result == nullptr || request->arguments_json == nullptr) return -1;
+    char animation[16];
+    if (!metalio_app_json_get_string(request->arguments_json, "animation", animation,
+                                     sizeof(animation))) {
+        result->status = METALIO_APP_AI_ACTION_FAILED;
+        result->error = "pet animation is required";
+        return 0;
+    }
+    if (std::strcmp(animation, "breathing") == 0) PlayBreathing(nullptr);
+    else if (std::strcmp(animation, "bounce") == 0) PlayBounce(nullptr);
+    else if (std::strcmp(animation, "wave") == 0) PlayWave(nullptr);
+    else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "invalid pet animation"; return 0; }
+    result->status = METALIO_APP_AI_ACTION_SUCCEEDED;
+    result->result_json = "{\"animationApplied\":true}";
+    return 0;
+}
+
 }  // namespace
 
 extern "C" int main(int argc, char* argv[]) {
@@ -320,5 +343,9 @@ extern "C" int main(int argc, char* argv[]) {
     s_app.api->set_interval(s_app.launch->host_context, 500,
                             RefreshStats, nullptr);
     RefreshStats(nullptr);
+    if ((s_app.api->get_capabilities(s_app.launch->host_context) & METALIO_APP_CAP_AI_ACTIONS) != 0 &&
+        s_app.api->struct_size >= offsetof(metalio_app_host_api_t, ai_unregister_actions) + sizeof(s_app.api->ai_unregister_actions)) {
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.pet-demo.animation", AiAction, nullptr, nullptr, nullptr);
+    }
     return 0;
 }

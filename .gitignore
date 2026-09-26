@@ -47,5 +47,11 @@ Thumbs.db
 
 # Local tests and validation scripts
 /tests/
+!/tests/
+/tests/*
+!/tests/ai_capabilities_host/
+/tests/ai_capabilities_host/*
+!/tests/ai_capabilities_host/CMakeLists.txt
+!/tests/ai_capabilities_host/ai_capabilities_host_test.cc
 /scripts/test-*
 /docs/codex-micro-voice.md

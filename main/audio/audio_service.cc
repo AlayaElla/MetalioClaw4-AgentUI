@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "ai/ai_availability.h"
 #include <algorithm>
 #include <cmath>
 #include <esp_log.h>
@@ -555,6 +556,7 @@ void AudioService::SetExternalRecordingActive(bool active) {
 
 void AudioService::SetExternalPlaybackActive(bool active) {
     external_playback_active_.store(active, std::memory_order_release);
+    RefreshInputRoutes();
     if (active && audio_power_timer_ != nullptr) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(
@@ -626,6 +628,17 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
         return packet;
     }
     return nullptr;
+}
+
+void AudioService::SetAiWakeEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(input_route_mutex_);
+    ai_wake_enabled_ = enabled;
+    UpdateInputRoutesLocked();
+}
+
+void AudioService::RefreshInputRoutes() {
+    std::lock_guard<std::mutex> lock(input_route_mutex_);
+    UpdateInputRoutesLocked();
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
@@ -709,7 +722,9 @@ void AudioService::ApplyVoiceProcessingLocked(bool enable) {
 void AudioService::UpdateInputRoutesLocked() {
     const bool want_voice =
         voice_processing_requested_ || external_recording_active_;
-    const bool want_wake = wake_word_requested_ && !want_voice;
+    const bool want_wake = wake_word_requested_ && ai_wake_enabled_ &&
+                           ai::Availability::Get().IsAvailable() &&
+                           !external_playback_active_.load(std::memory_order_acquire) && !want_voice;
     const EventBits_t bits = xEventGroupGetBits(event_group_);
     const bool wake_active = (bits & AS_EVENT_WAKE_WORD_RUNNING) != 0;
     const bool voice_active =

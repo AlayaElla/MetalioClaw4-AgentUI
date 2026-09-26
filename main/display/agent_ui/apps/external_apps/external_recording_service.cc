@@ -115,6 +115,7 @@ std::string UniquePath(const std::string& requested) {
 }  // namespace
 
 struct RecordingService::Impl {
+    ai::Availability::Token ai_block = 0;
     mutable std::mutex mutex;
     void* owner = nullptr;
     FILE* file = nullptr;
@@ -167,6 +168,8 @@ struct RecordingService::Impl {
         accepting.store(false, std::memory_order_release);
         audio().SetExternalRecordingPcmCallback({});
         audio().SetExternalRecordingActive(false);
+        ai::Availability::Get().ReleaseBlock(ai_block);
+        ai_block = 0;
     }
 
     void WriterMain() {
@@ -280,7 +283,7 @@ int RecordingService::Start(
     if (owner == nullptr) return METALIO_APP_RECORDING_ERROR_INVALID;
     Application& app = Application::GetInstance();
     if (app.GetDeviceState() != kDeviceStateIdle ||
-        app.IsCodexVoiceCaptureActive()) {
+        app.IsCodexVoiceCaptureActive() || !ai::Availability::Get().IsAvailable()) {
         return METALIO_APP_RECORDING_ERROR_BUSY;
     }
 
@@ -333,9 +336,12 @@ int RecordingService::Start(
     impl_->discard_requested.store(false, std::memory_order_release);
     impl_->accepting.store(false, std::memory_order_release);
 
+    impl_->ai_block = ai::Availability::Get().AcquireBlock("external.recording", "应用录音");
     if (xTaskCreate(Impl::WriterEntry, "external_record", 6144, impl_, 3,
                     &impl_->writer_task) != pdPASS) {
         impl_->writer_task = nullptr;
+        ai::Availability::Get().ReleaseBlock(impl_->ai_block);
+        impl_->ai_block = 0;
         vStreamBufferDeleteWithCaps(stream);
         impl_->stream = nullptr;
         std::fclose(file);

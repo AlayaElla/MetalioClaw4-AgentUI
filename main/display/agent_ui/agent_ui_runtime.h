@@ -32,6 +32,7 @@ private:
 
     static void StartTask(void* argument);
     void RunStartTask();
+    void ToggleListeningFromStatusBar();
     static lv_obj_t* CreateHomeView();
     static lv_obj_t* CreateCameraView();
     bool initialized_ = false;

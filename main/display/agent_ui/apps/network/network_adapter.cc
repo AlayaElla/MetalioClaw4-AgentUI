@@ -331,6 +331,7 @@ struct Adapter::Impl {
             EmitNearbyNetworks(false, true);
             Event finished;
             finished.type = EventType::ScanFinished;
+            finished.success = false;
             Emit(finished);
             vTaskDelete(nullptr);
             return;
@@ -353,6 +354,7 @@ struct Adapter::Impl {
             EmitNearbyNetworks(false, true);
             Event finished;
             finished.type = EventType::ScanFinished;
+            finished.success = false;
             Emit(finished);
             vTaskDelete(nullptr);
             return;
@@ -366,6 +368,7 @@ struct Adapter::Impl {
             EmitNearbyNetworks(false, true);
             Event finished;
             finished.type = EventType::ScanFinished;
+            finished.success = false;
             Emit(finished);
             vTaskDelete(nullptr);
             return;

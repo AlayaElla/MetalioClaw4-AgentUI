@@ -24,6 +24,7 @@
 #include "dual_network_board.h"
 #include "nt26_board.h"
 #include "settings.h"
+#include "ai/ai_availability.h"
 
 // ---------------------------------------------------------------------------
 // 720x720 layout
@@ -90,6 +91,8 @@ enum class CallState { kIdle, kCalling };
 constexpr int  kMaxDigits   = 24;
 char           s_number[kMaxDigits + 1];
 CallState      s_call_state;
+uint64_t       s_ai_revision = 0;
+const char*    s_ai_status = "idle";
 
 lv_obj_t* s_number_lbl;
 lv_obj_t* s_status_lbl;
@@ -108,6 +111,18 @@ bool s_screen_active = false;
 // hung up before ATD returned). This avoids a stale "dial OK" overwriting a
 // freshly-idle UI.
 uint32_t s_call_epoch = 0;
+ai::Availability::Token s_call_availability_token = 0;
+
+void ReleaseCallAvailability() {
+    if (s_call_availability_token == 0) return;
+    ai::Availability::Get().ReleaseBlock(s_call_availability_token);
+    s_call_availability_token = 0;
+}
+
+void SetAiStatus(const char* status) {
+    s_ai_status = status != nullptr ? status : "unknown";
+    ++s_ai_revision;
+}
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -233,7 +248,8 @@ enum class AtOutcome : uint8_t {
     kDialOk,         // ATD 收到 OK
     kSimNotReady,    // AT+CPIN? 没回 READY / 超时 / 模组不在
     kDialFailed,     // ATD 没回 OK（ERROR / NO CARRIER / 超时）
-    kHangupDone,     // ATH 完成（成功与否都视作完成）
+    kHangupDone,     // ATH acknowledged
+    kHangupFailed,
     kNo4G,           // 当前不是 4G 板（WiFi 模式）
 };
 
@@ -241,6 +257,7 @@ struct AtJob {
     AtJobKind   kind;
     std::string number;   // only used for kDial
     uint32_t    epoch;    // 触发时记录的 s_call_epoch
+    ai::Availability::Token cleanup_token = 0;
 };
 
 struct AtResult {
@@ -266,11 +283,15 @@ void OnAtResult(void* user_data) {
     if (res->kind == AtJobKind::kDial) {
         switch (res->outcome) {
             case AtOutcome::kDialOk:
-                // ATD 已经收到 OK，正在通话中。
-                SetStatusText(I18n::T("通话中"));
+                // ATD only accepted the command. It is not evidence that a
+                // remote endpoint answered, so keep that distinction for AI.
+                SetAiStatus("dial_accepted");
+                SetStatusText(I18n::T("拨号请求已受理"));
                 break;
             case AtOutcome::kSimNotReady:
                 s_call_state = CallState::kIdle;
+                SetAiStatus("failed");
+                ReleaseCallAvailability();
                 ++s_call_epoch;
                 RefreshActionButton();
                 RefreshNumberDisplay();
@@ -278,6 +299,8 @@ void OnAtResult(void* user_data) {
                 break;
             case AtOutcome::kNo4G:
                 s_call_state = CallState::kIdle;
+                SetAiStatus("failed");
+                ReleaseCallAvailability();
                 ++s_call_epoch;
                 RefreshActionButton();
                 RefreshNumberDisplay();
@@ -286,6 +309,8 @@ void OnAtResult(void* user_data) {
             case AtOutcome::kDialFailed:
             default:
                 s_call_state = CallState::kIdle;
+                SetAiStatus("failed");
+                ReleaseCallAvailability();
                 ++s_call_epoch;
                 RefreshActionButton();
                 RefreshNumberDisplay();
@@ -293,6 +318,7 @@ void OnAtResult(void* user_data) {
                 break;
         }
     } else {
+        SetAiStatus(res->outcome == AtOutcome::kHangupDone ? "hung_up" : "failed");
         // 挂断的反馈不是必须展示的，简单清空状态行即可。
         if (s_call_state == CallState::kIdle) {
             SetStatusText("");
@@ -318,7 +344,8 @@ void AtJobTask(void* arg) {
         std::string resp;
         esp_err_t err = nt26->SendAtCommand("ATH", resp, 5000);
         ESP_LOGI(TAG, "AT 'ATH' -> err=%d resp='%s'", (int)err, resp.c_str());
-        result->outcome = AtOutcome::kHangupDone;
+        result->outcome = err == ESP_OK && resp.find("OK") != std::string::npos
+            ? AtOutcome::kHangupDone : AtOutcome::kHangupFailed;
     } else {
         // === Dial flow: AT+CPIN? -> ATD<number> ===
         std::string cpin_resp;
@@ -349,6 +376,12 @@ void AtJobTask(void* arg) {
         }
     }
 
+    // ATH is the final modem cleanup step.  Release only after it returns so
+    // a resumed AI request cannot race the active call's audio/modem route.
+    if (job->kind == AtJobKind::kHangup) {
+        ai::Availability::Get().ReleaseBlock(job->cleanup_token);
+    }
+
     lv_async_call(OnAtResult, result);
     delete job;
     vTaskDelete(nullptr);
@@ -361,17 +394,26 @@ void DispatchDial(const std::string& number) {
     if (r != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(call_at dial) failed");
         delete job;
+        s_call_state = CallState::kIdle;
+        ReleaseCallAvailability();
+        SetAiStatus("failed");
         SetStatusText(I18n::T("系统忙"));
     }
 }
 
 void DispatchHangup() {
-    auto* job = new AtJob{AtJobKind::kHangup, "", s_call_epoch};
+    // Transfer this call's lease to its cleanup task. An older ATH must never
+    // release a subsequent call's token after the screen is reopened.
+    const auto cleanup_token = s_call_availability_token;
+    s_call_availability_token = 0;
+    auto* job = new AtJob{AtJobKind::kHangup, "", s_call_epoch, cleanup_token};
     BaseType_t r = xTaskCreate(AtJobTask, "call_at", 4096, job,
                                tskIDLE_PRIORITY + 2, nullptr);
     if (r != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(call_at hangup) failed");
         delete job;
+        ai::Availability::Get().ReleaseBlock(cleanup_token);
+        SetAiStatus("failed");
     }
 }
 
@@ -406,7 +448,15 @@ void StartCall() {
         return;
     }
 
+    s_call_availability_token = ai::Availability::Get().AcquireBlock(
+        "phone.call", "电话通话");
+    if (s_call_availability_token == 0) {
+        SetStatusText(I18n::T("AI 正在处理请求，请稍后重试"));
+        return;
+    }
+
     s_call_state = CallState::kCalling;
+    SetAiStatus("dialing");
     ++s_call_epoch;
     RefreshActionButton();
     RefreshNumberDisplay();
@@ -419,6 +469,7 @@ void StartCall() {
 void HangupCall() {
     const bool was_calling = (s_call_state == CallState::kCalling);
     s_call_state = CallState::kIdle;
+    SetAiStatus("hanging_up");
     ++s_call_epoch;
     RefreshActionButton();
     RefreshStatus();
@@ -470,6 +521,7 @@ void OnSwipeBack() {
         DispatchHangup();
     }
     s_call_state = CallState::kIdle;
+    SetAiStatus("idle");
     ++s_call_epoch;
     s_screen_active = false;
 
@@ -681,10 +733,37 @@ void PhoneView::LifecycleCallback(AppLifecycleEvent event) {
         if (s_call_state == CallState::kCalling) {
             DispatchHangup();
             s_call_state = CallState::kIdle;
+            SetAiStatus("idle");
             ++s_call_epoch;
+        } else {
+            ReleaseCallAvailability();
         }
         s_screen_active = false;
     }
 }
+
+bool PhoneView::SubmitAiDial(const char* number) {
+    if (!s_screen_active || number == nullptr) return false;
+    const size_t length = std::strlen(number);
+    if (length == 0 || length > kMaxDigits || s_call_state != CallState::kIdle) return false;
+    for (size_t i = 0; i < length; ++i) {
+        const char c = number[i];
+        if (!((c >= '0' && c <= '9') || c == '+' || c == '*' || c == '#')) return false;
+    }
+    std::memcpy(s_number, number, length);
+    s_number[length] = '\0';
+    StartCall();
+    return s_call_state == CallState::kCalling;
+}
+
+bool PhoneView::SubmitAiHangup() {
+    if (!s_screen_active || s_call_state != CallState::kCalling) return false;
+    HangupCall();
+    return true;
+}
+
+bool PhoneView::IsAiCallActive() { return s_call_state == CallState::kCalling; }
+uint64_t PhoneView::AiRevision() { return s_ai_revision; }
+const char* PhoneView::AiStatus() { return s_ai_status; }
 
 }  // namespace agent_ui

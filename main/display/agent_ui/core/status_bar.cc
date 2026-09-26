@@ -4,10 +4,12 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <utility>
 
 #include <font_awesome.h>
 
 #include "application.h"
+#include "ai/ai_availability.h"
 #include "apps/bluetooth/bluetooth_adapter.h"
 #include "apps/home/home_renderer.h"
 #include "board.h"
@@ -55,6 +57,15 @@ void SetA8Color(lv_obj_t* image, uint32_t color) {
 }
 
 }  // namespace
+
+void StatusBar::AgentFaceClicked(lv_event_t* event) {
+    auto* self = static_cast<StatusBar*>(lv_event_get_user_data(event));
+    if (self == nullptr || !ai::Availability::Get().IsAvailable()) return;
+    self->SetReplyCaption(nullptr);
+    // The callback is runtime-owned, so the shared top control does not
+    // depend on whichever application screen is currently mounted.
+    if (self->agent_tap_callback_) self->agent_tap_callback_();
+}
 
 StatusBar& StatusBar::Get() {
     static StatusBar instance;
@@ -115,27 +126,47 @@ void StatusBar::Create() {
 
     agent_cluster_ = lv_obj_create(root_);
     lv_obj_remove_style_all(agent_cluster_);
-    lv_obj_set_size(agent_cluster_, 240, metrics::kStatusBarHeight);
+    lv_obj_set_size(agent_cluster_, 360, metrics::kStatusBarHeight);
     lv_obj_align(agent_cluster_, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_flex_flow(agent_cluster_, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(agent_cluster_, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(agent_cluster_, 8, LV_PART_MAIN);
     lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 
-    agent_dot_ = lv_obj_create(agent_cluster_);
+    agent_face_slot_ = lv_obj_create(agent_cluster_);
+    lv_obj_remove_style_all(agent_face_slot_);
+    lv_obj_set_size(agent_face_slot_, 126, 60);
+    lv_obj_set_pos(agent_face_slot_, 117, 1);
+    lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(agent_face_slot_, AgentFaceClicked, LV_EVENT_CLICKED,
+                        this);
+    agent_expression_ = std::make_unique<ExpressionPlayer>(
+        agent_face_slot_, nullptr, 126, 60, 4);
+
+    // A tiny state dot remains available to distinguish disabled AI from an
+    // ordinary idle expression without introducing a text-only status mode.
+    agent_dot_ = lv_obj_create(agent_face_slot_);
     lv_obj_remove_style_all(agent_dot_);
-    lv_obj_set_size(agent_dot_, 10, 10);
+    lv_obj_set_size(agent_dot_, 6, 6);
     lv_obj_set_style_radius(agent_dot_, LV_RADIUS_CIRCLE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(agent_dot_, lv_color_hex(colors.muted), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(agent_dot_, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_pos(agent_dot_, 116, 4);
 
-    agent_label_ = lv_label_create(agent_cluster_);
-    lv_label_set_text(agent_label_, "待机");
+    reply_clip_ = lv_obj_create(agent_cluster_);
+    lv_obj_remove_style_all(reply_clip_);
+    lv_obj_remove_flag(reply_clip_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(reply_clip_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_pos(reply_clip_, 140, 9);
+    lv_obj_set_size(reply_clip_, 220, 44);
+    agent_label_ = lv_label_create(reply_clip_);
+    lv_label_set_text(agent_label_, "");
     lv_obj_set_style_text_font(agent_label_, fonts::MediumBold(), LV_PART_MAIN);
     lv_obj_set_style_text_color(agent_label_, lv_color_hex(colors.text), LV_PART_MAIN);
-    lv_obj_set_width(agent_label_, LV_SIZE_CONTENT);
+    lv_obj_set_size(agent_label_, 220, 44);
+    lv_obj_set_pos(agent_label_, 0, 0);
+    lv_label_set_long_mode(agent_label_, LV_LABEL_LONG_CLIP);
+    lv_obj_add_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
 
     right_cluster_ = lv_obj_create(root_);
     lv_obj_remove_style_all(right_cluster_);
@@ -233,6 +264,19 @@ void StatusBar::Refresh(bool force) {
     if (root_ == nullptr) return;
 
     const auto& colors = Theme::Get().colors();
+    const bool available = ai::Availability::Get().IsAvailable();
+    if (force || available != ai_available_) {
+        ai_available_ = available;
+        if (agent_face_slot_ != nullptr) {
+            if (available && !lock_screen_mode_) {
+                lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (!available) ClearReplyCaption();
+        UpdateAgentPresentation();
+    }
     const bool bluetooth_enabled = bluetooth::Adapter::Get().IsEnabled();
     const bool bluetooth_connected = bluetooth_enabled &&
                                      bluetooth::Adapter::Get().IsConnected();
@@ -280,9 +324,9 @@ void StatusBar::Refresh(bool force) {
     // Theme changes must repaint the already-rendered agent state as well as
     // the network, clock, and battery colors refreshed below.
     if (force) SetAgentState(agent_state_);
-    if (has_activation && (force || last_center_text_ != center_text)) {
+    if (force || last_center_text_ != center_text) {
         last_center_text_ = center_text;
-        lv_label_set_text(agent_label_, center_text.c_str());
+        UpdateAgentPresentation();
     }
 
     int level = 0;
@@ -336,18 +380,153 @@ void StatusBar::SetAgentState(AgentState state) {
     if (agent_dot_ == nullptr || agent_label_ == nullptr) return;
     const auto& colors = Theme::Get().colors();
     const bool active = state != AgentState::Idle;
-    const char* text = state == AgentState::Connecting
-                           ? "连接中"
-                           : (state == AgentState::Listening
-                                  ? "聆听中"
-                                  : (state == AgentState::Answering ? "说话中"
-                                                                    : "待机"));
     const uint32_t color = active ? colors.accent : colors.muted;
-    lv_label_set_text(agent_label_, text);
-    lv_obj_set_style_text_font(agent_label_, fonts::MediumBold(), LV_PART_MAIN);
-    lv_obj_set_style_text_color(
-        agent_label_, lv_color_hex(active ? colors.accent : colors.text), LV_PART_MAIN);
     lv_obj_set_style_bg_color(agent_dot_, lv_color_hex(color), LV_PART_MAIN);
+    if (agent_expression_) agent_expression_->SetState(state);
+    if (state == AgentState::Listening || state == AgentState::Connecting) {
+        ClearReplyCaption();
+    }
+    UpdateAgentPresentation();
+}
+
+void StatusBar::SetReplyCaption(const char* caption) {
+    const std::string next = caption != nullptr ? caption : "";
+    ClearReplyCaption();
+    reply_caption_ = next;
+    if (reply_caption_.empty()) {
+        ClearReplyCaption();
+        UpdateAgentPresentation();
+    } else {
+        agent_state_ = AgentState::Answering;
+        if (agent_expression_) agent_expression_->SetState(agent_state_);
+        UpdateAgentPresentation();
+    }
+}
+
+void StatusBar::SetAgentTapCallback(AgentTapCallback callback) {
+    agent_tap_callback_ = std::move(callback);
+}
+
+void StatusBar::ClearReplyCaption() {
+    if (reply_finish_timer_) {
+        lv_timer_delete(reply_finish_timer_);
+        reply_finish_timer_ = nullptr;
+    }
+    if (agent_label_) lv_anim_delete(agent_label_, SetObjectTranslateX);
+    reply_caption_.clear();
+    reply_wide_ = false;
+    reply_presented_ = false;
+    if (agent_label_ != nullptr) {
+        lv_label_set_text(agent_label_, "");
+        lv_obj_add_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (battery_group_ != nullptr) {
+        lv_anim_delete(battery_group_, SetAgentClusterTranslateY);
+        lv_obj_set_style_translate_y(battery_group_, 0, LV_PART_MAIN);
+        lv_obj_set_style_opa(battery_group_, LV_OPA_COVER, LV_PART_MAIN);
+    }
+}
+
+void StatusBar::SetObjectTranslateX(void* object, int32_t value) {
+    auto* target = static_cast<lv_obj_t*>(object);
+    if (target != nullptr && lv_obj_is_valid(target)) {
+        lv_obj_set_style_translate_x(target, value, LV_PART_MAIN);
+    }
+}
+
+void StatusBar::AnimateAgentFace(int32_t target, uint32_t duration_ms) {
+    if (agent_face_slot_ == nullptr || !lv_obj_is_valid(agent_face_slot_)) return;
+    lv_anim_delete(agent_face_slot_, SetObjectTranslateX);
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, agent_face_slot_);
+    lv_anim_set_exec_cb(&animation, SetObjectTranslateX);
+    lv_anim_set_values(&animation,
+        lv_obj_get_style_translate_x(agent_face_slot_, LV_PART_MAIN), target);
+    lv_anim_set_duration(&animation, duration_ms);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+    lv_anim_start(&animation);
+}
+
+void StatusBar::UpdateAgentPresentation() {
+    if (!agent_face_slot_ || !agent_label_ || !reply_clip_) return;
+    const bool show_caption = !reply_caption_.empty() && !lock_screen_mode_ && ai_available_;
+    if (home_active_ || lock_screen_mode_ || !ai_available_) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+    if (show_caption) {
+        lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
+        if (reply_presented_) return;
+        reply_presented_ = true;
+        if (reply_finish_timer_) { lv_timer_delete(reply_finish_timer_); reply_finish_timer_ = nullptr; }
+        lv_anim_delete(agent_label_, SetObjectTranslateX);
+        lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);
+        std::string single_line = reply_caption_;
+        std::replace(single_line.begin(), single_line.end(), '\n', ' ');
+        std::replace(single_line.begin(), single_line.end(), '\r', ' ');
+        lv_label_set_text(agent_label_, single_line.c_str());
+        lv_point_t measured{};
+        lv_text_get_size(&measured, single_line.c_str(), fonts::MediumBold(), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        const int normal_width = home_active_ ? 360 : 220;
+        reply_wide_ = measured.x > normal_width;
+        const int width = reply_wide_ ? (home_active_ ? 520 : 380) : normal_width;
+        lv_obj_set_x(reply_clip_, home_active_ ? 0 : 140);
+        lv_obj_set_width(reply_clip_, width);
+        lv_obj_set_width(agent_label_, std::max<int>(measured.x + 2, width));
+        if (battery_group_) {
+            lv_anim_delete(battery_group_, SetAgentClusterTranslateY);
+            lv_anim_t battery;
+            lv_anim_init(&battery);
+            lv_anim_set_var(&battery, battery_group_);
+            lv_anim_set_exec_cb(&battery, SetAgentClusterTranslateY);
+            lv_anim_set_values(&battery, lv_obj_get_style_translate_y(battery_group_, LV_PART_MAIN),
+                reply_wide_ ? -metrics::kStatusBarHeight : 0);
+            lv_anim_set_duration(&battery, 420);
+            lv_anim_set_path_cb(&battery, lv_anim_path_ease_in_out);
+            lv_anim_start(&battery);
+        }
+        if (!home_active_) AnimateAgentFace(-117, 420);
+        const int distance = std::max<int>(0, measured.x - width);
+        const uint32_t travel = static_cast<uint32_t>(distance) * 1000 / 42;
+        uint32_t duration = 420 + std::max<uint32_t>(2400, static_cast<uint32_t>(measured.x) * 9);
+        if (distance > 0) {
+            lv_anim_t animation;
+            lv_anim_init(&animation);
+            lv_anim_set_var(&animation, agent_label_);
+            lv_anim_set_exec_cb(&animation, SetObjectTranslateX);
+            lv_anim_set_values(&animation, 0, -distance);
+            lv_anim_set_delay(&animation, 1420);
+            lv_anim_set_duration(&animation, travel);
+            lv_anim_set_path_cb(&animation, lv_anim_path_linear);
+            lv_anim_start(&animation);
+            duration = 1420 + travel + 1400;
+        }
+        reply_finish_timer_ = lv_timer_create([](lv_timer_t* timer) {
+            auto* self = static_cast<StatusBar*>(lv_timer_get_user_data(timer));
+            self->reply_finish_timer_ = nullptr;
+            lv_timer_delete(timer);
+            self->ClearReplyCaption();
+            self->UpdateAgentPresentation();
+        }, duration, this);
+        return;
+    }
+    const bool show_activation = !last_center_text_.empty() && !lock_screen_mode_;
+    if (show_activation) {
+        lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(agent_label_, last_center_text_.c_str());
+        lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);
+        lv_obj_set_x(reply_clip_, home_active_ ? 0 : 140);
+        lv_obj_set_width(reply_clip_, home_active_ ? 360 : 220);
+        lv_obj_set_width(agent_label_, home_active_ ? 360 : 220);
+    } else lv_obj_add_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
+    if (battery_group_) {
+        lv_anim_delete(battery_group_, SetAgentClusterTranslateY);
+        lv_obj_set_style_translate_y(battery_group_, 0, LV_PART_MAIN);
+        lv_obj_set_style_opa(battery_group_, LV_OPA_COVER, LV_PART_MAIN);
+    }
+    if (lock_screen_mode_ || (home_active_ && !show_activation)) lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    AnimateAgentFace(0, 420);
 }
 
 namespace {
@@ -417,27 +596,33 @@ void StatusBar::SetHomeActive(bool active) {
         if (agent_cluster_ != nullptr && lv_obj_is_valid(agent_cluster_) &&
             !lock_screen_mode_) {
             if (active) {
+                lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+            } else {
                 lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_translate_y(agent_cluster_, 0, LV_PART_MAIN);
             }
         }
+        UpdateAgentPresentation();
         return;
     }
     home_active_ = active;
+    reply_presented_ = false;
     if (agent_cluster_ == nullptr || !lv_obj_is_valid(agent_cluster_)) return;
     lv_anim_delete(agent_cluster_, SetAgentClusterTranslateY);
     if (lock_screen_mode_) {
         lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
     if (active) {
-        lv_obj_set_style_translate_y(
-            agent_cluster_, metrics::kStatusBarHeight, LV_PART_MAIN);
-        AnimateAgentCluster(0, metrics::kTransitionMs);
+        lv_anim_delete(agent_cluster_, SetAgentClusterTranslateY);
+        lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_y(agent_cluster_, 0, LV_PART_MAIN);
     } else {
-        AnimateAgentCluster(-metrics::kStatusBarHeight, metrics::kTransitionMs);
+        lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_y(agent_cluster_, -metrics::kStatusBarHeight,
+                                     LV_PART_MAIN);
+        AnimateAgentCluster(0, metrics::kTransitionMs);
     }
+    UpdateAgentPresentation();
 }
 
 void StatusBar::SetLockScreenMode(bool active) {
@@ -453,12 +638,16 @@ void StatusBar::SetLockScreenMode(bool active) {
         if (active) {
             lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         } else if (home_active_) {
-            lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_translate_y(agent_cluster_, 0, LV_PART_MAIN);
+            lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    if (agent_face_slot_ != nullptr) {
+        if (active || !ai_available_) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+    }
+    UpdateAgentPresentation();
     if (active) SetVisible(true);
 }
 
@@ -470,6 +659,7 @@ void StatusBar::TimerCallback(lv_timer_t* timer) {
 void StatusBar::DeletedCallback(lv_event_t* event) {
     auto* self = static_cast<StatusBar*>(lv_event_get_user_data(event));
     if (self == nullptr) return;
+    self->ClearReplyCaption();
     if (self->timer_ != nullptr) {
         lv_timer_delete(self->timer_);
         self->timer_ = nullptr;
@@ -477,12 +667,15 @@ void StatusBar::DeletedCallback(lv_event_t* event) {
     if (self->agent_cluster_ != nullptr) {
         lv_anim_delete(self->agent_cluster_, SetAgentClusterTranslateY);
     }
+    self->agent_expression_.reset();
     self->root_ = nullptr;
     self->left_cluster_ = nullptr;
     self->time_label_ = nullptr;
     self->agent_cluster_ = nullptr;
+    self->agent_face_slot_ = nullptr;
     self->agent_dot_ = nullptr;
     self->agent_label_ = nullptr;
+    self->reply_clip_ = nullptr;
     self->right_cluster_ = nullptr;
     self->bluetooth_icon_ = nullptr;
     self->network_icon_ = nullptr;
@@ -497,6 +690,9 @@ void StatusBar::DeletedCallback(lv_event_t* event) {
     self->last_bluetooth_enabled_ = false;
     self->last_bluetooth_connected_ = false;
     self->home_active_ = true;
+    self->ai_available_ = true;
+    self->reply_caption_.clear();
+    self->reply_wide_ = false;
 }
 
 }  // namespace agent_ui

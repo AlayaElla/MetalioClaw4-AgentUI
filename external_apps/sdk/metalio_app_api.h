@@ -74,6 +74,43 @@ typedef uint64_t metalio_app_capabilities_t;
 #define METALIO_APP_CAP_UI_THEME (UINT64_C(1) << 16)
 #define METALIO_APP_CAP_APP_STORAGE (UINT64_C(1) << 17)
 #define METALIO_APP_CAP_UI_CONTROLS (UINT64_C(1) << 18)
+#define METALIO_APP_CAP_AI_ACTIONS (UINT64_C(1) << 19)
+
+/*
+ * AI actions are declared in manifest.json and bound by their exact id at
+ * runtime. The host never accepts arbitrary widget names or callbacks as AI
+ * targets. A handler may return PENDING and later finish through
+ * ai_complete_action; all strings are UTF-8 JSON objects and host-copied.
+ */
+typedef enum {
+    METALIO_APP_AI_ACTION_SUCCEEDED = 0,
+    METALIO_APP_AI_ACTION_PENDING = 1,
+    METALIO_APP_AI_ACTION_FAILED = 2,
+    METALIO_APP_AI_ACTION_CANCELLED = 3,
+} metalio_app_ai_action_status_t;
+
+typedef struct {
+    const char* id;
+    const char* arguments_json;
+    const char* request_id;
+    uint32_t deadline_ms;
+    uint64_t generation;
+} metalio_app_ai_action_request_t;
+
+typedef struct {
+    metalio_app_ai_action_status_t status;
+    const char* result_json;
+    const char* error;
+} metalio_app_ai_action_result_t;
+
+typedef int (*metalio_app_ai_action_handler_t)(
+    void* app_context, const metalio_app_ai_action_request_t* request,
+    metalio_app_ai_action_result_t* result);
+typedef int (*metalio_app_ai_action_cancel_t)(void* app_context,
+                                               const char* request_id);
+typedef int (*metalio_app_ai_action_state_t)(void* app_context,
+                                              char* state_json,
+                                              uint32_t capacity);
 
 typedef enum {
     METALIO_APP_STORAGE_OK = 0,
@@ -567,7 +604,23 @@ typedef struct metalio_app_host_api {
                         int16_t x, int16_t y, int16_t width, int16_t height,
                         metalio_app_widget_t* widget);
     int (*set_image_source)(void* host_context, metalio_app_widget_t widget,
-                            const char* asset_relative_path);
+                             const char* asset_relative_path);
+
+    /* ABI 1 AI action extension. Check struct_size and AI_ACTIONS first. */
+    int (*ai_register_action)(void* host_context, const char* action_id,
+                              metalio_app_ai_action_handler_t handler,
+                              metalio_app_ai_action_cancel_t cancel,
+                              metalio_app_ai_action_state_t get_state,
+                              void* app_context);
+    int (*ai_complete_action)(void* host_context, const char* request_id,
+                              const metalio_app_ai_action_result_t* result);
+    int (*ai_unregister_actions)(void* host_context);
+    /* UI-thread APIs. Tokens belong to this loaded App instance and are
+     * automatically released at unload. Multiple callers may hold leases. */
+    uint64_t (*ai_acquire_block)(void* host_context, const char* reason);
+    int (*ai_release_block)(void* host_context, uint64_t token);
+    int (*ai_get_availability)(void* host_context, uint8_t* available,
+                               uint64_t* generation);
 } metalio_app_host_api_t;
 
 typedef struct metalio_app_launch_context {

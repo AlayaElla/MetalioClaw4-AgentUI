@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -942,6 +944,7 @@ int MediaService::Start(void* owner, const char* url) {
         impl_->pending_owner.store(owner, std::memory_order_release);
         impl_->pending_url = url;
         impl_->Unlock();
+        EndAssistantInteraction(false);
         return 0;
     }
     if (active_owner != nullptr && active_owner != owner) {
@@ -956,15 +959,24 @@ int MediaService::Start(void* owner, const char* url) {
         impl_->public_state.store(MediaState::Connecting,
                                   std::memory_order_release);
         impl_->Unlock();
+        EndAssistantInteraction(false);
         impl_->RequestPlayerStop();
         return 0;
     }
     impl_->Unlock();
+    EndAssistantInteraction(false);
     return impl_->BeginStart(owner) ? 0 : -1;
 }
 
 int MediaService::Pause(void* owner) {
     if (impl_ == nullptr || !impl_->Lock()) return -1;
+    if (impl_->OwnerMatches(owner) &&
+        impl_->life.load(std::memory_order_relaxed) == LifeState::Suspended) {
+        impl_->resume_after_suspend = false;
+        impl_->Unlock();
+        EndAssistantInteraction(false);
+        return 0;
+    }
     if (!impl_->OwnerMatches(owner) ||
         impl_->life.load(std::memory_order_relaxed) != LifeState::Running) {
         impl_->Unlock();
@@ -973,6 +985,7 @@ int MediaService::Pause(void* owner) {
     impl_->want_play.store(false, std::memory_order_relaxed);
     impl_->public_state.store(MediaState::Paused, std::memory_order_release);
     impl_->Unlock();
+    EndAssistantInteraction(false);
     impl_->RequestPlayerStop();
     return 0;
 }
@@ -1001,6 +1014,7 @@ int MediaService::Resume(void* owner) {
 }
 
 int MediaService::Stop(void* owner) {
+    if (impl_ && impl_->owner.load() == owner) EndAssistantInteraction(false);
     return impl_ != nullptr ? impl_->BeginStop(owner, false) : -1;
 }
 
@@ -1072,10 +1086,12 @@ void MediaService::ResumeOwner(void* owner) {
 }
 
 void MediaService::UnloadOwner(void* owner) {
+    if (impl_ && impl_->owner.load() == owner) EndAssistantInteraction(false);
     if (impl_ != nullptr) (void)impl_->BeginStop(owner, false);
 }
 
 bool MediaService::ResetForAppLaunch(uint32_t timeout_ms) {
+    EndAssistantInteraction(false);
     if (impl_ == nullptr) return true;
 
     void* active_owner = nullptr;
@@ -1127,6 +1143,77 @@ bool MediaService::ResetForAppLaunch(uint32_t timeout_ms) {
     impl_->public_state.store(MediaState::Idle, std::memory_order_release);
     impl_->Unlock();
     return true;
+}
+
+
+bool MediaService::BeginAssistantInteraction(std::function<void(bool)> ready) {
+    if (impl_ == nullptr) return false;
+    std::unique_lock<std::mutex> lock(assistant_mutex_);
+    if (assistant_owner_ != nullptr) return false;
+    void* owner = impl_->owner.load(std::memory_order_acquire);
+    const auto life = impl_->life.load(std::memory_order_acquire);
+    if (owner == nullptr || (life != LifeState::Running && life != LifeState::Starting)) return false;
+    assistant_owner_ = owner;
+    assistant_generation_ = impl_->generation.load(std::memory_order_acquire);
+    const uint64_t epoch = ++assistant_epoch_;
+    struct WaitJob { MediaService* service; uint64_t epoch; std::function<void(bool)> ready; };
+    auto* job = new (std::nothrow) WaitJob{this, epoch, std::move(ready)};
+    if (!job) {
+        assistant_owner_ = nullptr;
+        lock.unlock();
+        if (ready) ready(false);
+        return true;
+    }
+    SuspendOwner(owner);
+    const auto entry = [](void* argument) {
+        std::unique_ptr<WaitJob> job(static_cast<WaitJob*>(argument));
+        bool available = false;
+        for (unsigned i = 0; i < 250; ++i) {
+            {
+                std::lock_guard<std::mutex> guard(job->service->assistant_mutex_);
+                if (job->service->assistant_epoch_ != job->epoch ||
+                    job->service->assistant_owner_ != job->service->impl_->owner.load()) break;
+                available = job->service->impl_->life.load() == LifeState::Suspended;
+                // Teardown advances the playback generation. Remember the
+                // suspended generation, not the one before teardown started.
+                if (available) job->service->assistant_generation_ =
+                    job->service->impl_->generation.load();
+            }
+            if (available) break;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (job->ready) job->ready(available);
+        job.reset();
+        vTaskDelete(nullptr);
+    };
+    if (xTaskCreate(entry, "assistant_focus", 4096, job, 3, nullptr) != pdPASS) {
+        auto callback = std::move(job->ready);
+        delete job;
+        lock.unlock();
+        EndAssistantInteraction(true);
+        if (callback) callback(false);
+        return true;
+    }
+    return true;
+}
+
+bool MediaService::HasAssistantInteraction() const {
+    std::lock_guard<std::mutex> lock(assistant_mutex_);
+    return assistant_owner_ != nullptr;
+}
+
+void MediaService::EndAssistantInteraction(bool resume) {
+    void* owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(assistant_mutex_);
+        if (assistant_owner_ != nullptr && impl_ != nullptr &&
+            impl_->owner.load() == assistant_owner_ &&
+            (impl_->life.load() == LifeState::Stopping ||
+             impl_->generation.load() == assistant_generation_)) owner = assistant_owner_;
+        assistant_owner_ = nullptr;
+        ++assistant_epoch_;
+    }
+    if (resume && owner != nullptr) ResumeOwner(owner);
 }
 
 }  // namespace agent_ui::external_apps

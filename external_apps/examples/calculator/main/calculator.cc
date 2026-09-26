@@ -1,6 +1,9 @@
 #include "metalio_app_api.h"
+#include "metalio_app_json.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -531,6 +534,61 @@ void OnKey(void* context) {
     }
 }
 
+int AiAction(void*, const metalio_app_ai_action_request_t* request,
+             metalio_app_ai_action_result_t* result) {
+    if (request == nullptr || result == nullptr || request->id == nullptr ||
+        request->arguments_json == nullptr) return -1;
+    if (std::strcmp(request->id, "com.metalio.calculator.clear") == 0) {
+        ResetEntry(true);
+        result->status = METALIO_APP_AI_ACTION_SUCCEEDED;
+        result->result_json = "{\"value\":0}";
+        return 0;
+    } else if (std::strcmp(request->id, "com.metalio.calculator.mode") == 0) {
+        char mode[16]{};
+        if (!metalio_app_json_get_string(request->arguments_json, "mode", mode,
+                                         sizeof(mode))) {
+            result->status = METALIO_APP_AI_ACTION_FAILED;
+            result->error = "calculator mode is required";
+            return 0;
+        }
+        if (std::strcmp(mode, "standard") == 0) SetMode(CalculatorMode::Standard);
+        else if (std::strcmp(mode, "scientific") == 0) SetMode(CalculatorMode::Scientific);
+        else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "invalid calculator mode"; return 0; }
+        result->status = METALIO_APP_AI_ACTION_SUCCEEDED;
+        result->result_json = std::strcmp(mode, "standard") == 0 ?
+            "{\"mode\":\"standard\"}" : "{\"mode\":\"scientific\"}";
+        return 0;
+    } else if (std::strcmp(request->id, "com.metalio.calculator.evaluate") == 0) {
+        char expression[sizeof(s_app.expression)]{};
+        if (!metalio_app_json_get_string(request->arguments_json, "expression",
+                                         expression, sizeof(expression))) {
+            result->status = METALIO_APP_AI_ACTION_FAILED;
+            result->error = "expression required";
+            return 0;
+        }
+        const size_t length = std::strlen(expression);
+        if (length == 0 || length >= sizeof(s_app.expression) ||
+            !std::all_of(expression, expression + length, [](unsigned char ch) {
+                if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= 'A' && ch <= 'Z')) return true;
+                switch (ch) {
+                    case '.': case '+': case '-': case '*': case '/':
+                    case '^': case '(': case ')': case '%': case ' ': return true;
+                    default: return false;
+                }
+            })) { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "invalid expression"; return 0; }
+        std::memcpy(s_app.expression, expression, length); s_app.expression[length] = '\0';
+        s_app.after_equals = false; Evaluate();
+    } else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "unknown calculator action"; return 0; }
+    result->status = s_app.error ? METALIO_APP_AI_ACTION_FAILED : METALIO_APP_AI_ACTION_SUCCEEDED;
+    // The host copies this after the callback returns; storage must outlive it.
+    static char value[sizeof(s_app.expression) + 32]{};
+    if (!s_app.error) std::snprintf(value, sizeof(value), "{\"value\":%s}", s_app.expression);
+    result->result_json = s_app.error ? "{}" : value;
+    result->error = s_app.error ? "calculation failed" : "";
+    return 0;
+}
+
 template <size_t Count>
 bool BuildKeypad(metalio_app_widget_t grid, const KeyDefinition (&keys)[Count],
                  metalio_app_widget_t (&buttons)[Count], metalio_app_font_t font) {
@@ -580,5 +638,12 @@ extern "C" int main(int argc, char* argv[]) {
         s_app.api->set_widget_visible(s_app.launch->host_context, s_app.scientific_grid, 0) != 0 ||
         s_app.api->set_theme_callback(s_app.launch->host_context, OnThemeChanged, nullptr) != 0) return 6;
     ResetEntry(true);
+    if ((s_app.capabilities & METALIO_APP_CAP_AI_ACTIONS) != 0 &&
+        s_app.api->struct_size >= offsetof(metalio_app_host_api_t, ai_unregister_actions) +
+                                   sizeof(s_app.api->ai_unregister_actions)) {
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.calculator.evaluate", AiAction, nullptr, nullptr, nullptr);
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.calculator.mode", AiAction, nullptr, nullptr, nullptr);
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.calculator.clear", AiAction, nullptr, nullptr, nullptr);
+    }
     return 0;
 }

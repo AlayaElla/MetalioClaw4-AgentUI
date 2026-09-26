@@ -15,6 +15,7 @@ public:
 
     void Initialize(const char* initial_message, NavigationSink navigation_sink);
     void HandleEvent(const Event& event);
+    void HandleIntent(const Intent& intent) { controller_.HandleIntent(intent); }
 
     ScreenId screen_id() const override { return ScreenId::Home; }
     lv_obj_t* Mount() override;

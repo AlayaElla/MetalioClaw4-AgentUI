@@ -119,6 +119,9 @@ public:
     bool IsAfeWakeWord();
 
     void EnableWakeWordDetection(bool enable);
+    // User preference and system availability are separate from route requests.
+    void SetAiWakeEnabled(bool enabled);
+    void RefreshInputRoutes();
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
@@ -221,6 +224,7 @@ private:
                                uint32_t production_generation = 0);
     bool CanEnqueueNetworkAudio(uint32_t production_generation) const;
     void UpdateInputRoutesLocked();
+    bool ai_wake_enabled_ = true;
     void ApplyWakeWordDetectionLocked(bool enable);
     void ApplyVoiceProcessingLocked(bool enable);
     void UpdateListeningAudioFeatures(const std::vector<int16_t>& pcm);

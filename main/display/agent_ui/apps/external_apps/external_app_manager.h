@@ -7,6 +7,13 @@
 
 namespace agent_ui::external_apps {
 
+struct AiActionInfo {
+    std::string id;
+    std::string title;
+    std::string description;
+    std::string args_schema_json;
+};
+
 struct AppInfo {
     std::string id;
     std::string name;
@@ -14,6 +21,9 @@ struct AppInfo {
     std::string root_path;
     std::string entry_path;
     std::string icon_path;
+    // Parsed at install discovery time so an unloaded App can be described to
+    // the assistant without loading arbitrary ELF code.
+    std::vector<AiActionInfo> ai_actions;
 };
 
 struct InstallProgress {

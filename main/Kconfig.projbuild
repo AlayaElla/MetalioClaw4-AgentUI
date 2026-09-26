@@ -1,5 +1,11 @@
 menu "Xiaozhi Assistant"
 
+# Registry dependency conditions reference this option even when the locked
+# esp_video 2.3 component does not declare it. Keep its standard H.264 dependency.
+config ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION
+    bool "Use a customized ESP H.264 component version"
+    default n
+
 config PROVISIONING_URL
     string "Default provisioning URL"
     default "https://api.tenclass.net/xiaozhi/ota/"

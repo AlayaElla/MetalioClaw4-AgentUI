@@ -489,6 +489,15 @@ void McpServer::GetToolsList(int id, const std::string& cursor, bool list_user_o
 }
 
 void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments) {
+    const auto ai_snapshot = ai::Availability::Get().GetSnapshot();
+    const bool policy_query = tool_name == "self.capabilities.list" ||
+        tool_name == "self.capabilities.describe" || tool_name == "self.capabilities.result" ||
+        tool_name == "self.capabilities.cancel" || tool_name == "self.ai.availability" ||
+        tool_name == "self.get_device_status";
+    if (!policy_query && !ai_snapshot.available) {
+        ReplyError(id, "Device AI is temporarily unavailable");
+        return;
+    }
     auto tool_iter = std::find_if(tools_.begin(), tools_.end(), 
                                  [&tool_name](const McpTool* tool) { 
                                      return tool->name() == tool_name; 
@@ -532,7 +541,12 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
-    app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
+    app.Schedule([this, id, tool_iter, ai_snapshot, policy_query, arguments = std::move(arguments)]() {
+        const auto current = ai::Availability::Get().GetSnapshot();
+        if (!policy_query && (!current.available || current.generation != ai_snapshot.generation)) {
+            ReplyError(id, "Device AI state changed before execution");
+            return;
+        }
         try {
             ReplyResult(id, (*tool_iter)->Call(arguments));
         } catch (const std::exception& e) {

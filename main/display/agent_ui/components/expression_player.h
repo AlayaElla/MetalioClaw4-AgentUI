@@ -19,7 +19,10 @@ public:
 
     explicit ExpressionPlayer(
         lv_obj_t* parent,
-        audio::ListeningAudioFeatureStore* listening_audio_features = nullptr);
+        audio::ListeningAudioFeatureStore* listening_audio_features = nullptr,
+        int surface_width = 600,
+        int surface_height = 400,
+        int pixel_step = 1);
     ~ExpressionPlayer();
 
     void SetState(AgentState state);
@@ -129,6 +132,9 @@ private:
     int8_t* morph_from_field_ = nullptr;
     int8_t* morph_to_field_ = nullptr;
     uint8_t* distance_scratch_ = nullptr;
+    int surface_width_ = kExpressionWidth;
+    int surface_height_ = kExpressionHeight;
+    int pixel_step_ = 1;
     AgentState state_ = AgentState::Idle;
     Action action_ = Action::Idle;
     Action queued_action_ = Action::Idle;

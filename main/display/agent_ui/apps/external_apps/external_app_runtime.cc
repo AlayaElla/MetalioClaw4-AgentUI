@@ -13,6 +13,8 @@
 #include <ctime>
 #include <cstring>
 #include <memory>
+#include <map>
+#include <set>
 #include <new>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -35,6 +37,12 @@
 #include "agent_ui/components/pet_renderer.h"
 #include "agent_ui/components/haptic_feedback.h"
 #include "agent_ui/components/ui_components.h"
+#include "ai/ai_availability.h"
+#include "ai/ai_capabilities.h"
+#include "ai/ai_ui_operation.h"
+#include "agent_ui/core/navigation.h"
+#include <atomic>
+#include <cJSON.h>
 #include "boards/metalio-claw-4/sc7a20_motion.h"
 #include "board.h"
 #include "font_awesome.h"
@@ -415,6 +423,22 @@ struct Runtime::State {
     uint64_t theme_signature = 0;
     metalio_app_host_api_t api{};
     metalio_app_launch_context_t launch_context{};
+    struct AiActionBinding {
+        std::string id;
+        metalio_app_ai_action_handler_t handler = nullptr;
+        metalio_app_ai_action_cancel_t cancel = nullptr;
+        metalio_app_ai_action_state_t get_state = nullptr;
+        void* app_context = nullptr;
+    };
+    std::vector<AiActionBinding> ai_actions;
+    struct AiCompletion {
+        metalio_app_ai_action_status_t status = METALIO_APP_AI_ACTION_FAILED;
+        std::string result_json = "{}";
+        std::string error;
+    };
+    std::map<std::string, AiCompletion> ai_completed;
+    std::map<std::string, std::string> ai_dispatched;
+    std::set<ai::Availability::Token> ai_blocks;
 };
 
 namespace {
@@ -498,7 +522,83 @@ metalio_app_capabilities_t GetCapabilities(void* host_context) {
            METALIO_APP_CAP_AUDIO_RECORDING |
            METALIO_APP_CAP_UI_THEME |
            METALIO_APP_CAP_APP_STORAGE |
-           METALIO_APP_CAP_UI_CONTROLS;
+           METALIO_APP_CAP_UI_CONTROLS |
+           METALIO_APP_CAP_AI_ACTIONS;
+}
+
+Runtime::State::AiActionBinding* FindAiAction(Runtime::State* state,
+                                               const char* action_id) {
+    if (state == nullptr || action_id == nullptr) return nullptr;
+    for (auto& action : state->ai_actions) {
+        if (action.id == action_id) return &action;
+    }
+    return nullptr;
+}
+
+// AI SDK entry points run on the UI thread, just like other widget APIs.
+int CompleteAiAction(void* host_context, const char* request_id,
+                     const metalio_app_ai_action_result_t* result) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state || !request_id || !result ||
+        !state->ai_dispatched.count(request_id) ||
+        result->status == METALIO_APP_AI_ACTION_PENDING) return -1;
+    if ((result->result_json && strnlen(result->result_json, 4097) > 4096) ||
+        (result->error && strnlen(result->error, 513) > 512)) return -1;
+    state->ai_completed[request_id] = {result->status,
+        result->result_json ? result->result_json : "{}", result->error ? result->error : ""};
+    return 0;
+}
+
+int RegisterAiAction(void* host_context, const char* action_id,
+                     metalio_app_ai_action_handler_t handler,
+                     metalio_app_ai_action_cancel_t cancel,
+                     metalio_app_ai_action_state_t get_state, void* app_context) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state || !action_id || !handler || FindAiAction(state, action_id)) return -1;
+    const auto manifest = std::find_if(state->app.ai_actions.begin(), state->app.ai_actions.end(),
+        [action_id](const AiActionInfo& item) { return item.id == action_id; });
+    if (manifest == state->app.ai_actions.end()) return -1;
+    state->ai_actions.push_back({action_id, handler, cancel, get_state, app_context});
+    return 0;
+}
+
+int UnregisterAiActions(void* host_context) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state) return -1;
+    // Detach first so a cancellation callback cannot invalidate this iteration.
+    auto pending = std::move(state->ai_dispatched);
+    state->ai_dispatched.clear();
+    for (const auto& request : pending) {
+        auto* binding = FindAiAction(state, request.second.c_str());
+        if (binding && binding->cancel) binding->cancel(binding->app_context, request.first.c_str());
+    }
+    state->ai_actions.clear();
+    state->ai_completed.clear();
+    return 0;
+}
+
+uint64_t AcquireAiBlock(void* host_context, const char* reason) {
+    auto* state = CheckedState(host_context);
+    if (!state || state->ai_blocks.size() >= 8 ||
+        (reason && strnlen(reason, 129) > 128)) return 0;
+    auto token = ai::Availability::Get().AcquireBlock("external-app:" + state->app.id,
+        reason ? reason : "External app owns the assistant route");
+    state->ai_blocks.insert(token);
+    return token;
+}
+
+int ReleaseAiBlock(void* host_context, uint64_t token) {
+    auto* state = CheckedState(host_context);
+    if (!state || !state->ai_blocks.erase(token)) return -1;
+    return ai::Availability::Get().ReleaseBlock(token) ? 0 : -1;
+}
+
+int GetAiAvailability(void* host_context, uint8_t* available, uint64_t* generation) {
+    if (!CheckedState(host_context) || !available || !generation) return -1;
+    auto snapshot = ai::Availability::Get().GetSnapshot();
+    *available = snapshot.available ? 1 : 0;
+    *generation = snapshot.generation;
+    return 0;
 }
 
 int ConfigWrite(void* host_context, const char* relative_path,
@@ -2788,6 +2888,7 @@ bool Runtime::Launch(const AppInfo& app, lv_obj_t* content, lv_obj_t* actions,
         return false;
     }
     state->app = app;
+    state->ai_actions.reserve(app.ai_actions.size());
     state->content = content;
     state->actions = actions;
     state->elf_size = static_cast<size_t>(info.st_size);
@@ -2812,6 +2913,7 @@ bool Runtime::Launch(const AppInfo& app, lv_obj_t* content, lv_obj_t* actions,
     }
 
     state_ = state;
+    ++generation_;
     if (!RelocateWithInternalStack(state, error)) {
         Unload();
         return false;
@@ -2899,6 +3001,12 @@ bool Runtime::Launch(const AppInfo& app, lv_obj_t* content, lv_obj_t* actions,
         .set_action_picker_selected = SetActionPickerSelected,
         .add_image_ex = AddImageEx,
         .set_image_source = SetImageSource,
+        .ai_register_action = RegisterAiAction,
+        .ai_complete_action = CompleteAiAction,
+        .ai_unregister_actions = UnregisterAiActions,
+        .ai_acquire_block = AcquireAiBlock,
+        .ai_release_block = ReleaseAiBlock,
+        .ai_get_availability = GetAiAvailability,
     };
     state->launch_context = {
         .abi_version = METALIO_APP_ABI_VERSION,
@@ -2964,8 +3072,123 @@ void Runtime::SetPaused(bool paused) {
     }
 }
 
+void Runtime::RegisterInstalledCapabilities(const std::vector<AppInfo>& apps) {
+    static std::mutex mutex;
+    static std::vector<std::string> installed_ids;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& registry = ai::CapabilityRegistry::Get();
+    for (const auto& id : installed_ids) registry.Unregister(id);
+    installed_ids.clear();
+    for (const auto& app : apps) {
+        for (const auto& action : app.ai_actions) {
+            ai::CapabilityProvider provider;
+            provider.descriptor = {action.id, action.title, action.description, action.args_schema_json};
+            // Never call ELF code from the MCP worker. State callbacks, actions
+            // and cancellation all execute through the UI dispatcher.
+            provider.get_state = [] { return ai::CapabilityState{}; };
+            provider.invoke = [app](const ai::InvokeRequest& request) {
+                return Runtime::Get().InvokeAction(app, request);
+            };
+            provider.get_result = ai::UiOperations::GetResult;
+            provider.cancel = ai::UiOperations::Cancel;
+            std::string error;
+            if (registry.Register(std::move(provider), &error)) installed_ids.push_back(action.id);
+            else ESP_LOGW(kTag, "Cannot register %s: %s", action.id.c_str(), error.c_str());
+        }
+    }
+}
+
+ai::OperationResult Runtime::InvokeAction(const AppInfo& app, const ai::InvokeRequest& request) {
+    struct Invocation {
+        bool opened = false;
+        bool dispatched = false;
+        uint64_t generation = 0;
+        std::string id;
+    };
+    static std::atomic<uint64_t> next_request{0};
+    auto invocation = std::make_shared<Invocation>();
+    invocation->id = "external-" + std::to_string(++next_request);
+    auto cancel = [this, invocation, action_id = request.capability_id]() {
+        if (!invocation->dispatched || !state_ || generation_ != invocation->generation) return;
+        auto* binding = FindAiAction(state_, action_id.c_str());
+        state_->ai_dispatched.erase(invocation->id);
+        state_->ai_completed.erase(invocation->id);
+        if (binding && binding->cancel) binding->cancel(binding->app_context, invocation->id.c_str());
+    };
+    return ai::UiOperations::Submit(request, [this, app, request, invocation]() {
+        ai::OperationResult output;
+        output.status = ai::OperationStatus::Pending;
+        auto fail = [&output](const char* error) {
+            output.status = ai::OperationStatus::Failed;
+            output.error = error;
+            return output;
+        };
+        if (!invocation->opened) {
+            if (!Manager::Get().Select(app.id)) return fail("App is no longer installed");
+            invocation->opened = true;
+            auto& navigation = Navigation::Get();
+            if (navigation.current() == ScreenId::ExternalAppHost) {
+                if (!state_ || state_->app.id != app.id) navigation.RebuildCurrent();
+            } else navigation.Open(ScreenId::ExternalAppHost);
+            return output;
+        }
+        if (Navigation::Get().current() != ScreenId::ExternalAppHost)
+            return fail("App was closed before the action completed");
+        if (invocation->dispatched && (!state_ || generation_ != invocation->generation))
+            return fail("App instance changed before the action completed");
+        if (!state_ || state_->app.id != app.id || state_->paused) return output;
+        auto* binding = FindAiAction(state_, request.capability_id.c_str());
+        if (!binding) return fail("Loaded App did not register its declared action");
+        if (invocation->dispatched) {
+            auto found = state_->ai_completed.find(invocation->id);
+            if (found == state_->ai_completed.end()) return output;
+            output.status = found->second.status == METALIO_APP_AI_ACTION_SUCCEEDED ? ai::OperationStatus::Succeeded :
+                found->second.status == METALIO_APP_AI_ACTION_CANCELLED ? ai::OperationStatus::Cancelled : ai::OperationStatus::Failed;
+            output.result_json = found->second.result_json;
+            output.error = found->second.error;
+            state_->ai_completed.erase(found);
+            state_->ai_dispatched.erase(invocation->id);
+            return output;
+        }
+        const auto availability = ai::Availability::Get().GetSnapshot();
+        if (!availability.available || availability.generation != request.generation)
+            return fail("AI availability changed while opening the App");
+        invocation->generation = generation_;
+        invocation->dispatched = true;
+        state_->ai_dispatched[invocation->id] = binding->id;
+        metalio_app_ai_action_request_t input{.id = binding->id.c_str(),
+            .arguments_json = request.arguments_json.c_str(), .request_id = invocation->id.c_str(),
+            .deadline_ms = request.deadline_ms, .generation = request.generation};
+        metalio_app_ai_action_result_t result{};
+        result.status = METALIO_APP_AI_ACTION_FAILED;
+        if (binding->handler(binding->app_context, &input, &result) != 0) {
+            state_->ai_dispatched.erase(invocation->id);
+            return fail("External action handler failed");
+        }
+        output.status = result.status == METALIO_APP_AI_ACTION_PENDING ? ai::OperationStatus::Pending :
+            result.status == METALIO_APP_AI_ACTION_SUCCEEDED ? ai::OperationStatus::Succeeded :
+            result.status == METALIO_APP_AI_ACTION_CANCELLED ? ai::OperationStatus::Cancelled : ai::OperationStatus::Failed;
+        if ((result.result_json && strnlen(result.result_json, 4097) > 4096) ||
+            (result.error && strnlen(result.error, 513) > 512)) {
+            state_->ai_dispatched.erase(invocation->id);
+            return fail("External action result exceeds its limit");
+        }
+        output.result_json = result.result_json ? result.result_json : "{}";
+        output.error = result.error ? result.error : "";
+        if (output.status != ai::OperationStatus::Pending) {
+            state_->ai_dispatched.erase(invocation->id);
+            state_->ai_completed.erase(invocation->id);
+        }
+        return output;
+    }, cancel);
+}
+
 void Runtime::Unload() {
     if (state_ == nullptr) return;
+    ++generation_;
+    UnregisterAiActions(state_);
+    for (auto token : state_->ai_blocks) ai::Availability::Get().ReleaseBlock(token);
+    state_->ai_blocks.clear();
     if (MediaService* media = MediaService::Existing(); media != nullptr) {
         media->UnloadOwner(state_);
     }

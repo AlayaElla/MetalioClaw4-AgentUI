@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "lvgl.h"
 #include "core/ui_utils.h"
 
@@ -19,6 +21,13 @@ public:
     //   LOAD   -> PA_SWITCH=false（音频功放切到 4G 通话路径）
     //   UNLOAD -> PA_SWITCH=true （恢复 WIFI/本地音频路径）
     static void LifecycleCallback(AppLifecycleEvent event);
+    // UI-thread capability seam. ATD acceptance is exposed as accepted, never
+    // as a proof that the remote party connected.
+    static bool SubmitAiDial(const char* number);
+    static bool SubmitAiHangup();
+    static bool IsAiCallActive();
+    static uint64_t AiRevision();
+    static const char* AiStatus();
 };
 
 }  // namespace agent_ui

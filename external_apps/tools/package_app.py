@@ -24,6 +24,10 @@ ELF32_SYMBOL_SIZE = 16
 ELF_MACHINE_RISCV = 243
 SECTION_TYPE_DYNSYM = 11
 SECTION_INDEX_UNDEFINED = 0
+ACTION_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,79}$")
+MAX_AI_ACTIONS = 12
+MAX_AI_TEXT_BYTES = 512
+MAX_AI_SCHEMA_BYTES = 2048
 
 
 def add_bytes(archive: tarfile.TarFile, name: str, data: bytes) -> None:
@@ -141,6 +145,40 @@ def validate_elf(elf_bytes: bytes) -> None:
         )
 
 
+def validate_manifest(manifest: object) -> None:
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a JSON object")
+    if manifest.get("entry") != "elf/esp32p4.elf":
+        raise ValueError("manifest entry must be elf/esp32p4.elf")
+    if manifest.get("target") != "esp32p4" or manifest.get("api_version") != 1:
+        raise ValueError("sample package must target esp32p4 ABI 1")
+    actions = manifest.get("ai_actions", [])
+    if not isinstance(actions, list) or len(actions) > MAX_AI_ACTIONS:
+        raise ValueError("manifest ai_actions must contain at most 12 actions")
+    action_ids: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            raise ValueError("manifest ai_action must be an object")
+        action_id = action.get("id")
+        if not isinstance(action_id, str) or not ACTION_ID_PATTERN.fullmatch(action_id):
+            raise ValueError("manifest ai_action id is invalid")
+        app_id = manifest.get("id")
+        if not isinstance(app_id, str) or not action_id.startswith(app_id + "."):
+            raise ValueError("manifest ai_action id must belong to its App namespace")
+        if action_id in action_ids:
+            raise ValueError("manifest ai_action ids must be unique")
+        action_ids.add(action_id)
+        for key in ("title", "description"):
+            value = action.get(key)
+            if not isinstance(value, str) or not value or len(value.encode("utf-8")) > MAX_AI_TEXT_BYTES:
+                raise ValueError(f"manifest ai_action {key} is invalid")
+        schema = action.get("args_schema")
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise ValueError("manifest ai_action args_schema must be an object schema")
+        if len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > MAX_AI_SCHEMA_BYTES:
+            raise ValueError("manifest ai_action args_schema is too large")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -161,10 +199,7 @@ def main() -> int:
 
     manifest_bytes = args.manifest.read_bytes()
     manifest = json.loads(manifest_bytes)
-    if manifest.get("entry") != "elf/esp32p4.elf":
-        raise ValueError("manifest entry must be elf/esp32p4.elf")
-    if manifest.get("target") != "esp32p4" or manifest.get("api_version") != 1:
-        raise ValueError("sample package must target esp32p4 ABI 1")
+    validate_manifest(manifest)
 
     icon = manifest.get("icon")
     if icon is not None and (

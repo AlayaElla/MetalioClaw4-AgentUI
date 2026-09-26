@@ -5,5 +5,9 @@
   "version": "1.0.0",
   "api_version": 1,
   "target": "esp32p4",
-  "entry": "elf/esp32p4.elf"
+  "entry": "elf/esp32p4.elf",
+  "ai_actions": [
+    {"id":"com.metalio.radio.tune","title":"切换电台","description":"按预置索引切换收音机电台。","args_schema":{"type":"object","properties":{"index":{"type":"integer","minimum":0,"maximum":31}},"required":["index"],"additionalProperties":false}},
+    {"id":"com.metalio.radio.playback","title":"控制播放","description":"播放、暂停或恢复当前电台。","args_schema":{"type":"object","properties":{"state":{"type":"string","enum":["play","pause","resume"]}},"required":["state"],"additionalProperties":false}}
+  ]
 }

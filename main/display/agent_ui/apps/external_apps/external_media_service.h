@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 
 namespace agent_ui::external_apps {
 
@@ -35,6 +37,11 @@ public:
     // Host-level launch barrier. Cancels any stale successor and waits until
     // the previous GMF/HLS pipeline has released its resources.
     bool ResetForAppLaunch(uint32_t timeout_ms);
+    // Returns true when playback must be released asynchronously. The callback
+    // runs off the UI thread, after the shared audio route is safe to acquire.
+    bool BeginAssistantInteraction(std::function<void(bool)> ready);
+    bool HasAssistantInteraction() const;
+    void EndAssistantInteraction(bool resume = true);
 
 private:
     MediaService();
@@ -44,6 +51,10 @@ private:
 
     struct Impl;
     Impl* impl_ = nullptr;
+    mutable std::mutex assistant_mutex_;
+    void* assistant_owner_ = nullptr;
+    uint32_t assistant_generation_ = 0;
+    uint64_t assistant_epoch_ = 0;
 };
 
 }  // namespace agent_ui::external_apps

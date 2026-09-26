@@ -48,6 +48,12 @@ idf.py build
 powershell -ExecutionPolicy Bypass -File .\scripts\package-esp32.ps1 -IdfPath C:\path\to\esp-idf
 ```
 
+Windows 也可双击 `scripts/package-esp32.cmd`，它调用同一脚本，使用根目录
+`sdkconfig` 和 `build/`。已有 `sdkconfig` 的选择优先于 `sdkconfig.defaults.esp32p4`；
+只修改 defaults 不会覆盖已有配置。若提示 `Wi-Fi requires ESP32-C5`，检查
+Wi-Fi Remote 和 ESP-Hosted 都选中 C5、传输为 SDIO Slot 1，并按
+`sdkconfig.defaults.esp32p4` 核对引脚；修正后重新打包即可，无需删除整个配置。
+
 打包结果位于本仓库的 `build/esp32/`：
 
 ```text

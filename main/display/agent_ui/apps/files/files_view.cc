@@ -961,4 +961,55 @@ void FilesView::LifecycleCallback(AppLifecycleEvent event) {
     }
 }
 
+bool FilesView::PreviewPath(const char* posix_path) {
+    auto& disk = UsbVirtualDisk::GetInstance();
+    if (posix_path == nullptr || strncmp(posix_path, "/sdcard/", 8) != 0 ||
+        strstr(posix_path, "..") != nullptr || strchr(posix_path, '\\') != nullptr || s_screen == nullptr ||
+        !SdCardManager::GetInstance().IsMounted() || disk.IsSdExportedToHost() ||
+        disk.IsBusy()) {
+        return false;
+    }
+    const char* name = strrchr(posix_path, '/');
+    name = name != nullptr ? name + 1 : posix_path;
+    if (!IsPreviewableFile(name) ||
+        strlcpy(s_preview_posix_path, posix_path, sizeof(s_preview_posix_path)) >=
+            sizeof(s_preview_posix_path)) {
+        return false;
+    }
+    SetPreviewTitle(name);
+    if (IsImageFile(name)) OpenImagePreview(posix_path);
+    else OpenTextPreview(posix_path);
+    return IsPreviewOpen();
+}
+
+bool FilesView::DeletePath(const char* posix_path) {
+    auto& disk = UsbVirtualDisk::GetInstance();
+    if (posix_path == nullptr || strncmp(posix_path, "/sdcard/", 8) != 0 ||
+        strstr(posix_path, "..") != nullptr || strchr(posix_path, '\\') != nullptr || !SdCardManager::GetInstance().IsMounted() ||
+        disk.IsSdExportedToHost() || disk.IsBusy() || unlink(posix_path) != 0) {
+        return false;
+    }
+    ClosePreview();
+    UpdateStatusUI();
+    if (s_screen != nullptr) RebuildFileList(s_screen);
+    return true;
+}
+
+bool FilesView::GetStorageBytes(uint64_t* total_bytes, uint64_t* free_bytes) {
+    if (total_bytes == nullptr || free_bytes == nullptr) return false;
+    *total_bytes = 0;
+    *free_bytes = 0;
+    auto& sd = SdCardManager::GetInstance();
+    auto& disk = UsbVirtualDisk::GetInstance();
+    if (!sd.IsMounted() || disk.IsSdExportedToHost() || disk.IsBusy()) return false;
+    FATFS* fs = nullptr;
+    DWORD free_clusters = 0;
+    if (f_getfree("0:", &free_clusters, &fs) == FR_OK && fs != nullptr) {
+        *total_bytes = static_cast<uint64_t>(fs->n_fatent - 2) * fs->csize * 512U;
+        *free_bytes = static_cast<uint64_t>(free_clusters) * fs->csize * 512U;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace agent_ui

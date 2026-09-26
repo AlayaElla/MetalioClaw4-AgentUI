@@ -2,6 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+
+#include "metalio_app_json.h"
 
 namespace {
 
@@ -75,6 +79,8 @@ struct AppState {
     uint32_t saved_station = kMaximumStations;
     metalio_app_media_state_t media_state = METALIO_APP_MEDIA_IDLE;
     bool tune_pending = false;
+    bool ai_tune_pending = false;
+    char ai_request_id[80]{};
     metalio_app_widget_t station_label = 0;
     metalio_app_widget_t spectrum[METALIO_APP_MEDIA_SPECTRUM_BANDS]{};
     metalio_app_widget_t upper_divider = 0;
@@ -436,7 +442,34 @@ void Refresh(void*) {
             SetStationText("接收失败", s_app.theme.danger);
         }
     }
+    if (s_app.ai_tune_pending && s_app.api->ai_complete_action != nullptr) {
+        metalio_app_ai_action_result_t result{};
+        if (s_app.media_state == METALIO_APP_MEDIA_ERROR) {
+            result.status = METALIO_APP_AI_ACTION_FAILED;
+            result.error = "radio stream failed to start";
+        } else if (s_app.media_state == METALIO_APP_MEDIA_PLAYING &&
+                   s_app.playing_station == s_app.requested_station) {
+            result.status = METALIO_APP_AI_ACTION_SUCCEEDED;
+            result.result_json = "{\"playing\":true}";
+        } else {
+            UpdateSpectrum();
+            return;
+        }
+        s_app.api->ai_complete_action(s_app.launch->host_context, s_app.ai_request_id,
+                                      &result);
+        s_app.ai_tune_pending = false;
+        s_app.ai_request_id[0] = '\0';
+    }
     UpdateSpectrum();
+}
+
+int AiCancel(void*, const char* request_id) {
+    if (request_id != nullptr && s_app.ai_tune_pending &&
+        TextEquals(request_id, s_app.ai_request_id)) {
+        s_app.ai_tune_pending = false;
+        s_app.ai_request_id[0] = '\0';
+    }
+    return 0;
 }
 
 void ApplyTheme(const metalio_app_theme_t& theme) {
@@ -506,6 +539,47 @@ void BuildConfigurationError() {
     }
 }
 
+int AiAction(void*, const metalio_app_ai_action_request_t* request,
+             metalio_app_ai_action_result_t* result) {
+    if (request == nullptr || result == nullptr || request->id == nullptr || request->arguments_json == nullptr) return -1;
+    if (std::strcmp(request->id, "com.metalio.radio.tune") == 0) {
+        uint32_t index = 0;
+        if (!metalio_app_json_get_uint(request->arguments_json, "index", &index) ||
+            index >= s_app.station_count) { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "station index is required and must be in range"; return 0; }
+        if (s_app.ai_tune_pending || request->request_id == nullptr ||
+            TextLength(request->request_id) == 0 ||
+            TextLength(request->request_id) >= sizeof(s_app.ai_request_id)) { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "radio already has a pending tune"; return 0; }
+        std::memcpy(s_app.ai_request_id, request->request_id, TextLength(request->request_id) + 1);
+        s_app.ai_tune_pending = true;
+        QueueTune(index);
+        result->status = METALIO_APP_AI_ACTION_PENDING;
+        return 0;
+    } else if (std::strcmp(request->id, "com.metalio.radio.playback") == 0) {
+        char state[16]{};
+        if (!metalio_app_json_get_string(request->arguments_json, "state", state,
+                                         sizeof(state))) { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "playback state is required"; return 0; }
+        if (std::strcmp(state, "pause") == 0 && s_app.api->media_pause(s_app.launch->host_context) == 0) {}
+        else if (std::strcmp(state, "resume") == 0 && s_app.api->media_resume(s_app.launch->host_context) == 0) {}
+        else if (std::strcmp(state, "play") == 0) {
+            if (s_app.ai_tune_pending || request->request_id == nullptr ||
+                TextLength(request->request_id) == 0 ||
+                TextLength(request->request_id) >= sizeof(s_app.ai_request_id)) {
+                result->status = METALIO_APP_AI_ACTION_FAILED;
+                result->error = "radio already has a pending tune";
+                return 0;
+            }
+            std::memcpy(s_app.ai_request_id, request->request_id,
+                        TextLength(request->request_id) + 1);
+            s_app.ai_tune_pending = true;
+            QueueTune(s_app.requested_station);
+            result->status = METALIO_APP_AI_ACTION_PENDING;
+            return 0;
+        }
+        else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "invalid playback state"; return 0; }
+    } else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "unknown radio action"; return 0; }
+    result->status = METALIO_APP_AI_ACTION_SUCCEEDED; result->result_json = "{\"ok\":true}"; return 0;
+}
+
 }  // namespace
 
 extern "C" int main(int argc, char* argv[]) {
@@ -534,5 +608,10 @@ extern "C" int main(int argc, char* argv[]) {
         s_app.api->set_interval(s_app.launch->host_context, 40, Refresh, nullptr) != 0) return 5;
     ApplyTheme(s_app.theme);
     QueueTune(selected);
+    if ((s_app.capabilities & METALIO_APP_CAP_AI_ACTIONS) != 0 &&
+        s_app.api->struct_size >= offsetof(metalio_app_host_api_t, ai_unregister_actions) + sizeof(s_app.api->ai_unregister_actions)) {
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.radio.tune", AiAction, AiCancel, nullptr, nullptr);
+        s_app.api->ai_register_action(s_app.launch->host_context, "com.metalio.radio.playback", AiAction, AiCancel, nullptr, nullptr);
+    }
     return 0;
 }

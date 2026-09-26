@@ -40,7 +40,7 @@ bluetooth::Module s_bluetooth_module;
 
 constexpr lv_opa_t kAccentSoftOpacity = 0x1F;
 
-enum class Panel : uint8_t { General, Ai, Network, Bluetooth, Language, About };
+using Panel = SettingsPanel;
 enum class EmbeddedView : uint8_t { None, Network, Bluetooth };
 
 struct UiState {
@@ -483,5 +483,17 @@ lv_obj_t* SettingsView::Create() {
     BuildGeneralPanel();
     return shell.root;
 }
+
+bool SettingsView::OpenPanel(SettingsPanel panel) {
+    if (Navigation::Get().current() != ScreenId::Settings || s_ui.root == nullptr) {
+        Navigation::Get().Open(ScreenId::Settings);
+    }
+    if (s_ui.root == nullptr || s_ui.panel == nullptr) return false;
+    BuildPanel(panel);
+    return true;
+}
+
+network::Module& SettingsView::NetworkModule() { return s_network_module; }
+bluetooth::Module& SettingsView::BluetoothModule() { return s_bluetooth_module; }
 
 }  // namespace agent_ui

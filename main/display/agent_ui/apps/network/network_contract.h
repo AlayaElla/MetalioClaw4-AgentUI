@@ -130,6 +130,7 @@ enum class EventType {
 
 struct Event {
     EventType type = EventType::Status;
+    bool success = true;
     bool cellular = false;
     bool external_slot = false;
     bool scanning = false;

@@ -67,11 +67,42 @@ def make_elf(undefined_symbols: list[str]) -> bytes:
 
 
 class PackageAppElfValidationTests(unittest.TestCase):
+    def test_ai_actions_are_validated_before_packaging(self) -> None:
+        package_app.validate_manifest({
+            "id": "com.metalio.demo",
+            "entry": "elf/esp32p4.elf", "target": "esp32p4", "api_version": 1,
+            "ai_actions": [{
+                "id": "com.metalio.demo.next", "title": "Next", "description": "Advance",
+                "args_schema": {"type": "object", "additionalProperties": False},
+            }],
+        })
+
+    def test_ai_action_rejects_unsafe_ids_and_non_object_schema(self) -> None:
+        manifest = {
+            "entry": "elf/esp32p4.elf", "target": "esp32p4", "api_version": 1,
+            "ai_actions": [{
+                "id": "unsafe action", "title": "Bad", "description": "Bad",
+                "args_schema": {"type": "array"},
+            }],
+        }
+        with self.assertRaisesRegex(ValueError, "ai_action"):
+            package_app.validate_manifest(manifest)
+
     def test_allowlist_is_loaded_from_shared_definition(self) -> None:
         imports = package_app.load_host_imports()
         self.assertIn("log", imports)
         self.assertIn("snprintf", imports)
         self.assertIn("__adddf3", imports)
+
+    def test_action_cannot_claim_system_or_another_app_namespace(self) -> None:
+        manifest = {
+            "id": "com.metalio.demo", "entry": "elf/esp32p4.elf",
+            "target": "esp32p4", "api_version": 1,
+            "ai_actions": [{"id": "system.phone", "title": "Phone",
+                            "description": "Call", "args_schema": {"type": "object"}}],
+        }
+        with self.assertRaisesRegex(ValueError, "namespace"):
+            package_app.validate_manifest(manifest)
 
     def test_allowed_undefined_symbols_pass(self) -> None:
         package_app.validate_elf(make_elf(["log", "snprintf", "__adddf3"]))

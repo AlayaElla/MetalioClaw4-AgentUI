@@ -35,6 +35,7 @@
 #include "agent_ui/core/idle_power.h"
 #include "agent_ui/core/navigation.h"
 #include "agent_ui/core/status_bar.h"
+#include "agent_ui/apps/external_apps/external_media_service.h"
 #include "esp_lv_adapter.h"
 #endif
 
@@ -94,6 +95,9 @@ std::string SpecialInteractionPrompt(SpecialInteraction interaction, int detail)
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
+    ai::Availability::Get().SetObserver([this](const auto&) {
+        Schedule([this]() { ApplyAiAvailability(); });
+    });
 
 #if CONFIG_USE_DEVICE_AEC && CONFIG_USE_SERVER_AEC
 #error "CONFIG_USE_DEVICE_AEC and CONFIG_USE_SERVER_AEC cannot be enabled at the same time"
@@ -120,6 +124,7 @@ Application::Application() {
 }
 
 Application::~Application() {
+    ai::Availability::Get().SetObserver({});
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
@@ -364,8 +369,82 @@ void Application::DismissAlert() {
     }
 }
 
+void Application::ScheduleAi(std::function<void()> callback) {
+    const auto snapshot = ai::Availability::Get().GetSnapshot();
+    if (!snapshot.available) return;
+    Schedule([snapshot, callback = std::move(callback)]() {
+        const auto current = ai::Availability::Get().GetSnapshot();
+        if (current.available && current.generation == snapshot.generation) callback();
+    });
+}
+
+void Application::SetAiWakeEnabled(bool enabled) {
+    ai_wake_enabled_.store(enabled);
+    Settings(ai_settings::kNamespace, true).SetInt("wake", enabled ? 1 : 0);
+    Schedule([this]() {
+        if (audio_initialized_) audio_service_.SetAiWakeEnabled(ai_wake_enabled_.load());
+    });
+}
+
+void Application::ApplyAiAvailability() {
+    if (!audio_initialized_) return;
+    if (!ai::Availability::Get().IsAvailable()) {
+        CancelSpecialInteraction();
+        if (device_state_ == kDeviceStateSpeaking) AbortSpeaking(kAbortReasonNone);
+        if (device_state_ == kDeviceStateListening && protocol_) protocol_->SendStopListening();
+        if (protocol_ && protocol_->IsAudioChannelOpened()) protocol_->CloseAudioChannel();
+        if (device_state_ == kDeviceStateListening || device_state_ == kDeviceStateSpeaking ||
+            device_state_ == kDeviceStateConnecting) {
+            // The old device-AI audio may be discarded only before a new owner
+            // starts using the decoder. Codex capture is scheduled after this.
+            if (!codex_voice_capture_active_ && !codex_realtime_playback_active_)
+                audio_service_.ResetDecoder();
+            SetDeviceState(kDeviceStateIdle);
+        }
+    }
+    audio_service_.RefreshInputRoutes();
+    if (ai::Availability::Get().IsAvailable() && device_state_ == kDeviceStateIdle &&
+        !low_power_standby_.load()) {
+        audio_service_.EnableWakeWordDetection(true);
+#ifdef HAVE_LVGL
+        if (!assistant_listen_pending_.load()) {
+            if (auto* media = agent_ui::external_apps::MediaService::Existing())
+                media->EndAssistantInteraction(true);
+        }
+#endif
+    }
+}
+
+bool Application::DeferAssistantForMedia(std::function<void()> continuation) {
+    if (assistant_listen_pending_.load()) return true;
+#ifdef HAVE_LVGL
+    if (device_state_ == kDeviceStateIdle) {
+        auto* media = agent_ui::external_apps::MediaService::Existing();
+        if (media && !media->HasAssistantInteraction()) {
+            if (assistant_listen_pending_.exchange(true)) return true;
+            const uint64_t generation = ai::Availability::Get().Generation();
+            if (media->BeginAssistantInteraction([this, generation, continuation](bool ready) {
+                    Schedule([this, generation, ready, continuation]() {
+                        assistant_listen_pending_.store(false);
+                        if (ready && ai::Availability::Get().IsAvailable() &&
+                            ai::Availability::Get().Generation() == generation &&
+                            !low_power_standby_.load()) continuation();
+                        else if (ai::Availability::Get().IsAvailable()) {
+                            if (auto* active = agent_ui::external_apps::MediaService::Existing())
+                                active->EndAssistantInteraction(true);
+                        }
+                    });
+                })) return true;
+            assistant_listen_pending_.store(false);
+        }
+    }
+#endif
+    return false;
+}
+
 void Application::ToggleChatState() {
-    if (low_power_standby_.load()) return;
+    if (!ai::Availability::Get().IsAvailable() || low_power_standby_.load()) return;
+    if (DeferAssistantForMedia([this] { ToggleChatState(); })) return;
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -385,11 +464,12 @@ void Application::ToggleChatState() {
     }
 
     if (device_state_ == kDeviceStateIdle) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             if (low_power_standby_.load()) return;
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
+                    SetDeviceState(kDeviceStateIdle);
                     return;
                 }
             }
@@ -397,18 +477,20 @@ void Application::ToggleChatState() {
             SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
     } else if (device_state_ == kDeviceStateListening) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             protocol_->CloseAudioChannel();
         });
     }
 }
 
 void Application::StartListening() {
+    if (!ai::Availability::Get().IsAvailable()) return;
     if (low_power_standby_.load()) return;
+    if (DeferAssistantForMedia([this] { StartListening(); })) return;
     if (device_state_ == kDeviceStateActivating) {
         SetDeviceState(kDeviceStateIdle);
         return;
@@ -424,11 +506,12 @@ void Application::StartListening() {
     }
     
     if (device_state_ == kDeviceStateIdle) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             if (low_power_standby_.load()) return;
             if (!protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
+                    SetDeviceState(kDeviceStateIdle);
                     return;
                 }
             }
@@ -436,7 +519,7 @@ void Application::StartListening() {
             SetListeningMode(kListeningModeManualStop);
         });
     } else if (device_state_ == kDeviceStateSpeaking) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             AbortSpeaking(kAbortReasonNone);
             SetListeningMode(kListeningModeManualStop);
         });
@@ -460,7 +543,7 @@ void Application::StopListening() {
         return;
     }
 
-    Schedule([this]() {
+    ScheduleAi([this]() {
         if (device_state_ == kDeviceStateListening) {
             protocol_->SendStopListening();
             SetDeviceState(kDeviceStateIdle);
@@ -472,6 +555,9 @@ void Application::StartCodexVoiceCapture() {
     Schedule([this]() {
         if (low_power_standby_.load()) return;
         if (codex_voice_capture_active_ || codex_voice_start_pending_) return;
+        if (!ai::Availability::Get().IsAvailable()) return;
+        codex_voice_ai_block_ = ai::Availability::Get().AcquireBlock("codex.dictation", "Codex 听写");
+        ApplyAiAvailability();
         codex_voice_stop_pending_ = false;
         codex_voice_stop_wait_started_at_us_ = 0;
         codex_voice_restore_wake_word_ = false;
@@ -552,6 +638,8 @@ void Application::StopCodexVoiceCapture(std::function<void()> on_stopped) {
         if (codex_voice_start_pending_) {
             codex_voice_start_pending_ = false;
             codex_voice_start_wait_started_at_us_ = 0;
+            ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
+            codex_voice_ai_block_ = 0;
             if (on_stopped) on_stopped();
             return;
         }
@@ -570,6 +658,8 @@ void Application::StopCodexVoiceCapture(std::function<void()> on_stopped) {
 
 void Application::TryStartCodexVoiceCapture() {
     if (low_power_standby_.load()) {
+        ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
+        codex_voice_ai_block_ = 0;
         codex_voice_start_pending_ = false;
         codex_voice_start_wait_started_at_us_ = 0;
         return;
@@ -583,6 +673,8 @@ void Application::TryStartCodexVoiceCapture() {
         if (now_us - codex_voice_start_wait_started_at_us_ >=
             kCodexVoiceQueueDrainTimeoutUs) {
             ESP_LOGW(TAG, "Codex voice start timed out waiting for prior audio; closing voice transport");
+            ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
+            codex_voice_ai_block_ = 0;
             codex_voice_start_pending_ = false;
             codex_voice_start_wait_started_at_us_ = 0;
             // The UI has already accepted the recording status.  Closing the
@@ -622,6 +714,8 @@ void Application::TryFinishCodexVoiceCapture() {
     }
 
     codex_voice_capture_active_ = false;
+    ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
+    codex_voice_ai_block_ = 0;
     codex_voice_stop_pending_ = false;
     codex_voice_stop_wait_started_at_us_ = 0;
     if (codex_voice_restore_wake_word_ &&
@@ -636,6 +730,8 @@ void Application::TryFinishCodexVoiceCapture() {
 }
 
 void Application::FailCodexVoiceCaptureTransport() {
+    ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
+    codex_voice_ai_block_ = 0;
     // Capture starts only after the shared send queue drains, so while active
     // every queued network frame belongs to this Codex capture.
     codex_voice_start_pending_ = false;
@@ -681,6 +777,9 @@ void Application::Start() {
     /* Setup the audio service */
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
+    ai_wake_enabled_.store(Settings(ai_settings::kNamespace, false).GetInt("wake", 1) != 0);
+    audio_service_.SetAiWakeEnabled(ai_wake_enabled_.load());
+    audio_initialized_ = true;
     audio_service_.Start();
 
     AudioServiceCallbacks callbacks;
@@ -787,7 +886,7 @@ void Application::Start() {
         });
     });
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (device_state_ == kDeviceStateSpeaking) {
+        if (ai::Availability::Get().IsAvailable() && device_state_ == kDeviceStateSpeaking) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -814,23 +913,31 @@ void Application::Start() {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (!cJSON_IsString(type)) return;
+        if (!ai::Availability::Get().IsAvailable() && strcmp(type->valuestring, "mcp") != 0) return;
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (!cJSON_IsString(state)) return;
             if (strcmp(state->valuestring, "start") == 0) {
-                Schedule([this]() {
+                ScheduleAi([this]() {
                     aborted_ = false;
                     if (device_state_ == kDeviceStateIdle || device_state_ == kDeviceStateListening) {
                         SetDeviceState(kDeviceStateSpeaking);
                     }
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
+                ScheduleAi([this]() {
                     if (device_state_ == kDeviceStateSpeaking) {
                         if (active_special_interaction_ != SpecialInteraction::None ||
                             listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
+#ifdef HAVE_LVGL
+                            auto* media = agent_ui::external_apps::MediaService::Existing();
+                            if (media && media->HasAssistantInteraction()) {
+                                if (protocol_ && protocol_->IsAudioChannelOpened()) protocol_->CloseAudioChannel();
+                                SetDeviceState(kDeviceStateIdle);
+                            } else
+#endif
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
@@ -845,7 +952,7 @@ void Application::Start() {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([this, display, message = std::string(text->valuestring)]() {
+                    ScheduleAi([this, display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("assistant", message.c_str());
                     });
                 }
@@ -859,7 +966,7 @@ void Application::Start() {
                     ESP_LOGD(TAG, "Special interaction STT echo hidden");
                 } else {
                     ESP_LOGI(TAG, ">> %s", text->valuestring);
-                    Schedule([this, display, message = std::string(text->valuestring)]() {
+                    ScheduleAi([this, display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("user", message.c_str());
                     });
                 }
@@ -867,7 +974,7 @@ void Application::Start() {
         } else if (strcmp(type->valuestring, "llm") == 0) {
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(emotion)) {
-                Schedule([this, display, emotion_str = std::string(emotion->valuestring)]() {
+                ScheduleAi([this, display, emotion_str = std::string(emotion->valuestring)]() {
                     display->SetEmotion(emotion_str.c_str());
                 });
             }
@@ -891,7 +998,7 @@ void Application::Start() {
                 ESP_LOGI(TAG, "System command: %s", command->valuestring);
                 if (strcmp(command->valuestring, "reboot") == 0) {
                     // Honor an explicit server-requested reboot.
-                    Schedule([this]() {
+                    ScheduleAi([this]() {
                         Reboot();
                     });
                 } else {
@@ -903,7 +1010,7 @@ void Application::Start() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
-                Schedule([this,
+                ScheduleAi([this,
                           status_text = std::string(status->valuestring),
                           message_text = std::string(message->valuestring),
                           emotion_text = std::string(emotion->valuestring)]() {
@@ -920,7 +1027,7 @@ void Application::Start() {
                 char* printed = cJSON_PrintUnformatted(payload);
                 std::string payload_str = printed != nullptr ? printed : "";
                 cJSON_free(printed);
-                Schedule([this, display, payload_str = std::move(payload_str)]() {
+                ScheduleAi([this, display, payload_str = std::move(payload_str)]() {
                     display->SetChatMessage("system", payload_str.c_str());
                 });
             } else {
@@ -987,7 +1094,8 @@ void Application::MainEventLoop() {
                         FailCodexVoiceCaptureTransport();
                         break;
                     }
-                } else if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
+                } else if (ai::Availability::Get().IsAvailable() && protocol_ &&
+                           !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
@@ -1050,7 +1158,7 @@ void Application::MainEventLoop() {
 }
 
 void Application::OnWakeWordDetected() {
-    if (low_power_standby_.load() || !protocol_) {
+    if (!ai::Availability::Get().IsAvailable() || !ai_wake_enabled_.load() || low_power_standby_.load() || !protocol_) {
         return;
     }
 
@@ -1102,6 +1210,8 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 void Application::SetDeviceState(DeviceState state) {
+    if (!ai::Availability::Get().IsAvailable() &&
+        (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking)) return;
     if (low_power_standby_.load() &&
         (state == kDeviceStateConnecting || state == kDeviceStateListening ||
          state == kDeviceStateSpeaking)) {
@@ -1129,8 +1239,15 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            audio_service_.EnableVoiceProcessing(false);
+            if (!codex_voice_capture_active_ && !codex_voice_start_pending_)
+                audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(!low_power_standby_.load());
+#ifdef HAVE_LVGL
+            if (ai::Availability::Get().IsAvailable() && !low_power_standby_.load()) {
+                if (auto* media = agent_ui::external_apps::MediaService::Existing())
+                    media->EndAssistantInteraction(true);
+            }
+#endif
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1187,7 +1304,7 @@ void Application::Reboot() {
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
-    if (low_power_standby_.load() || !protocol_) {
+    if (!ai::Availability::Get().IsAvailable() || low_power_standby_.load() || !protocol_) {
         return;
     }
 
@@ -1217,11 +1334,11 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
 #endif
     } else if (device_state_ == kDeviceStateSpeaking) {
-        Schedule([this]() {
+        ScheduleAi([this]() {
             AbortSpeaking(kAbortReasonNone);
         });
     } else if (device_state_ == kDeviceStateListening) {   
-        Schedule([this]() {
+        ScheduleAi([this]() {
             if (protocol_) {
                 protocol_->CloseAudioChannel();
             }
@@ -1306,7 +1423,8 @@ bool Application::PlayCodexNotificationSound(const std::string_view& sound,
 }
 
 void Application::TriggerSpecialInteraction(SpecialInteraction interaction, int detail) {
-    Schedule([this, interaction, detail]() {
+    if (!ai::Availability::Get().IsAvailable()) return;
+    ScheduleAi([this, interaction, detail]() {
         if (low_power_standby_.load()) {
             ESP_LOGD(TAG, "Special interaction skipped during standby");
             return;
@@ -1360,7 +1478,7 @@ void Application::TriggerSpecialInteraction(SpecialInteraction interaction, int 
                                     std::unique_ptr<AudioStreamPacket> prime_packet) mutable {
             auto prime_packet_holder =
                 std::make_shared<std::unique_ptr<AudioStreamPacket>>(std::move(prime_packet));
-            Schedule([this, interaction, prompt = std::move(prompt),
+            ScheduleAi([this, interaction, prompt = std::move(prompt),
                       prime_packet_holder]() mutable {
                 if (active_special_interaction_ != interaction || protocol_ == nullptr) {
                     return;
@@ -1452,6 +1570,7 @@ void Application::SetLowPowerStandby(bool enabled) {
     if (previous == enabled) return;
 
     if (enabled) {
+        standby_ai_block_ = ai::Availability::Get().AcquireBlock("system.standby", "待机");
         standby_restore_wake_word_ = audio_service_.IsWakeWordRunning();
         audio_service_.EnableAudioTesting(false);
         audio_service_.EnableVoiceProcessing(false);
@@ -1489,6 +1608,8 @@ void Application::SetLowPowerStandby(bool enabled) {
         return;
     }
 
+    ai::Availability::Get().ReleaseBlock(standby_ai_block_);
+    standby_ai_block_ = 0;
     if (standby_restore_wake_word_ && device_state_ == kDeviceStateIdle) {
         audio_service_.EnableWakeWordDetection(true);
     }

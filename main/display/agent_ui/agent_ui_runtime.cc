@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include <esp_random.h>
@@ -12,6 +13,7 @@
 
 #include "agent_ui/apps/boot/boot_view.h"
 #include "agent_ui/apps/camera/camera_module.h"
+#include "agent_ui/apps/camera/camera_ai_provider.h"
 #include "agent_ui/apps/codex/codex_view.h"
 #include "agent_ui/apps/display_debug/display_debug_view.h"
 #include "agent_ui/apps/external_apps/external_apps_view.h"
@@ -20,6 +22,8 @@
 #include "agent_ui/apps/phone/phone_view.h"
 #include "agent_ui/apps/settings/settings_view.h"
 #include "agent_ui/apps/home/home_renderer.h"
+#include "ai/ai_availability.h"
+#include "ai/system_connectivity.h"
 #include "agent_ui/core/app_mcp_tools.h"
 #include "agent_ui/core/idle_power.h"
 #include "agent_ui/core/navigation.h"
@@ -76,8 +80,12 @@ void Runtime::Initialize() {
                                external_apps::HostView::Create);
     Navigation::Get().Register(ScreenId::DisplayDebug, DisplayDebugView::Create);
     UiDispatcher::Init();
+    ai::system_connectivity::RegisterProviders();
     RegisterAppMcpTools();
+    camera::RegisterAiProvider();
     StatusBar::Get().Initialize();
+    StatusBar::Get().SetAgentTapCallback(
+        []() { Runtime::Get().ToggleListeningFromStatusBar(); });
     StatusBar::Get().SetAgentState(home_module_.state().agent_state);
     StatusBar::Get().SetVisible(false);
     Keyboard::Get().Initialize();
@@ -164,6 +172,16 @@ void Runtime::SetAgentState(AgentState state) {
 
 void Runtime::SetConversationMessage(const char* role, const char* content) {
     home_module_.HandleEvent(home::Event::ConversationMessage(role, content));
+    if (role != nullptr && std::strcmp(role, "assistant") == 0) {
+        StatusBar::Get().SetReplyCaption(content);
+    } else if (role != nullptr && std::strcmp(role, "user") == 0) {
+        StatusBar::Get().SetReplyCaption(nullptr);
+    }
+}
+
+void Runtime::ToggleListeningFromStatusBar() {
+    if (!ai::Availability::Get().IsAvailable()) return;
+    home_module_.HandleIntent(home::Intent::ToggleListening());
 }
 
 void Runtime::SetSystemStatus(const char* status) {

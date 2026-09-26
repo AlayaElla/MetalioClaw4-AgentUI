@@ -142,12 +142,18 @@ uint8_t* AllocateExpressionBuffer(size_t size) {
 
 ExpressionPlayer::ExpressionPlayer(
     lv_obj_t* parent,
-    audio::ListeningAudioFeatureStore* listening_audio_features)
-    : parent_(parent), listening_audio_features_(listening_audio_features) {
+    audio::ListeningAudioFeatureStore* listening_audio_features,
+    int surface_width, int surface_height, int pixel_step)
+    : parent_(parent),
+      surface_width_(std::max(1, surface_width)),
+      surface_height_(std::max(1, surface_height)),
+      pixel_step_(std::clamp(pixel_step, 1, kGridSize)),
+      listening_audio_features_(listening_audio_features) {
     if (parent_ == nullptr || !lv_obj_is_valid(parent_)) return;
 
     lv_obj_add_event_cb(parent_, ParentDeletedCallback, LV_EVENT_DELETE, this);
-    constexpr size_t kBufferSize = kExpressionWidth * kExpressionHeight;
+    const size_t kBufferSize = static_cast<size_t>(surface_width_) *
+                               static_cast<size_t>(surface_height_);
     a8_buffer_ = AllocateExpressionBuffer(kBufferSize);
     if (a8_buffer_ == nullptr) {
         ESP_LOGE(kTag, "Unable to allocate %u-byte A8 expression buffer",
@@ -172,15 +178,15 @@ ExpressionPlayer::ExpressionPlayer(
 
     image_descriptor_.header.magic = LV_IMAGE_HEADER_MAGIC;
     image_descriptor_.header.cf = LV_COLOR_FORMAT_A8;
-    image_descriptor_.header.w = kExpressionWidth;
-    image_descriptor_.header.h = kExpressionHeight;
-    image_descriptor_.header.stride = kExpressionWidth;
+    image_descriptor_.header.w = surface_width_;
+    image_descriptor_.header.h = surface_height_;
+    image_descriptor_.header.stride = surface_width_;
     image_descriptor_.data_size = kBufferSize;
     image_descriptor_.data = a8_buffer_;
 
     image_ = lv_image_create(parent_);
     lv_image_set_src(image_, &image_descriptor_);
-    lv_obj_set_size(image_, kExpressionWidth, kExpressionHeight);
+    lv_obj_set_size(image_, surface_width_, surface_height_);
     lv_image_set_inner_align(image_, LV_IMAGE_ALIGN_CENTER);
     lv_obj_center(image_);
     lv_obj_remove_flag(image_, LV_OBJ_FLAG_CLICKABLE);
@@ -943,19 +949,18 @@ void ExpressionPlayer::InvalidateCellBounds(int min_x, int min_y, int max_x,
     if (image_ == nullptr || min_x > max_x || min_y > max_y) return;
     lv_area_t image_area;
     lv_obj_get_coords(image_, &image_area);
+    const auto map_x = [this](int value) {
+        return value * surface_width_ / kGridSize;
+    };
+    const auto map_y = [this](int value) {
+        return (kLogicalOriginY + value * kLogicalExtent / kGridSize) *
+               surface_height_ / kExpressionHeight;
+    };
     lv_area_t dirty = {
-        .x1 = image_area.x1 + min_x * kLogicalExtent / kGridSize,
-        .y1 = image_area.y1 + std::max(
-            0, kLogicalOriginY + min_y * kLogicalExtent / kGridSize),
-        .x2 = image_area.x1 +
-              std::min(kExpressionWidth,
-                       (max_x + 1) * kLogicalExtent / kGridSize) -
-              1,
-        .y2 = image_area.y1 +
-              std::min(kExpressionHeight,
-                       kLogicalOriginY +
-                           (max_y + 1) * kLogicalExtent / kGridSize) -
-              1,
+        .x1 = image_area.x1 + std::max(0, map_x(min_x)),
+        .y1 = image_area.y1 + std::max(0, map_y(min_y)),
+        .x2 = image_area.x1 + std::min(surface_width_, map_x(max_x + 1)) - 1,
+        .y2 = image_area.y1 + std::min(surface_height_, map_y(max_y + 1)) - 1,
     };
     if (dirty.x1 > dirty.x2 || dirty.y1 > dirty.y2) return;
     lv_obj_invalidate_area(image_, &dirty);
@@ -970,14 +975,30 @@ void ExpressionPlayer::RedrawChangedCells() {
     int right_min_y = kGridSize;
     int right_max_x = -1;
     int right_max_y = -1;
-    constexpr int kDotSize = 7;
+    const int render_step = pixel_step_;
+    const int render_grid = (kGridSize + render_step - 1) / render_step;
+    const int dot_size = render_step == 1 ? 7 : 6;
+    const auto group_active = [this, render_step](
+                                  const std::array<uint8_t, kMaskBytes>& mask,
+                                  int group_x, int group_y) {
+        const int start_x = group_x * render_step;
+        const int start_y = group_y * render_step;
+        for (int y = start_y; y < std::min(kGridSize, start_y + render_step); ++y) {
+            for (int x = start_x; x < std::min(kGridSize, start_x + render_step); ++x) {
+                if (GetMaskBit(mask, y * kGridSize + x)) return true;
+            }
+        }
+        return false;
+    };
 
-    for (int y = 0; y < kGridSize; ++y) {
-        for (int x = 0; x < kGridSize; ++x) {
-            const int index = y * kGridSize + x;
-            const bool previous = GetMaskBit(previous_mask_, index);
-            const bool next = GetMaskBit(next_mask_, index);
+    for (int group_y = 0; group_y < render_grid; ++group_y) {
+        for (int group_x = 0; group_x < render_grid; ++group_x) {
+            const bool previous = group_active(previous_mask_, group_x, group_y);
+            const bool next = group_active(next_mask_, group_x, group_y);
             if (previous == next) continue;
+
+            const int x = group_x * render_step;
+            const int y = group_y * render_step;
 
             int& min_x = x < kGridSize / 2 ? left_min_x : right_min_x;
             int& min_y = x < kGridSize / 2 ? left_min_y : right_min_y;
@@ -988,28 +1009,35 @@ void ExpressionPlayer::RedrawChangedCells() {
             max_x = std::max(max_x, x);
             max_y = std::max(max_y, y);
 
-            const int raw_x1 = x * kLogicalExtent / kGridSize;
+            const int raw_x1 = x * surface_width_ / kGridSize;
             const int raw_y1 =
-                kLogicalOriginY + y * kLogicalExtent / kGridSize;
-            const int raw_x2 = (x + 1) * kLogicalExtent / kGridSize;
+                (kLogicalOriginY + y * kLogicalExtent / kGridSize) *
+                surface_height_ / kExpressionHeight;
+            const int raw_x2 = std::min(
+                surface_width_, (x + render_step) * surface_width_ / kGridSize);
             const int raw_y2 =
-                kLogicalOriginY + (y + 1) * kLogicalExtent / kGridSize;
+                (kLogicalOriginY + std::min(kGridSize, y + render_step) *
+                                        kLogicalExtent / kGridSize) *
+                surface_height_ / kExpressionHeight;
             const int pixel_x1 = std::max(0, raw_x1);
             const int pixel_y1 = std::max(0, raw_y1);
-            const int pixel_x2 = std::min(kExpressionWidth, raw_x2);
-            const int pixel_y2 = std::min(kExpressionHeight, raw_y2);
+            const int pixel_x2 = std::min(surface_width_, raw_x2);
+            const int pixel_y2 = std::min(surface_height_, raw_y2);
             for (int py = pixel_y1; py < pixel_y2; ++py) {
-                std::memset(a8_buffer_ + py * kExpressionWidth + pixel_x1, 0,
+                std::memset(a8_buffer_ + py * surface_width_ + pixel_x1, 0,
                             static_cast<size_t>(pixel_x2 - pixel_x1));
             }
             if (!next) continue;
 
-            const int dot_x1 = std::max(0, (raw_x1 + raw_x2 - kDotSize) / 2);
-            const int dot_y1 = std::max(0, (raw_y1 + raw_y2 - kDotSize) / 2);
-            const int dot_x2 = std::min(kExpressionWidth, dot_x1 + kDotSize);
-            const int dot_y2 = std::min(kExpressionHeight, dot_y1 + kDotSize);
+            const int bounded_dot_size = std::min(
+                dot_size, std::max(1, std::min(pixel_x2 - pixel_x1,
+                                                 pixel_y2 - pixel_y1)));
+            const int dot_x1 = std::max(0, (raw_x1 + raw_x2 - bounded_dot_size) / 2);
+            const int dot_y1 = std::max(0, (raw_y1 + raw_y2 - bounded_dot_size) / 2);
+            const int dot_x2 = std::min(surface_width_, dot_x1 + bounded_dot_size);
+            const int dot_y2 = std::min(surface_height_, dot_y1 + bounded_dot_size);
             for (int py = dot_y1; py < dot_y2; ++py) {
-                std::memset(a8_buffer_ + py * kExpressionWidth + dot_x1,
+                std::memset(a8_buffer_ + py * surface_width_ + dot_x1,
                             LV_OPA_COVER,
                             static_cast<size_t>(dot_x2 - dot_x1));
             }
@@ -1019,8 +1047,12 @@ void ExpressionPlayer::RedrawChangedCells() {
     if (left_max_x >= 0 || right_max_x >= 0) {
         lv_image_cache_drop(&image_descriptor_);
     }
-    InvalidateCellBounds(left_min_x, left_min_y, left_max_x, left_max_y);
-    InvalidateCellBounds(right_min_x, right_min_y, right_max_x, right_max_y);
+    InvalidateCellBounds(left_min_x, left_min_y,
+                         left_max_x + render_step - 1,
+                         left_max_y + render_step - 1);
+    InvalidateCellBounds(right_min_x, right_min_y,
+                         right_max_x + render_step - 1,
+                         right_max_y + render_step - 1);
     previous_mask_.swap(next_mask_);
 }
 

@@ -1,4 +1,8 @@
 #include "metalio_app_api.h"
+#include "metalio_app_json.h"
+
+#include <stddef.h>
+#include <string.h>
 
 #define IMAGE_COUNT 5U
 
@@ -34,11 +38,11 @@ static const char* const kImageCounters[IMAGE_COUNT] = {
     "1 / 5", "2 / 5", "3 / 5", "4 / 5", "5 / 5",
 };
 
-static void show_image(uint32_t index) {
-    if (index >= IMAGE_COUNT || s_viewer.api == 0) return;
+static int show_image(uint32_t index) {
+    if (index >= IMAGE_COUNT || s_viewer.api == 0) return 0;
     if (s_viewer.api->set_image_source(s_viewer.host_context, s_viewer.image,
                                        kImagePaths[index]) != 0) {
-        return;
+        return 0;
     }
     s_viewer.index = index;
     s_viewer.api->set_label_text(s_viewer.host_context, s_viewer.title,
@@ -49,6 +53,7 @@ static void show_image(uint32_t index) {
         s_viewer.api->play_haptic(s_viewer.host_context,
                                   METALIO_APP_HAPTIC_TICK);
     }
+    return 1;
 }
 
 static void show_previous(void* app_context) {
@@ -72,6 +77,27 @@ static void on_swipe(void* app_context,
     } else if (direction == METALIO_APP_SWIPE_RIGHT) {
         show_previous(app_context);
     }
+}
+
+static int ai_navigate(void* context, const metalio_app_ai_action_request_t* request,
+                       metalio_app_ai_action_result_t* result) {
+    image_viewer_state_t* viewer = (image_viewer_state_t*)context;
+    if (viewer == 0 || request == 0 || result == 0 || request->arguments_json == 0) return -1;
+    uint32_t index = viewer->index;
+    char direction[16];
+    if (metalio_app_json_get_string(request->arguments_json, "direction", direction,
+                                    sizeof(direction))) {
+        if (strcmp(direction, "next") == 0) index = (index + 1U) % IMAGE_COUNT;
+        else if (strcmp(direction, "previous") == 0) index = index == 0 ? IMAGE_COUNT - 1U : index - 1U;
+        else { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "invalid image direction"; return 0; }
+    } else if (!metalio_app_json_get_uint(request->arguments_json, "index", &index) ||
+               index >= IMAGE_COUNT) {
+        result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "image index is required and must be in range"; return 0;
+    }
+    if (!show_image(index)) { result->status = METALIO_APP_AI_ACTION_FAILED; result->error = "image could not be displayed"; return 0; }
+    result->status = METALIO_APP_AI_ACTION_SUCCEEDED;
+    result->result_json = index == 0 ? "{\"index\":0}" : index == 1 ? "{\"index\":1}" : index == 2 ? "{\"index\":2}" : index == 3 ? "{\"index\":3}" : "{\"index\":4}";
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -125,5 +151,11 @@ int main(int argc, char* argv[]) {
     api->add_action(launch->host_context, METALIO_APP_ACTION_NEXT, "下一张",
                     show_next, &s_viewer);
     api->set_swipe_handler(launch->host_context, on_swipe, &s_viewer);
+    if ((api->get_capabilities(launch->host_context) & METALIO_APP_CAP_AI_ACTIONS) != 0 &&
+        api->struct_size >= offsetof(metalio_app_host_api_t, ai_unregister_actions) +
+                            sizeof(api->ai_unregister_actions)) {
+        api->ai_register_action(launch->host_context, "com.metalio.image-viewer.navigate",
+                                ai_navigate, 0, 0, &s_viewer);
+    }
     return 0;
 }
