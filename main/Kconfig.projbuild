@@ -321,4 +321,33 @@ menu "Camera Configuration"
     endif
 endmenu
 
+choice
+    prompt "Agent UI CJK font source"
+    default AGENT_UI_FONTS_BUILTIN
+    help
+        The six CJK UI faces (regular/bold 18/28/56 px, ~6.4 MB of glyph
+        bitmaps) can be loaded at runtime from the SD card instead of being
+        compiled into the firmware.
+
+    config AGENT_UI_FONTS_BUILTIN
+        bool "Compiled into firmware"
+    config AGENT_UI_FONTS_SD
+        bool "SD card with built-in fallback"
+        select AGENT_UI_FONTS_ON_SD
+        help
+            Load /sdcard/metalio/fonts/font_agent_*.bin at startup (generated
+            by scripts/generate_agent_fonts.py --bin); fall back to the
+            compiled-in faces when a file is missing.
+    config AGENT_UI_FONTS_SD_ONLY
+        bool "SD card only (saves ~6.4 MB flash)"
+        select AGENT_UI_FONTS_ON_SD
+        help
+            Exclude the compiled-in CJK faces from the build. The SD card must
+            contain the font .bin files or the UI renders placeholders.
+endchoice
+
+config AGENT_UI_FONTS_ON_SD
+    bool
+    default n
+
 endmenu

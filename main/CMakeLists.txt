@@ -17,12 +17,6 @@ set(SOURCES "audio/audio_codec.cc"
             "display/oled_display.cc"
             "display/lv_adapter_display.cc"
             "display/touch_feed.cc"
-            "display/font/font_agent_small_18.c"
-            "display/font/font_agent_medium_28.c"
-            "display/font/font_agent_large_56.c"
-            "display/font/font_agent_small_bold_18.c"
-            "display/font/font_agent_medium_bold_28.c"
-            "display/font/font_agent_large_bold_56.c"
             "display/font/font_agent_emoji_18.c"
             "display/font/font_agent_emoji_28.c"
             "display/font/font_agent_emoji_56.c"
@@ -54,6 +48,17 @@ set(SOURCES "audio/audio_codec.cc"
             "assets.cc"
             "main.cc"
             )
+
+if (NOT CONFIG_AGENT_UI_FONTS_SD_ONLY)
+    list(APPEND SOURCES
+        "display/font/font_agent_small_18.c"
+        "display/font/font_agent_medium_28.c"
+        "display/font/font_agent_large_56.c"
+        "display/font/font_agent_small_bold_18.c"
+        "display/font/font_agent_medium_bold_28.c"
+        "display/font/font_agent_large_bold_56.c"
+    )
+endif()
 
 set(INCLUDE_DIRS
     "."

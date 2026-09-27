@@ -5,6 +5,13 @@ The browser demo uses Microsoft YaHei UI first, so the firmware uses the same
 regular and bold faces. Regular UI text and all bold body faces include GB2312.
 Shared Segoe UI Emoji fallback fonts provide monochrome emoji at each UI text
 size without duplicating the same glyph bitmaps for both weights.
+
+Run ``--bin`` to also produce the SD-card font pack: the six CJK faces are
+written as lv_font_conv .bin files into assets/fonts/.
+Copy them to the card at /sdcard/metalio/fonts/ (same filenames); when
+CONFIG_AGENT_UI_FONTS_SD[_ONLY] is enabled, fonts.cc loads them at startup
+instead of (or in place of) the compiled-in arrays. Color emoji faces cannot
+be exported as .bin and always stay compiled in.
 """
 
 from __future__ import annotations
@@ -86,6 +93,7 @@ def run_converter(
     compress: bool = False,
     use_color_info: bool = False,
     include_ascii: bool = True,
+    binary: bool = False,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -95,16 +103,14 @@ def run_converter(
         "--font",
         str(font),
         "--format",
-        "lvgl",
-        "--lv-include",
-        "lvgl.h",
-        "--lv-font-name",
-        name,
+        "bin" if binary else "lvgl",
         "--bpp",
         str(bpp),
         "--size",
         str(size),
     ]
+    if not binary:
+        command.extend(("--lv-include", "lvgl.h", "--lv-font-name", name))
     if include_ascii:
         command.extend(("--range", ASCII_RANGE))
     command.extend((
@@ -113,12 +119,14 @@ def run_converter(
         "--no-kerning",
         "--output", str(output),
     ))
-    if not compress:
+    # lv_font_conv cannot compress .bin output; the SD card has space.
+    if not compress or binary:
         command.append("--no-compress")
     if use_color_info:
         command.append("--use-color-info")
     subprocess.run(command, check=True)
-    output.write_bytes(output.read_bytes().rstrip(b"\r\n") + b"\n")
+    if not binary:
+        output.write_bytes(output.read_bytes().rstrip(b"\r\n") + b"\n")
     print(f"{name}: {output.stat().st_size} bytes")
 
 
@@ -150,7 +158,16 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=project_dir / "main" / "display" / "font",
+        default=None,
+        help="output directory; defaults to main/display/font, or "
+             "assets/fonts with --bin",
+    )
+    parser.add_argument(
+        "--bin",
+        action="store_true",
+        help="emit lv_font_conv .bin fonts for the SD card "
+             "(/sdcard/metalio/fonts/<name>.bin) instead of C arrays; only "
+             "the six CJK faces are supported, color emoji cannot be .bin",
     )
     parser.add_argument(
         "--only",
@@ -160,6 +177,12 @@ def main() -> None:
         help="generate only the named font; may be specified more than once",
     )
     args = parser.parse_args()
+    if args.output is None:
+        args.output = (
+            project_dir / "assets" / "fonts"
+            if args.bin
+            else project_dir / "main" / "display" / "font"
+        )
     for font in (args.regular_font, args.bold_font, args.emoji_font):
         if not font.is_file():
             parser.error(f"font not found: {font}")
@@ -198,6 +221,16 @@ def main() -> None:
         except ValueError as error:
             parser.error(str(error))
 
+        # The six faces resolved from the SD card at runtime (fonts.cc).
+        # Emoji/home/montserrat faces stay compiled in.
+        sd_font_names = {
+            "font_agent_small_18",
+            "font_agent_medium_28",
+            "font_agent_large_56",
+            "font_agent_small_bold_18",
+            "font_agent_medium_bold_28",
+            "font_agent_large_bold_56",
+        }
         outputs = (
             (regular_font, "font_agent_small_18", 18, body_symbols, 2, True, False),
             (regular_font, "font_agent_medium_28", 28, body_symbols, 2, True, False),
@@ -220,17 +253,21 @@ def main() -> None:
             (args.emoji_font, "font_agent_emoji_28", 28, emoji_symbols, 3, True, True),
             (args.emoji_font, "font_agent_emoji_56", 56, emoji_symbols, 2, True, True),
         )
-        output_names = {output[1] for output in outputs}
+        selected_outputs = tuple(
+            output for output in outputs
+            if not args.bin or output[1] in sd_font_names
+        )
+        output_names = {output[1] for output in selected_outputs}
         unknown_names = set(args.only) - output_names
         if unknown_names:
             parser.error(f"unknown font name(s): {', '.join(sorted(unknown_names))}")
-        for font, name, size, symbols, bpp, compress, use_color_info in outputs:
+        for font, name, size, symbols, bpp, compress, use_color_info in selected_outputs:
             if args.only and name not in args.only:
                 continue
             run_converter(
                 converter,
                 font,
-                args.output / f"{name}.c",
+                args.output / f"{name}{'.bin' if args.bin else '.c'}",
                 name,
                 size,
                 symbols,
@@ -238,6 +275,7 @@ def main() -> None:
                 compress,
                 use_color_info,
                 not use_color_info,
+                args.bin,
             )
 
 

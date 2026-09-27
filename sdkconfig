@@ -1337,11 +1337,19 @@ CONFIG_XIAOZHI_ENABLE_HARDWARE_JPEG_ENCODER=y
 # CONFIG_XIAOZHI_ENABLE_CAMERA_ENDIANNESS_SWAP is not set
 # CONFIG_XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE is not set
 # end of Camera Configuration
+
+# default:
+CONFIG_AGENT_UI_FONTS_BUILTIN=y
+# default:
+# CONFIG_AGENT_UI_FONTS_SD is not set
+# default:
+# CONFIG_AGENT_UI_FONTS_SD_ONLY is not set
 # end of Xiaozhi Assistant
 
 #
 # ESP Speech Recognition
 #
+# default:
 CONFIG_MODEL_IN_FLASH=y
 # CONFIG_MODEL_IN_SDCARD is not set
 CONFIG_AFE_INTERFACE_V1=y
