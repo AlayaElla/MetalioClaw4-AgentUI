@@ -1,0 +1,16 @@
+# ESP-IDF Partition Table — 32MB, single large factory app (AgentUI) + kept data partitions
+# Same head layout as 32m_dual.csv (nvsfactory/nvs/otadata/phy_init/model), so existing
+# NVS settings and the wake-word model restore byte-for-byte. ota_1 is dropped to grow
+# the app slot to 15M; emote/system/storage are blank on-device and shrink only nominally.
+# Name,         Type, SubType,      Offset,       Size, Flags
+nvsfactory,     data, nvs,         0xA000,        200K,
+nvs,            data, nvs,                ,       840K,
+otadata,        data, ota,                ,         8K,
+phy_init,       data, phy,                ,         4K,
+model,          data, spiffs,             ,       956K,
+factory,        app,  factory,     0x200000,        15M,
+resources,      data, spiffs,             ,         4M,
+factory_test,   data, spiffs,             ,       600K,
+emote,          data, spiffs,             ,         4M,
+system,         data, fat,                ,         1M,
+storage,        data, fat,                ,         5M,
