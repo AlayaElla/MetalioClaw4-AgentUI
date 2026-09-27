@@ -128,14 +128,29 @@ that manifest from `display/agent_ui/sources.cmake`.
 ## Source and validation rules
 
 - Edit `expression-spec.json` in the Demo and regenerate
-  `components/expression_spec.generated.h` when expression timing changes.
+  `components/expression_spec.generated.h` when expression timing changes. The
+  imported IrisOLED poses (`Connecting`, `Wink*`, `Look*`, `Surprised`, `Bored`,
+  `Sad`, `Angry`, `Scared`, `Despair`, `Furious`, `Alert`) and the status glyphs
+  (`Battery`, `BatteryFull`, `BatteryLow`, `Warning`) exist only here, so a
+  regeneration has to carry them over.
+- `components/expression_art.generated.h` is traced from the IrisOLED eye and
+  special-expression bitmaps by `scripts/trace_expression_art.py`; rerun that
+  script after changing the source art, and check the result with
+  `scripts/check_expression_raster.py`, which mirrors the player's rasteriser on
+  the host (`--all` for the poses, `--glyphs` for the status graphics).
+- A status glyph replaces the eye pair for the length of its action. The player
+  unions its polygons and only applies even-odd within one polygon, so the
+  generator bridges every hole loop into its shell; a nested loop emitted as a
+  separate shape fills solid instead of carving a hole. `Battery`,
+  `BatteryFull` and `BatteryLow` are announced from `Renderer::UpdateBattery`
+  on the level edges, and `Warning` holds while `AgentState::Error` is set.
 - Keep hardware, storage, networking, and protocol work in app integrations or
   the existing device services; shared components must remain device-agnostic.
 - Run a source-manifest check before a firmware build:
 
-  ```powershell
+  ```bash
   # Run from the repository root.
-  node --test design\agent\tests\agent-ui-architecture.test.cjs
+  node --test design/agent/tests/agent-ui-architecture.test.cjs
   ```
 
 - Camera UI changes also require the architecture and visual-parity contracts:

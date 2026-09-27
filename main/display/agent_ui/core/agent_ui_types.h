@@ -23,6 +23,9 @@ enum class AgentState : uint8_t {
     Connecting,
     Listening,
     Answering,
+    // The device has faulted: the face shows the warning graphic until the
+    // state moves elsewhere.
+    Error,
 };
 
 enum class NetworkMode : uint8_t {

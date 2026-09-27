@@ -15,13 +15,22 @@
 namespace agent_ui {
 namespace {
 
+namespace art = expression_art;
+namespace geo = expression_geometry;
+
 constexpr char kTag[] = "ExpressionPlayer";
 constexpr uint32_t kIdleDelayMinMs = 6000;
 constexpr uint32_t kIdleDelayRangeMs = 8001;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kTau = kPi * 2.0f;
-constexpr float kGridScale = 56.0f / 48.0f;
-constexpr float kPivot = 24.0f * kGridScale;
+// The artwork lives in a 48-unit square that spans the full expression width, so
+// (24, 24) is the canvas centre and one logical unit is surface width / 48
+// pixels. FaceTransform carries that mapping per player, which is what lets the
+// status bar show a reduced copy of the same face.
+constexpr float kLogicalCenter = art::kLogicalCenter;
+constexpr int kSubSamples = 4;
+constexpr int kCoveragePerSubSample = 256 / kSubSamples;
+constexpr int kMaxCrossings = 2 * geo::kMaxShapePoints;
 constexpr uint32_t kListeningAudioFrameMs = 60;
 constexpr uint32_t kListeningActivityAttackMs = 90;
 constexpr uint32_t kListeningActivityReleaseMs = 420;
@@ -55,76 +64,252 @@ float SegmentPulse(float seconds, float start, float end) {
     return wave * wave;
 }
 
-float EllipseField(float x, float y, float center_x, float center_y,
-                   float radius_x, float radius_y) {
-    const float dx = (x - center_x) / std::max(radius_x, 0.01f);
-    const float dy = (y - center_y) / std::max(radius_y, 0.01f);
-    return std::sqrt(dx * dx + dy * dy) - 1.0f;
+// Every pulse scales an eye about its own centre, so growing the eyes eats the
+// gap between them and the pair reads as one slab. Pushing the eyes apart
+// instead keeps the breathing motion while the silhouette stays two eyes.
+void KeepEyesApart(geo::EyeState& left, geo::EyeState& right) {
+    constexpr float kMinGap = art::kMinEyeGap;
+    if (left.eye == nullptr || right.eye == nullptr) return;
+    const float left_inner = left.eye->center[0] + left.shift_x +
+                             left.eye->radius[0] * left.scale_x;
+    const float right_inner = right.eye->center[0] + right.shift_x -
+                              right.eye->radius[0] * right.scale_x;
+    const float deficit = kMinGap - (right_inner - left_inner);
+    if (deficit <= 0.0f) return;
+    left.shift_x -= deficit * 0.5f;
+    right.shift_x += deficit * 0.5f;
 }
 
-float HappyArcField(float x, float y, float center_x, float center_y,
-                    float width, float thickness) {
-    const float dx = x - center_x;
-    const float curve_y = center_y - 2.2f * kGridScale +
-                          (dx * dx) / (width * 2.8f);
-    return std::max(std::abs(dx) / width - 1.0f,
-                    std::abs(y - curve_y) / thickness - 1.0f);
+// Maps the 48-unit artwork square onto one player's A8 surface and carries that
+// surface's extent, so every emitter below clips and scales to the size the
+// player was built at instead of a fixed panel.
+struct FaceTransform {
+    float cosine = 1.0f;
+    float sine = 0.0f;
+    float translate_x = 0.0f;
+    float translate_y = 0.0f;
+    float energy_scale = 1.0f;
+    float energy_sag = 0.0f;
+    float unit_scale = 1.0f;
+    float center_x = 0.0f;
+    float center_y = 0.0f;
+    int width = 1;
+    int height = 1;
+
+    void Apply(float ux, float uy, float* px, float* py) const {
+        const float dx = (ux - kLogicalCenter) * unit_scale;
+        const float dy =
+            ((uy - kLogicalCenter) * energy_scale + energy_sag) * unit_scale;
+        *px = center_x + dx * cosine - dy * sine + translate_x * unit_scale;
+        *py = center_y + dx * sine + dy * cosine + translate_y * unit_scale;
+    }
+};
+
+// --------------------------------------------------------------- shape emitting
+
+void AddPolygon(geo::ShapeSet& set, const FaceTransform& transform,
+                const float* xs, const float* ys, int count) {
+    if (set.count >= geo::kMaxShapes || count < 3 ||
+        count > geo::kMaxShapePoints) {
+        return;
+    }
+    geo::Shape& shape = set.shapes[set.count++];
+    shape.count = static_cast<int16_t>(count);
+    int left = transform.width;
+    int right = -1;
+    int top = transform.height;
+    int bottom = -1;
+    for (int i = 0; i < count; ++i) {
+        shape.x[i] = xs[i];
+        shape.y[i] = ys[i];
+        left = std::min(left, static_cast<int>(std::floor(xs[i])));
+        right = std::max(right, static_cast<int>(std::ceil(xs[i])));
+        top = std::min(top, static_cast<int>(std::floor(ys[i])));
+        bottom = std::max(bottom, static_cast<int>(std::ceil(ys[i])));
+    }
+    shape.top = static_cast<int16_t>(std::max(0, top));
+    shape.bottom =
+        static_cast<int16_t>(std::min(transform.height - 1, bottom));
+    set.left = static_cast<int16_t>(std::min<int>(set.left,
+                                                  std::max(0, left)));
+    set.right = static_cast<int16_t>(
+        std::max<int>(set.right, std::min(transform.width - 1, right)));
+    set.top = static_cast<int16_t>(std::min<int>(set.top, shape.top));
+    set.bottom = static_cast<int16_t>(
+        std::max<int>(set.bottom, std::min(transform.height - 1, bottom)));
 }
 
-bool InsideEllipse(float x, float y, float center_x, float center_y,
-                   float radius_x, float radius_y) {
-    return EllipseField(x, y, center_x, center_y, radius_x, radius_y) <= 0.0f;
+void AddEye(geo::ShapeSet& set, const geo::EyeState& eye,
+            const FaceTransform& transform) {
+    const art::Eye* source = eye.eye;
+    if (source == nullptr) return;
+    const int count = std::min<int>(source->count, geo::kMaxShapePoints);
+    float xs[geo::kMaxShapePoints];
+    float ys[geo::kMaxShapePoints];
+    for (int i = 0; i < count; ++i) {
+        const float ux = source->center[0] +
+                         (source->points[i][0] - source->center[0]) *
+                             eye.scale_x + eye.shift_x;
+        const float uy = source->center[1] +
+                         (source->points[i][1] - source->center[1]) *
+                             eye.scale_y + eye.shift_y;
+        transform.Apply(ux, uy, &xs[i], &ys[i]);
+    }
+    AddPolygon(set, transform, xs, ys, count);
 }
 
-bool InsideSleepArc(float x, float y, float center_x, float center_y,
-                    float width, float thickness) {
-    const float dx = x - center_x;
-    if (std::abs(dx) > width) return false;
-    const float curve_y = center_y + 2.2f * kGridScale -
-                          (dx * dx) / (width * 2.8f);
-    return std::abs(y - curve_y) <= thickness;
+// The parametric helpers below only back the event symbols (bolt, sparkle,
+// orbiting rings); every eye is a traced silhouette.
+void AddEllipse(geo::ShapeSet& set, const FaceTransform& transform, float ux,
+                float uy, float radius_x, float radius_y) {
+    const int segments = static_cast<int>(Clamp(
+        kTau * std::max(radius_x, radius_y) * transform.unit_scale / 16.0f,
+        8.0f,
+        static_cast<float>(geo::kMaxShapePoints)));
+    float xs[geo::kMaxShapePoints];
+    float ys[geo::kMaxShapePoints];
+    for (int i = 0; i < segments; ++i) {
+        const float angle = static_cast<float>(i) / segments * kTau;
+        transform.Apply(ux + std::cos(angle) * radius_x,
+                        uy + std::sin(angle) * radius_y, &xs[i], &ys[i]);
+    }
+    AddPolygon(set, transform, xs, ys, segments);
 }
 
-bool InsideRing(float x, float y, float center_x, float center_y,
-                float radius_x, float radius_y, float thickness) {
-    return InsideEllipse(x, y, center_x, center_y, radius_x, radius_y) &&
-           !InsideEllipse(x, y, center_x, center_y,
-                          std::max(0.1f, radius_x - thickness),
-                          std::max(0.1f, radius_y - thickness));
+void AddRing(geo::ShapeSet& set, const FaceTransform& transform, float ux,
+             float uy, float radius, float thickness) {
+    // Both arcs run the full circle inclusive, so the seam where the outline
+    // folds back on itself has zero width and the annulus reads as unbroken.
+    constexpr int kSteps = geo::kMaxShapePoints / 2 - 1;
+    float xs[geo::kMaxShapePoints];
+    float ys[geo::kMaxShapePoints];
+    const float inner = std::max(0.4f, radius - thickness);
+    for (int i = 0; i <= kSteps; ++i) {
+        const float angle = static_cast<float>(i) / kSteps * kTau;
+        transform.Apply(ux + std::cos(angle) * radius,
+                        uy + std::sin(angle) * radius, &xs[i], &ys[i]);
+    }
+    for (int i = 0; i <= kSteps; ++i) {
+        const float angle = static_cast<float>(kSteps - i) / kSteps * kTau;
+        transform.Apply(ux + std::cos(angle) * inner,
+                        uy + std::sin(angle) * inner,
+                        &xs[kSteps + 1 + i], &ys[kSteps + 1 + i]);
+    }
+    AddPolygon(set, transform, xs, ys, kSteps * 2 + 2);
 }
 
-bool InsideDiamond(float x, float y, float center_x, float center_y,
-                   float radius) {
-    return std::abs(x - center_x) + std::abs(y - center_y) <= radius;
-}
-
-bool InsideLineSegment(float x, float y, float x1, float y1, float x2,
-                       float y2, float thickness) {
+void AddSegment(geo::ShapeSet& set, const FaceTransform& transform, float ux1,
+                float uy1, float ux2, float uy2, float thickness) {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+    transform.Apply(ux1, uy1, &x1, &y1);
+    transform.Apply(ux2, uy2, &x2, &y2);
     const float dx = x2 - x1;
     const float dy = y2 - y1;
-    const float length_squared = dx * dx + dy * dy;
-    const float amount = length_squared <= 0.0f
-                             ? 0.0f
-                             : Clamp(((x - x1) * dx + (y - y1) * dy) /
-                                         length_squared,
-                                     0.0f, 1.0f);
-    const float nearest_x = x1 + dx * amount;
-    const float nearest_y = y1 + dy * amount;
-    const float distance_x = x - nearest_x;
-    const float distance_y = y - nearest_y;
-    return std::sqrt(distance_x * distance_x + distance_y * distance_y) <=
-           thickness;
+    const float length = std::max(0.01f, std::sqrt(dx * dx + dy * dy));
+    const float half = thickness * transform.unit_scale;
+    const float nx = -dy / length * half;
+    const float ny = dx / length * half;
+    const float xs[4] = {x1 + nx, x2 + nx, x2 - nx, x1 - nx};
+    const float ys[4] = {y1 + ny, y2 + ny, y2 - ny, y1 - ny};
+    AddPolygon(set, transform, xs, ys, 4);
 }
 
-bool GetMaskBit(const std::array<uint8_t, (56 * 56 + 7) / 8>& mask,
-                int index) {
-    return (mask[static_cast<size_t>(index) >> 3] &
-            (1U << (index & 7))) != 0;
+void AddDiamond(geo::ShapeSet& set, const FaceTransform& transform, float ux,
+                float uy, float radius) {
+    float xs[4];
+    float ys[4];
+    transform.Apply(ux, uy - radius, &xs[0], &ys[0]);
+    transform.Apply(ux + radius, uy, &xs[1], &ys[1]);
+    transform.Apply(ux, uy + radius, &xs[2], &ys[2]);
+    transform.Apply(ux - radius, uy, &xs[3], &ys[3]);
+    AddPolygon(set, transform, xs, ys, 4);
 }
 
-void SetMaskBit(std::array<uint8_t, (56 * 56 + 7) / 8>& mask, int index) {
-    mask[static_cast<size_t>(index) >> 3] |=
-        static_cast<uint8_t>(1U << (index & 7));
+// A status glyph is a stack of traced loops whose holes have already been bridged
+// into their shell by the generator, so the set-wide union is what paints them.
+void AddGlyph(geo::ShapeSet& set, const art::Glyph& glyph,
+              const FaceTransform& transform, float scale) {
+    float xs[geo::kMaxShapePoints];
+    float ys[geo::kMaxShapePoints];
+    const int shapes = std::min<int>(glyph.shape_count, geo::kMaxShapes);
+    for (int s = 0; s < shapes; ++s) {
+        const art::GlyphShape& span = glyph.shapes[s];
+        const int count = std::min<int>(span.count, geo::kMaxShapePoints);
+        for (int i = 0; i < count; ++i) {
+            const art::GlyphPoint& point = art::kGlyphPoints[span.first + i];
+            transform.Apply(
+                glyph.center[0] + (point.x - glyph.center[0]) * scale,
+                glyph.center[1] + (point.y - glyph.center[1]) * scale,
+                &xs[i], &ys[i]);
+        }
+        AddPolygon(set, transform, xs, ys, count);
+    }
+}
+
+// ---------------------------------------------------------------- anti-aliased fill
+
+void AddSpanCoverage(int16_t* coverage, int x0, int x1, float start,
+                     float end) {
+    const float a = std::max(start, static_cast<float>(x0));
+    const float b = std::min(end, static_cast<float>(x1));
+    if (b <= a) return;
+    const int first = static_cast<int>(std::floor(a));
+    const int last = static_cast<int>(std::ceil(b)) - 1;
+    if (first > last) return;
+    if (first == last) {
+        coverage[first - x0] +=
+            static_cast<int16_t>((b - a) * kCoveragePerSubSample + 0.5f);
+        return;
+    }
+    coverage[first - x0] += static_cast<int16_t>(
+        (static_cast<float>(first + 1) - a) * kCoveragePerSubSample + 0.5f);
+    for (int x = first + 1; x < last; ++x) coverage[x - x0] += kCoveragePerSubSample;
+    coverage[last - x0] += static_cast<int16_t>(
+        (b - static_cast<float>(last)) * kCoveragePerSubSample + 0.5f);
+}
+
+void AccumulateRow(const geo::ShapeSet& set, int y, int x0, int x1,
+                   int16_t* coverage) {
+    float crossings[kMaxCrossings];
+    for (int s = 0; s < set.count; ++s) {
+        const geo::Shape& shape = set.shapes[s];
+        if (y < shape.top || y > shape.bottom) continue;
+        const int count = shape.count;
+        for (int sub = 0; sub < kSubSamples; ++sub) {
+            const float scan_y =
+                static_cast<float>(y) + (sub + 0.5f) / kSubSamples;
+            int found = 0;
+            for (int i = 0; i < count; ++i) {
+                const int previous = i == 0 ? count - 1 : i - 1;
+                const float ya = shape.y[previous];
+                const float yb = shape.y[i];
+                if ((ya <= scan_y && yb > scan_y) ||
+                    (yb <= scan_y && ya > scan_y)) {
+                    if (found >= kMaxCrossings) break;
+                    crossings[found++] =
+                        shape.x[previous] +
+                        (scan_y - ya) *
+                            (shape.x[i] - shape.x[previous]) / (yb - ya);
+                }
+            }
+            for (int i = 1; i < found; ++i) {
+                const float value = crossings[i];
+                int j = i - 1;
+                while (j >= 0 && crossings[j] > value) {
+                    crossings[j + 1] = crossings[j];
+                    --j;
+                }
+                crossings[j + 1] = value;
+            }
+            for (int i = 0; i + 1 < found; i += 2) {
+                AddSpanCoverage(coverage, x0, x1, crossings[i],
+                                crossings[i + 1]);
+            }
+        }
+    }
 }
 
 uint8_t* AllocateExpressionBuffer(size_t size) {
@@ -138,8 +323,305 @@ uint8_t* AllocateExpressionBuffer(size_t size) {
     return buffer;
 }
 
+// Which imported silhouette each action wears. The player only ever animates the
+// pose it picks here, so adding an expression is a matter of drawing it in the
+// source bitmap sheet and re-running scripts/trace_expression_art.py.
+art::Name ArtForAction(expression_spec::Action action) {
+    using Action = expression_spec::Action;
+    using Name = art::Name;
+    switch (action) {
+        case Action::Smile:
+        case Action::Answering:
+        case Action::Complete:
+            return Name::happy;
+        case Action::Laugh:
+            return Name::excited;
+        case Action::Yawn:
+            return Name::sleepy;
+        case Action::Listening:
+            return Name::focused;
+        case Action::Sleep:
+            return Name::blink;
+        case Action::Dizzy:
+            return Name::disoriented;
+        case Action::Connecting:
+            return Name::worried;
+        case Action::WinkLeft:
+            return Name::wink_left;
+        case Action::WinkRight:
+            return Name::wink_right;
+        case Action::BlinkUp:
+            return Name::blink_up;
+        case Action::BlinkDown:
+            return Name::blink_down;
+        case Action::LookLeft:
+            return Name::look_left;
+        case Action::LookRight:
+            return Name::look_right;
+        case Action::LookUp:
+            return Name::look_up;
+        case Action::LookDown:
+            return Name::look_down;
+        case Action::Surprised:
+            return Name::surprised;
+        case Action::Bored:
+            return Name::bored;
+        case Action::Sad:
+            return Name::sad;
+        case Action::Angry:
+            return Name::angry;
+        case Action::Scared:
+            return Name::scared;
+        case Action::Despair:
+            return Name::despair;
+        case Action::Furious:
+            return Name::furious;
+        case Action::Alert:
+            return Name::alert;
+        case Action::Idle:
+        case Action::Charging:
+        case Action::Wake:
+        default:
+            return Name::normal;
+    }
+}
+
+// Which whole-panel graphic an action shows. Everything outside this table keeps
+// its eye pair. The imported signal, mode and logo graphics have no trigger of
+// their own yet, so they stay in the generated tables without an action here.
+const art::Glyph* GlyphForAction(expression_spec::Action action) {
+    using Action = expression_spec::Action;
+    switch (action) {
+        case Action::Battery:
+            return &art::kGlyphs[art::battery];
+        case Action::BatteryFull:
+            return &art::kGlyphs[art::battery_full];
+        case Action::BatteryLow:
+            return &art::kGlyphs[art::battery_low];
+        case Action::Warning:
+            return &art::kGlyphs[art::warning];
+        default:
+            return nullptr;
+    }
+}
+
 }  // namespace
 
+// ------------------------------------------------------------------------ emit
+
+void ExpressionPlayer::Emit(const FrameGeometry& frame,
+                            geo::ShapeSet& shapes) const {
+    shapes = geo::ShapeSet{};
+    FaceTransform transform;
+    const float radians = frame.rotation * kPi / 180.0f;
+    transform.cosine = std::cos(radians);
+    transform.sine = std::sin(radians);
+    transform.translate_x = frame.translate_x;
+    transform.translate_y = frame.translate_y;
+    transform.energy_scale = frame.energy_vertical_scale;
+    transform.energy_sag = frame.energy_sag;
+    transform.unit_scale = static_cast<float>(surface_width_) /
+                           static_cast<float>(art::kLogicalExtent);
+    transform.center_x = static_cast<float>(surface_width_) * 0.5f;
+    transform.center_y = static_cast<float>(surface_height_) * 0.5f;
+    transform.width = surface_width_;
+    transform.height = surface_height_;
+
+    if (frame.glyph != nullptr) {
+        AddGlyph(shapes, *frame.glyph, transform, frame.glyph_scale);
+        return;
+    }
+
+    AddEye(shapes, frame.left, transform);
+    AddEye(shapes, frame.right, transform);
+
+    const float amount = frame.symbol_amount;
+    switch (frame.action) {
+        case Action::Charging: {
+            // The imported eyes reach out to ~42 units, so the bolt lives in the
+            // corner above them instead of overlapping the pair like the old
+            // ellipse artwork did.
+            const float thickness = 0.45f + SmoothStep(amount) * 0.15f;
+            AddSegment(shapes, transform, 46.0f, 9.0f, 43.2f, 13.2f, thickness);
+            AddSegment(shapes, transform, 43.2f, 13.2f, 46.8f, 13.8f, thickness);
+            AddSegment(shapes, transform, 46.8f, 13.8f, 43.6f, 18.0f, thickness);
+            break;
+        }
+        case Action::Complete: {
+            const float sparkle = SegmentPulse(frame.seconds, 0.2f, 1.3f);
+            AddDiamond(shapes, transform, 44.0f, 12.5f, 3.0f * sparkle);
+            break;
+        }
+        case Action::Sleep: {
+            // The Zzz marker: a Z that climbs away from the right eye and grows
+            // while it rises, so the loop reads as one Z drifting off rather
+            // than a dot repeating in place.
+            const float z_phase =
+                std::fmod(std::max(frame.seconds, 0.0f), 2.4f) / 2.4f;
+            const float half_width = 1.1f + z_phase * 1.7f;
+            const float center_x = 41.5f + z_phase * 3.0f;
+            const float center_y = 18.0f - z_phase * 8.0f;
+            const float thickness = 0.4f + z_phase * 0.3f;
+            AddSegment(shapes, transform, center_x - half_width,
+                       center_y - half_width, center_x + half_width,
+                       center_y - half_width, thickness);
+            AddSegment(shapes, transform, center_x + half_width,
+                       center_y - half_width, center_x - half_width,
+                       center_y + half_width, thickness);
+            AddSegment(shapes, transform, center_x - half_width,
+                       center_y + half_width, center_x + half_width,
+                       center_y + half_width, thickness);
+            break;
+        }
+        case Action::Dizzy: {
+            const float orbit = frame.seconds * kTau * 1.8f;
+            const float left_x = frame.left.eye != nullptr
+                                     ? frame.left.eye->center[0] + frame.left.shift_x
+                                     : 0.0f;
+            const float left_y = frame.left.eye != nullptr
+                                     ? frame.left.eye->center[1] + frame.left.shift_y
+                                     : 0.0f;
+            const float right_x = frame.right.eye != nullptr
+                                      ? frame.right.eye->center[0] + frame.right.shift_x
+                                      : 0.0f;
+            const float right_y = frame.right.eye != nullptr
+                                      ? frame.right.eye->center[1] + frame.right.shift_y
+                                      : 0.0f;
+            // The ring has to clear the pose's own eye, which is not a fixed
+            // size once the silhouettes come from the imported sheet.
+            const float left_radius = frame.left.eye != nullptr
+                                          ? std::max(frame.left.eye->radius[0],
+                                                     frame.left.eye->radius[1]) *
+                                                frame.left.scale_x
+                                          : 5.5f;
+            const float right_radius = frame.right.eye != nullptr
+                                           ? std::max(frame.right.eye->radius[0],
+                                                      frame.right.eye->radius[1]) *
+                                                 frame.right.scale_x
+                                           : 5.5f;
+            if (frame.left.eye != nullptr) {
+                AddRing(shapes, transform, left_x, left_y,
+                        left_radius + 1.6f + amount * 1.3f, 1.2f);
+                AddEllipse(shapes, transform, left_x + std::cos(orbit) * 4.2f,
+                           left_y + std::sin(orbit) * 4.2f, 1.3f, 1.3f);
+            }
+            if (frame.right.eye != nullptr) {
+                AddRing(shapes, transform, right_x, right_y,
+                        right_radius + 1.6f + amount * 1.3f, 1.2f);
+                AddEllipse(shapes, transform, right_x - std::cos(orbit) * 4.2f,
+                           right_y - std::sin(orbit) * 4.2f, 1.3f, 1.3f);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// --------------------------------------------------------------------- rasterise
+
+void ExpressionPlayer::InvalidateRect(int left, int top, int right,
+                                      int bottom) {
+    if (image_ == nullptr || left > right || top > bottom) return;
+    lv_area_t image_area;
+    lv_obj_get_coords(image_, &image_area);
+    const lv_area_t dirty = {
+        .x1 = image_area.x1 + left,
+        .y1 = image_area.y1 + top,
+        .x2 = image_area.x1 + right,
+        .y2 = image_area.y1 + bottom,
+    };
+    lv_obj_invalidate_area(image_, &dirty);
+}
+
+void ExpressionPlayer::Render(float dissolve) {
+    if (a8_buffer_ == nullptr || row_coverage_ == nullptr ||
+        current_shapes_ == nullptr) {
+        return;
+    }
+    int x0 = surface_width_;
+    int y0 = surface_height_;
+    int x1 = -1;
+    int y1 = -1;
+    auto include = [&x0, &y0, &x1, &y1](int left, int top, int right,
+                                        int bottom) {
+        if (left > right || top > bottom) return;
+        x0 = std::min(x0, left);
+        y0 = std::min(y0, top);
+        x1 = std::max(x1, right);
+        y1 = std::max(y1, bottom);
+    };
+    include(current_shapes_->left, current_shapes_->top, current_shapes_->right,
+            current_shapes_->bottom);
+    const bool blending = dissolve < 1.0f && previous_shapes_ != nullptr;
+    if (blending) {
+        include(previous_shapes_->left, previous_shapes_->top,
+                previous_shapes_->right, previous_shapes_->bottom);
+    }
+    // Whatever the previous frame painted has to be re-tested so shapes fade out
+    // instead of burning into the surface.
+    include(last_left_, last_top_, last_right_, last_bottom_);
+    x0 = std::max(0, x0);
+    y0 = std::max(0, y0);
+    x1 = std::min(surface_width_ - 1, x1);
+    y1 = std::min(surface_height_ - 1, y1);
+    if (x0 > x1 || y0 > y1) return;
+
+    int16_t* incoming = row_coverage_;
+    int16_t* outgoing = row_coverage_ + surface_width_;
+    const int dissolve_cover =
+        static_cast<int>(Clamp(dissolve, 0.0f, 1.0f) * 255.0f);
+    int changed_left = surface_width_;
+    int changed_top = surface_height_;
+    int changed_right = -1;
+    int changed_bottom = -1;
+
+    for (int y = y0; y <= y1; ++y) {
+        std::memset(incoming + x0, 0,
+                    static_cast<size_t>(x1 - x0 + 1) * sizeof(int16_t));
+        if (blending) {
+            std::memset(outgoing + x0, 0,
+                        static_cast<size_t>(x1 - x0 + 1) * sizeof(int16_t));
+        }
+        AccumulateRow(*current_shapes_, y, x0, x1, incoming);
+        if (blending) {
+            AccumulateRow(*previous_shapes_, y, x0, x1, outgoing);
+        }
+        uint8_t* row = a8_buffer_ + static_cast<size_t>(y) * surface_width_;
+        for (int x = x0; x <= x1; ++x) {
+            int value = std::min<int>(incoming[x - x0], 255);
+            if (blending) {
+                const int previous = std::min<int>(outgoing[x - x0], 255);
+                value = (value * dissolve_cover +
+                         previous * (255 - dissolve_cover) + 127) / 255;
+            }
+            const uint8_t alpha = static_cast<uint8_t>(value);
+            if (row[x] == alpha) continue;
+            row[x] = alpha;
+            changed_left = std::min(changed_left, x);
+            changed_right = std::max(changed_right, x);
+            changed_top = std::min(changed_top, y);
+            changed_bottom = std::max(changed_bottom, y);
+        }
+    }
+
+    if (changed_right < changed_left) return;
+    // The scanned rect already covers the current shapes, the blended-out ones
+    // and everything earlier frames touched, so it is what the next frame has to
+    // re-test to let stale pixels fade away.
+    last_left_ = static_cast<int16_t>(x0);
+    last_top_ = static_cast<int16_t>(y0);
+    last_right_ = static_cast<int16_t>(x1);
+    last_bottom_ = static_cast<int16_t>(y1);
+    lv_image_cache_drop(&image_descriptor_);
+    InvalidateRect(changed_left, changed_top, changed_right, changed_bottom);
+}
+
+// --------------------------------------------------------------------- lifecycle
+
+// pixel_step is a leftover of the old dot-matrix player: the polygon
+// rasteriser samples continuously, so a reduced surface needs no coarser grid
+// and the argument only exists for its former callers.
 ExpressionPlayer::ExpressionPlayer(
     lv_obj_t* parent,
     audio::ListeningAudioFeatureStore* listening_audio_features,
@@ -147,32 +629,37 @@ ExpressionPlayer::ExpressionPlayer(
     : parent_(parent),
       surface_width_(std::max(1, surface_width)),
       surface_height_(std::max(1, surface_height)),
-      pixel_step_(std::clamp(pixel_step, 1, kGridSize)),
       listening_audio_features_(listening_audio_features) {
     if (parent_ == nullptr || !lv_obj_is_valid(parent_)) return;
 
     lv_obj_add_event_cb(parent_, ParentDeletedCallback, LV_EVENT_DELETE, this);
     const size_t kBufferSize = static_cast<size_t>(surface_width_) *
                                static_cast<size_t>(surface_height_);
+    const size_t kScratchSize = sizeof(geo::ShapeSet) * 2 +
+                                sizeof(int16_t) * surface_width_ * 2;
     a8_buffer_ = AllocateExpressionBuffer(kBufferSize);
     if (a8_buffer_ == nullptr) {
         ESP_LOGE(kTag, "Unable to allocate %u-byte A8 expression buffer",
                  static_cast<unsigned>(kBufferSize));
         return;
     }
-    auto* morph_memory = static_cast<uint8_t*>(heap_caps_malloc(
-        kFieldCells * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (morph_memory == nullptr) {
-        morph_memory = static_cast<uint8_t*>(heap_caps_malloc(
-            kFieldCells * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    auto* scratch = static_cast<uint8_t*>(
+        heap_caps_malloc(kScratchSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (scratch == nullptr) {
+        scratch = static_cast<uint8_t*>(heap_caps_malloc(
+            kScratchSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     }
-    if (morph_memory != nullptr) {
-        morph_from_field_ = reinterpret_cast<int8_t*>(morph_memory);
-        morph_to_field_ = reinterpret_cast<int8_t*>(morph_memory + kFieldCells);
-        distance_scratch_ = morph_memory + kFieldCells * 2;
-    } else {
-        ESP_LOGW(kTag, "Direct expression morph disabled: no field memory");
+    if (scratch == nullptr) {
+        ESP_LOGE(kTag, "Unable to allocate expression rasteriser scratch");
+        heap_caps_free(a8_buffer_);
+        a8_buffer_ = nullptr;
+        return;
     }
+    shape_sets_ = reinterpret_cast<geo::ShapeSet*>(scratch);
+    current_shapes_ = shape_sets_;
+    previous_shapes_ = shape_sets_ + 1;
+    row_coverage_ =
+        reinterpret_cast<int16_t*>(scratch + sizeof(geo::ShapeSet) * 2);
     std::memset(a8_buffer_, 0, kBufferSize);
     RegisterExpressionA8Buffer(a8_buffer_, kBufferSize);
 
@@ -191,8 +678,8 @@ ExpressionPlayer::ExpressionPlayer(
     lv_obj_center(image_);
     lv_obj_remove_flag(image_, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(image_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_image_recolor(
-        image_, lv_color_hex(Theme::Get().colors().accent), LV_PART_MAIN);
+    accent_ = Theme::Get().colors().accent;
+    lv_obj_set_style_image_recolor(image_, lv_color_hex(accent_), LV_PART_MAIN);
     lv_obj_set_style_image_recolor_opa(image_, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_update_layout(image_);
 
@@ -308,11 +795,17 @@ void ExpressionPlayer::PlayBootAnimation() {
     RequestAction(Action::Smile);
 }
 
-void ExpressionPlayer::PlayCharging() { RequestSpecial(Action::Charging); }
-
 void ExpressionPlayer::PlayComplete() { RequestSpecial(Action::Complete); }
 
 void ExpressionPlayer::PlayDizzy() { RequestSpecial(Action::Dizzy); }
+
+void ExpressionPlayer::PlayBattery() { RequestSpecial(Action::Battery); }
+
+void ExpressionPlayer::PlayBatteryFull() {
+    RequestSpecial(Action::BatteryFull);
+}
+
+void ExpressionPlayer::PlayBatteryLow() { RequestSpecial(Action::BatteryLow); }
 
 void ExpressionPlayer::HoldCharging() { HoldSpecial(Action::Charging); }
 
@@ -422,10 +915,15 @@ float ExpressionPlayer::CurrentActionSeconds(uint32_t now) const {
 ExpressionPlayer::Action ExpressionPlayer::StateAction() const {
     switch (state_) {
         case AgentState::Connecting:
+            return Action::Connecting;
         case AgentState::Listening:
             return Action::Listening;
         case AgentState::Answering:
             return Action::Answering;
+        case AgentState::Error:
+            // No duration, so the graphic holds for exactly as long as the fault
+            // does and dissolves away when the state moves on.
+            return Action::Warning;
         case AgentState::Idle:
         default:
             return Action::Idle;
@@ -450,87 +948,17 @@ float ExpressionPlayer::TransitionTargetSeconds(Action action) const {
     return ActionDurationSeconds(action) * 0.5f;
 }
 
-void ExpressionPlayer::DistanceToMaskValue(
-    const std::array<uint8_t, kMaskBytes>& mask, bool value) {
-    if (distance_scratch_ == nullptr) return;
-    constexpr uint8_t kFar = 126;
-    for (int index = 0; index < static_cast<int>(kFieldCells); ++index) {
-        distance_scratch_[index] = GetMaskBit(mask, index) == value ? 0 : kFar;
-    }
-    for (int y = 0; y < kGridSize; ++y) {
-        for (int x = 0; x < kGridSize; ++x) {
-            const int index = y * kGridSize + x;
-            uint8_t best = distance_scratch_[index];
-            if (x > 0) best = std::min<uint8_t>(
-                best, static_cast<uint8_t>(
-                          std::min<int>(kFar, distance_scratch_[index - 1] + 1)));
-            if (y > 0) best = std::min<uint8_t>(
-                best, static_cast<uint8_t>(std::min<int>(
-                          kFar, distance_scratch_[index - kGridSize] + 1)));
-            distance_scratch_[index] = best;
-        }
-    }
-    for (int y = kGridSize - 1; y >= 0; --y) {
-        for (int x = kGridSize - 1; x >= 0; --x) {
-            const int index = y * kGridSize + x;
-            uint8_t best = distance_scratch_[index];
-            if (x + 1 < kGridSize) best = std::min<uint8_t>(
-                best, static_cast<uint8_t>(
-                          std::min<int>(kFar, distance_scratch_[index + 1] + 1)));
-            if (y + 1 < kGridSize) best = std::min<uint8_t>(
-                best, static_cast<uint8_t>(std::min<int>(
-                          kFar, distance_scratch_[index + kGridSize] + 1)));
-            distance_scratch_[index] = best;
-        }
-    }
-}
-
-void ExpressionPlayer::BuildSignedDistanceField(
-    const std::array<uint8_t, kMaskBytes>& mask, int8_t* output) {
-    if (output == nullptr || distance_scratch_ == nullptr) return;
-    DistanceToMaskValue(mask, false);
-    for (int index = 0; index < static_cast<int>(kFieldCells); ++index) {
-        if (GetMaskBit(mask, index)) {
-            output[index] = static_cast<int8_t>(distance_scratch_[index]);
-        }
-    }
-    DistanceToMaskValue(mask, true);
-    for (int index = 0; index < static_cast<int>(kFieldCells); ++index) {
-        if (!GetMaskBit(mask, index)) {
-            output[index] = -static_cast<int8_t>(distance_scratch_[index]);
-        }
-    }
-}
-
-void ExpressionPlayer::BuildMorphMask(float progress) {
-    next_mask_.fill(0);
-    const float amount = SmoothStep(progress);
-    for (int index = 0; index < static_cast<int>(kFieldCells); ++index) {
-        const float from = static_cast<float>(morph_from_field_[index]);
-        const float value = from +
-                            (static_cast<float>(morph_to_field_[index]) - from) *
-                                amount;
-        if (value >= 0.0f) SetMaskBit(next_mask_, index);
-    }
-}
-
 void ExpressionPlayer::BeginDirectMorph(Action action, float target_seconds,
                                         Energy energy) {
     const uint32_t now = lv_tick_get();
     action_ = action;
     energy_ = energy;
     morph_target_seconds_ = std::max(0.0f, target_seconds);
-    if (!has_rendered_ || morph_from_field_ == nullptr ||
-        morph_to_field_ == nullptr || distance_scratch_ == nullptr) {
+    if (!has_rendered_ || current_shapes_ == nullptr ||
+        previous_shapes_ == nullptr) {
         ActivateAction(action, now, morph_target_seconds_);
         return;
     }
-    const float motion_seconds =
-        static_cast<float>(lv_tick_elaps(motion_started_ms_)) / 1000.0f;
-    BuildMask(BuildFrameGeometry(morph_target_seconds_, motion_seconds, 1.0f),
-              target_mask_);
-    BuildSignedDistanceField(previous_mask_, morph_from_field_);
-    BuildSignedDistanceField(target_mask_, morph_to_field_);
     morph_started_ms_ = now;
     morph_active_ = true;
 }
@@ -556,11 +984,17 @@ void ExpressionPlayer::PlayAmbient() {
     ambient_timer_ = nullptr;
     if (state_ != AgentState::Idle || action_ != Action::Idle || sleeping_) return;
     constexpr Action kAmbientActions[] = {
-        Action::Smile,
-        Action::Laugh,
-        Action::Yawn,
+        Action::Smile,     Action::Laugh,      Action::Yawn,
+        Action::WinkLeft,  Action::WinkRight,  Action::LookLeft,
+        Action::LookRight, Action::LookUp,     Action::LookDown,
+        Action::Surprised, Action::Bored,      Action::Sad,
+        Action::Angry,     Action::Scared,     Action::Despair,
+        Action::Furious,   Action::Alert,      Action::BlinkUp,
+        Action::BlinkDown,
     };
-    RequestAction(kAmbientActions[esp_random() % 3]);
+    RequestAction(kAmbientActions[esp_random() %
+                                  (sizeof(kAmbientActions) /
+                                   sizeof(kAmbientActions[0]))]);
 }
 
 float ExpressionPlayer::ActionEnvelope(Action action, float seconds) const {
@@ -570,30 +1004,52 @@ float ExpressionPlayer::ActionEnvelope(Action action, float seconds) const {
     const bool loop = expression_spec::IsLooping(action) ||
                       (special_expression_held_ && action == held_special_action_);
     if (duration <= 0.0f) return 0.0f;
-    float progress = loop ? std::fmod(std::max(seconds, 0.0f), duration) / duration
-                          : Clamp(seconds / duration, 0.0f, 1.0f);
+    const float progress =
+        loop ? std::fmod(std::max(seconds, 0.0f), duration) / duration
+             : Clamp(seconds / duration, 0.0f, 1.0f);
     const float wave = std::sin(progress * kPi);
     return wave * wave;
 }
 
+// ---------------------------------------------------------------------- geometry
+
 ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
     float seconds, float motion_seconds, float intensity_scale) const {
-    FrameGeometry geometry;
+    FrameGeometry frame;
     const bool tracking_expression =
         tracking_active_ && (action_ == Action::Idle ||
                              action_ == Action::Listening ||
                              action_ == Action::Answering);
-    const Action rendered_action = tracking_expression ? Action::Idle : action_;
-    geometry.action = rendered_action;
-    geometry.seconds = seconds;
-    if (energy_ == Energy::Exhausted) {
-        geometry.energy_vertical_scale = 0.38f;
-        geometry.energy_sag = 2.3f * kGridScale;
-    } else if (energy_ == Energy::Tired) {
-        geometry.energy_vertical_scale = 0.68f;
-        geometry.energy_sag = 1.15f * kGridScale;
+    const Action rendered = tracking_expression ? Action::Idle : action_;
+    frame.action = rendered;
+    frame.seconds = seconds;
+
+    const art::Name name = ArtForAction(rendered);
+    const art::Expression& pose = art::kExpressions[name];
+    frame.left.eye = &pose.left;
+    frame.right.eye = &pose.right;
+
+    // A status graphic owns the whole surface, so the eye pair steps out and
+    // stays out for as long as the action plays.
+    frame.glyph = GlyphForAction(rendered);
+    if (frame.glyph != nullptr) {
+        frame.left.eye = nullptr;
+        frame.right.eye = nullptr;
     }
 
+    // The energy sag exists to droop the eyes, so it is skipped for a glyph,
+    // which would only end up squashed.
+    if (frame.glyph == nullptr) {
+        if (energy_ == Energy::Exhausted) {
+            frame.energy_vertical_scale = 0.38f;
+            frame.energy_sag = 2.3f;
+        } else if (energy_ == Energy::Tired) {
+            frame.energy_vertical_scale = 0.68f;
+            frame.energy_sag = 1.15f;
+        }
+    }
+
+    // Slow idle sway: the whole face drifts a couple of units and tilts.
     const float motion_phase =
         std::fmod(std::max(motion_seconds, 0.0f),
                   expression_spec::kMotionDurationSeconds) /
@@ -603,14 +1059,14 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
     float from_x = 0.0f;
     float from_y = 0.0f;
     float from_rotation = 0.0f;
-    float to_x = 0.2f * kGridScale;
-    float to_y = -0.8f * kGridScale;
+    float to_x = 0.2f;
+    float to_y = -0.8f;
     float to_rotation = 0.9f;
     if (motion_phase > 0.72f) {
         from_phase = 0.72f;
         to_phase = 1.0f;
-        from_x = -0.2f * kGridScale;
-        from_y = 0.8f * kGridScale;
+        from_x = -0.2f;
+        from_y = 0.8f;
         from_rotation = -0.9f;
         to_x = 0.0f;
         to_y = 0.0f;
@@ -618,34 +1074,29 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
     } else if (motion_phase > 0.42f) {
         from_phase = 0.42f;
         to_phase = 0.72f;
-        from_x = 0.2f * kGridScale;
-        from_y = -0.8f * kGridScale;
+        from_x = 0.2f;
+        from_y = -0.8f;
         from_rotation = 0.9f;
-        to_x = -0.2f * kGridScale;
-        to_y = 0.8f * kGridScale;
+        to_x = -0.2f;
+        to_y = 0.8f;
         to_rotation = -0.9f;
     }
-    const float motion_amount = SmoothStep(
-        (motion_phase - from_phase) / (to_phase - from_phase));
-    geometry.translate_x = from_x + (to_x - from_x) * motion_amount;
-    geometry.translate_y = from_y + (to_y - from_y) * motion_amount;
-    const float rotation = from_rotation +
-                           (to_rotation - from_rotation) * motion_amount;
-    const float inverse_radians = -rotation * kPi / 180.0f;
-    geometry.inverse_cos = std::cos(inverse_radians);
-    geometry.inverse_sin = std::sin(inverse_radians);
+    const float motion_amount =
+        SmoothStep((motion_phase - from_phase) / (to_phase - from_phase));
+    frame.translate_x = from_x + (to_x - from_x) * motion_amount;
+    frame.translate_y = from_y + (to_y - from_y) * motion_amount;
+    frame.rotation = from_rotation + (to_rotation - from_rotation) * motion_amount;
     if (tracking_active_) {
-        geometry.translate_x = 0.0f;
-        geometry.translate_y = 0.0f;
-        geometry.inverse_cos = 1.0f;
-        geometry.inverse_sin = 0.0f;
+        frame.translate_x = 0.0f;
+        frame.translate_y = 0.0f;
+        frame.rotation = 0.0f;
     }
 
     float blink = 0.0f;
     float left_wink = 0.0f;
     float right_wink = 0.0f;
     float idle_look_x = 0.0f;
-    if (rendered_action == Action::Idle) {
+    if (rendered == Action::Idle) {
         const float idle_phase = std::fmod(std::max(motion_seconds, 0.0f), 12.0f);
         blink = std::max(SegmentPulse(idle_phase, 2.4f, 3.0f),
                          SegmentPulse(idle_phase, 10.6f, 11.15f));
@@ -662,58 +1113,48 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
                              ? 0.0f
                              : std::sin(motion_seconds * kTau /
                                         expression_spec::kMotionDurationSeconds);
-    const float base_radius = (8.0f + breath * 0.2f) * kGridScale;
     const float action_amount =
-        ActionEnvelope(rendered_action, seconds) * intensity_scale;
+        ActionEnvelope(rendered, seconds) * intensity_scale;
+    frame.symbol_amount = action_amount;
     const float manual_x_scale = tracking_active_ ? 3.25f : 1.25f;
     const float manual_y_scale = tracking_active_ ? 2.75f : 1.2f;
-    const float look_offset_x =
+    frame.left.shift_x = frame.right.shift_x =
         look_x_ * manual_x_scale + idle_look_x * 1.25f;
-    geometry.left_x = (14.0f + look_offset_x) * kGridScale;
-    geometry.right_x = (34.0f + look_offset_x) * kGridScale;
-    geometry.left_y = (24.0f + look_y_ * manual_y_scale) * kGridScale;
-    geometry.right_y = geometry.left_y;
-    geometry.left_radius_x = base_radius;
-    geometry.right_radius_x = base_radius;
-    geometry.left_radius_y = base_radius;
-    geometry.right_radius_y = base_radius;
+    frame.left.shift_y = frame.right.shift_y = look_y_ * manual_y_scale;
 
-    switch (rendered_action) {
+    const float base_scale = 1.0f + breath * 0.02f;
+    frame.left.scale_x = frame.left.scale_y = base_scale;
+    frame.right.scale_x = frame.right.scale_y = base_scale;
+
+    switch (rendered) {
         case Action::Idle:
-            geometry.left_radius_y =
-                base_radius * (1.0f - std::max(blink, left_wink) * 0.82f);
-            geometry.right_radius_y =
-                base_radius * (1.0f - std::max(blink, right_wink) * 0.82f);
+            frame.left.scale_y *= 1.0f - std::max(blink, left_wink) * 0.82f;
+            frame.right.scale_y *= 1.0f - std::max(blink, right_wink) * 0.82f;
             break;
         case Action::Smile: {
-            const float lift = action_amount * 0.8f * kGridScale;
-            geometry.left_y -= lift;
-            geometry.right_y -= lift;
-            geometry.left_arc_width = geometry.right_arc_width = 7.2f * kGridScale;
-            geometry.left_arc_thickness = geometry.right_arc_thickness =
-                1.05f * kGridScale;
-            geometry.left_morph = geometry.right_morph = SmoothStep(action_amount);
+            const float lift = action_amount * 0.8f;
+            frame.left.shift_y -= lift;
+            frame.right.shift_y -= lift;
+            frame.left.scale_y *= 1.0f + action_amount * 0.1f;
+            frame.right.scale_y *= 1.0f + action_amount * 0.1f;
             break;
         }
         case Action::Laugh: {
             const float bounce = std::abs(std::sin(seconds * kTau * 2.2f)) *
-                                 1.2f * kGridScale * action_amount;
-            const float thickness =
-                (1.15f + std::abs(std::sin(seconds * kTau * 1.7f)) * 0.55f) *
-                kGridScale;
-            geometry.left_y -= bounce;
-            geometry.right_y -= bounce;
-            geometry.left_arc_width = geometry.right_arc_width = 7.5f * kGridScale;
-            geometry.left_arc_thickness = geometry.right_arc_thickness = thickness;
-            geometry.left_morph = geometry.right_morph = SmoothStep(action_amount);
+                                 1.2f * action_amount;
+            const float pulse = 1.0f + std::abs(std::sin(seconds * kTau * 1.7f)) *
+                                          0.12f * action_amount;
+            frame.left.shift_y -= bounce;
+            frame.right.shift_y -= bounce;
+            frame.left.scale_x *= pulse;
+            frame.right.scale_x *= pulse;
             break;
         }
         case Action::Yawn: {
-            const float openness = action_amount;
-            geometry.left_radius_x = geometry.right_radius_x =
-                base_radius + openness * 0.5f * kGridScale;
-            geometry.left_radius_y = geometry.right_radius_y =
-                base_radius + openness * 2.4f * kGridScale;
+            frame.left.scale_y *= 1.0f + action_amount * 0.45f;
+            frame.right.scale_y *= 1.0f + action_amount * 0.45f;
+            frame.left.scale_x *= 1.0f + action_amount * 0.1f;
+            frame.right.scale_x *= 1.0f + action_amount * 0.1f;
             break;
         }
         case Action::Listening: {
@@ -722,30 +1163,25 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
                 std::min(1.0f, listening_vad_ * 0.62f +
                                   listening_onset_ * 0.9f);
             const float elastic =
-                listening_onset_ * std::sin(seconds * kTau * 2.2f) * 0.65f;
+                listening_onset_ * std::sin(seconds * kTau * 2.2f) * 0.28f;
             const float audio_pulse = listening_activity_ *
                 (0.9f + 0.3f * std::sin(seconds * kTau * 1.15f + 0.55f));
-            const float radius_scale = 1.0f - attention * 0.08f;
-            const float attentive_left_x =
-                geometry.left_x + attention * 0.85f * kGridScale;
-            const float attentive_right_x =
-                geometry.right_x - attention * 0.85f * kGridScale;
-            geometry.left_x = attentive_left_x;
-            geometry.right_x = attentive_right_x;
-            geometry.left_radius_x = geometry.left_radius_y =
-                (base_radius +
-                 (wave - 0.5f) * 3.0f * action_amount * 0.42f * kGridScale +
-                 (audio_pulse + elastic) * kGridScale) * radius_scale;
-            geometry.right_radius_x = geometry.right_radius_y =
-                (base_radius +
-                 (0.5f - wave) * 3.0f * action_amount * 0.42f * kGridScale +
-                 (audio_pulse - elastic) * kGridScale) * radius_scale;
-            const float bob =
-                (wave - 0.5f) * 1.8f * 0.42f * kGridScale * action_amount +
-                listening_onset_ * std::sin(seconds * kTau * 1.55f) *
-                    0.55f * kGridScale;
-            geometry.left_y -= bob;
-            geometry.right_y += bob;
+            const float squeeze = 1.0f - attention * 0.08f;
+            frame.left.shift_x += attention * 0.85f;
+            frame.right.shift_x -= attention * 0.85f;
+            const float left_pulse =
+                (wave - 0.5f) * 0.42f * action_amount + audio_pulse + elastic;
+            const float right_pulse =
+                (0.5f - wave) * 0.42f * action_amount + audio_pulse - elastic;
+            frame.left.scale_x = frame.left.scale_y =
+                base_scale * (1.0f + left_pulse * 0.16f) * squeeze;
+            frame.right.scale_x = frame.right.scale_y =
+                base_scale * (1.0f + right_pulse * 0.16f) * squeeze;
+            const float bob = (wave - 0.5f) * 0.75f * action_amount +
+                              listening_onset_ *
+                                  std::sin(seconds * kTau * 1.55f) * 0.55f;
+            frame.left.shift_y -= bob;
+            frame.right.shift_y += bob;
             break;
         }
         case Action::Answering: {
@@ -760,38 +1196,22 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
                                      : 0.0f;
             constexpr float kLeftLift[] = {0.9f, 1.35f, 0.65f};
             constexpr float kRightLift[] = {0.9f, 1.35f, 1.25f};
-            constexpr float kLeftWidth[] = {7.5f, 8.2f, 7.0f};
-            constexpr float kRightWidth[] = {7.5f, 8.2f, 8.0f};
-            constexpr float kLeftThickness[] = {1.05f, 1.35f, 1.0f};
-            constexpr float kRightThickness[] = {1.05f, 1.35f, 1.45f};
-            geometry.left_y -= (kLeftLift[variant] + bounce) * action_amount * kGridScale;
-            geometry.right_y -= (kRightLift[variant] + bounce) * action_amount * kGridScale;
-            geometry.left_arc_width = kLeftWidth[variant] * kGridScale;
-            geometry.right_arc_width = kRightWidth[variant] * kGridScale;
-            geometry.left_arc_thickness =
-                (kLeftThickness[variant] + action_amount * 0.4f) * kGridScale;
-            geometry.right_arc_thickness =
-                (kRightThickness[variant] + action_amount * 0.4f) * kGridScale;
-            geometry.left_morph = geometry.right_morph = smile_amount;
+            frame.left.shift_y -= (kLeftLift[variant] + bounce) * smile_amount;
+            frame.right.shift_y -= (kRightLift[variant] + bounce) * smile_amount;
+            frame.left.scale_y *= 1.0f + smile_amount * 0.08f;
+            frame.right.scale_y *= 1.0f + smile_amount * 0.08f;
             break;
         }
         case Action::Charging: {
-            const float pulse = SmoothStep(action_amount);
-            geometry.left_radius_x = geometry.left_radius_y =
-                base_radius + pulse * 1.5f * kGridScale;
-            geometry.right_radius_x = geometry.right_radius_y =
-                geometry.left_radius_x;
+            const float pulse = 1.0f + SmoothStep(action_amount) * 0.10f;
+            frame.left.scale_x = frame.left.scale_y = base_scale * pulse;
+            frame.right.scale_x = frame.right.scale_y = base_scale * pulse;
             break;
         }
         case Action::Complete: {
             const float smile_amount = SmoothStep(action_amount);
-            geometry.left_y -= smile_amount * kGridScale;
-            geometry.right_y -= smile_amount * kGridScale;
-            geometry.left_arc_width = geometry.right_arc_width =
-                7.4f * kGridScale;
-            geometry.left_arc_thickness = geometry.right_arc_thickness =
-                1.2f * kGridScale;
-            geometry.left_morph = geometry.right_morph = smile_amount;
+            frame.left.shift_y -= smile_amount;
+            frame.right.shift_y -= smile_amount;
             break;
         }
         case Action::Wake: {
@@ -802,264 +1222,136 @@ ExpressionPlayer::FrameGeometry ExpressionPlayer::BuildFrameGeometry(
                 open = 1.18f + (0.12f - 1.18f) *
                                    SmoothStep((seconds - 0.28f) / 0.22f);
             } else if (seconds < 0.78f) {
-                open = 0.12f + 0.88f *
-                                   SmoothStep((seconds - 0.5f) / 0.28f);
+                open = 0.12f + 0.88f * SmoothStep((seconds - 0.5f) / 0.28f);
             }
-            geometry.left_radius_y = geometry.right_radius_y =
-                (0.7f + 7.3f * open) * kGridScale;
+            frame.left.scale_y *= open;
+            frame.right.scale_y *= open;
             break;
         }
-        case Action::Sleep:
-        case Action::Dizzy:
+        case Action::Sleep: {
+            const float drift = std::sin(seconds * kTau * 0.18f) * 0.45f;
+            frame.left.shift_y += drift;
+            frame.right.shift_y += drift;
+            break;
+        }
+        case Action::Dizzy: {
+            const float wobble = std::sin(seconds * kTau * 3.6f) * 1.2f;
+            frame.left.shift_x += wobble;
+            frame.right.shift_x -= wobble;
+            // Keep the eyes small enough for the orbit ring to encircle them.
+            frame.left.scale_x = frame.left.scale_y = base_scale * 0.7f;
+            frame.right.scale_x = frame.right.scale_y = base_scale * 0.7f;
+            break;
+        }
+        case Action::Connecting: {
+            const float sway = std::sin(seconds * kTau / 1.6f) * 0.9f;
+            frame.left.shift_x += sway;
+            frame.right.shift_x += sway;
+            break;
+        }
+        case Action::Surprised: {
+            // The surprised pose is already the widest artwork, so the pop goes
+            // upward and slightly narrows the eyes instead of growing the pair.
+            const float pop = SmoothStep(action_amount);
+            frame.left.scale_x = frame.right.scale_x = base_scale * (1.0f - pop * 0.06f);
+            frame.left.scale_y = frame.right.scale_y = base_scale * (1.0f + pop * 0.12f);
+            break;
+        }
+        case Action::Angry: {
+            const float lean = action_amount * 0.12f;
+            frame.left.scale_y *= 1.0f - lean;
+            frame.right.scale_y *= 1.0f - lean;
+            break;
+        }
+        case Action::Scared: {
+            // A flinch: the pair snaps wide and drops, then settles back.
+            const float flinch = SmoothStep(action_amount);
+            frame.left.shift_x -= flinch * 0.9f;
+            frame.right.shift_x += flinch * 0.9f;
+            frame.translate_y += flinch * 0.7f;
+            break;
+        }
+        case Action::Despair: {
+            const float sink = SmoothStep(action_amount);
+            frame.left.shift_y += sink * 1.4f;
+            frame.right.shift_y += sink * 1.4f;
+            frame.left.scale_y = frame.right.scale_y =
+                base_scale * (1.0f - sink * 0.18f);
+            break;
+        }
+        case Action::Furious: {
+            const float grind = SmoothStep(action_amount);
+            frame.left.scale_y *= 1.0f - grind * 0.22f;
+            frame.right.scale_y *= 1.0f - grind * 0.22f;
+            frame.rotation +=
+                std::sin(frame.seconds * kTau * 6.0f) * 0.5f * grind;
+            break;
+        }
+        case Action::Alert: {
+            const float snap = SmoothStep(action_amount);
+            frame.left.scale_x = frame.right.scale_x =
+                base_scale * (1.0f - snap * 0.10f);
+            frame.left.scale_y = frame.right.scale_y =
+                base_scale * (1.0f + snap * 0.12f);
+            break;
+        }
+        case Action::LookLeft:
+        case Action::LookRight: {
+            // The imported look-* poses are centred, so the glance itself has to
+            // come from the shared eye offset.
+            const float glance = 2.0f * SmoothStep(action_amount) *
+                                 (rendered == Action::LookLeft ? -1.0f : 1.0f);
+            frame.left.shift_x += glance;
+            frame.right.shift_x += glance;
+            break;
+        }
+        case Action::LookUp:
+        case Action::LookDown: {
+            const float glance = 1.4f * SmoothStep(action_amount) *
+                                 (rendered == Action::LookUp ? -1.0f : 1.0f);
+            frame.left.shift_y += glance;
+            frame.right.shift_y += glance;
+            break;
+        }
+        case Action::WinkLeft:
+        case Action::WinkRight:
+        case Action::Bored:
+        case Action::Sad:
+        default:
             break;
     }
-    return geometry;
-}
 
-bool ExpressionPlayer::IsDotActive(float x, float y,
-                                   const FrameGeometry& geometry) const {
-    const float translated_x = x - kPivot - geometry.translate_x;
-    const float translated_y = y - kPivot - geometry.translate_y;
-    const float sample_x = kPivot + translated_x * geometry.inverse_cos -
-                           translated_y * geometry.inverse_sin;
-    const float symbol_y = kPivot + translated_x * geometry.inverse_sin +
-                           translated_y * geometry.inverse_cos;
-
-    auto energy_y = [&](float center_y) {
-        return center_y +
-               (symbol_y - center_y - geometry.energy_sag) /
-                   geometry.energy_vertical_scale;
-    };
-
-    auto inside_eye = [&](float center_x, float center_y, float radius_x,
-                          float radius_y, float arc_width, float arc_thickness,
-                          float morph) {
-        const float sample_y = energy_y(center_y);
-        const float ellipse = EllipseField(sample_x, sample_y, center_x, center_y,
-                                           radius_x, radius_y);
-        if (morph <= 0.0f) return ellipse <= 0.0f;
-        const float smile = HappyArcField(sample_x, sample_y, center_x, center_y,
-                                          arc_width, arc_thickness);
-        return ellipse + (smile - ellipse) * morph <= 0.0f;
-    };
-
-    const float seconds = geometry.seconds;
-    const float action_amount = ActionEnvelope(geometry.action, seconds);
-    if (geometry.action == Action::Charging) {
-        const float pulse = SmoothStep(action_amount);
-        const float bolt_thickness = (0.7f + pulse * 0.45f) * kGridScale;
-        return inside_eye(geometry.left_x, geometry.left_y,
-                          geometry.left_radius_x, geometry.left_radius_y,
-                          0.0f, 0.0f, 0.0f) ||
-               inside_eye(geometry.right_x, geometry.right_y,
-                          geometry.right_radius_x, geometry.right_radius_y,
-                          0.0f, 0.0f, 0.0f) ||
-               InsideLineSegment(sample_x, symbol_y, 47.0f * kGridScale,
-                                 7.0f * kGridScale, 42.0f * kGridScale,
-                                 13.0f * kGridScale, bolt_thickness) ||
-               InsideLineSegment(sample_x, symbol_y, 42.0f * kGridScale,
-                                 13.0f * kGridScale, 47.0f * kGridScale,
-                                 13.0f * kGridScale, bolt_thickness) ||
-               InsideLineSegment(sample_x, symbol_y, 47.0f * kGridScale,
-                                 13.0f * kGridScale, 41.0f * kGridScale,
-                                 21.0f * kGridScale, bolt_thickness);
-    }
-
-    if (geometry.action == Action::Complete) {
-        const float sparkle = SegmentPulse(seconds, 0.2f, 1.3f);
-        return inside_eye(geometry.left_x, geometry.left_y,
-                          geometry.left_radius_x, geometry.left_radius_y,
-                          geometry.left_arc_width, geometry.left_arc_thickness,
-                          geometry.left_morph) ||
-               inside_eye(geometry.right_x, geometry.right_y,
-                          geometry.right_radius_x, geometry.right_radius_y,
-                          geometry.right_arc_width, geometry.right_arc_thickness,
-                          geometry.right_morph) ||
-               InsideDiamond(sample_x, symbol_y, 45.0f * kGridScale,
-                             10.0f * kGridScale,
-                             3.2f * kGridScale * sparkle);
-    }
-
-    if (geometry.action == Action::Sleep) {
-        const float drift = std::sin(seconds * kTau * 0.18f) *
-                            0.45f * kGridScale;
-        const bool left_sleeping = InsideSleepArc(
-            sample_x, energy_y(geometry.left_y), geometry.left_x,
-            geometry.left_y + drift, 7.2f * kGridScale, 0.9f * kGridScale);
-        const bool right_sleeping = InsideSleepArc(
-            sample_x, energy_y(geometry.right_y), geometry.right_x,
-            geometry.right_y + drift, 7.2f * kGridScale, 0.9f * kGridScale);
-        const float z_phase = std::fmod(std::max(seconds, 0.0f), 2.4f) / 2.4f;
-        return left_sleeping || right_sleeping ||
-               InsideDiamond(sample_x, energy_y(geometry.left_y),
-                             (42.0f + z_phase * 4.0f) * kGridScale,
-                             (18.0f - z_phase * 8.0f) * kGridScale,
-                             1.35f * kGridScale);
-    }
-
-    if (geometry.action == Action::Dizzy) {
-        const float orbit = seconds * kTau * 1.8f;
-        const float wobble_x = std::sin(seconds * kTau * 3.6f) *
-                               1.2f * kGridScale;
-        const float ring_radius = (5.5f + action_amount * 1.3f) * kGridScale;
-        const float orbit_radius = 4.2f * kGridScale;
-        const float left_y = energy_y(geometry.left_y);
-        const float right_y = energy_y(geometry.right_y);
-        return InsideRing(sample_x, left_y, geometry.left_x + wobble_x,
-                          geometry.left_y, ring_radius, ring_radius,
-                          1.2f * kGridScale) ||
-               InsideRing(sample_x, right_y, geometry.right_x - wobble_x,
-                          geometry.right_y, ring_radius, ring_radius,
-                          1.2f * kGridScale) ||
-               InsideEllipse(sample_x, left_y,
-                             geometry.left_x + std::cos(orbit) * orbit_radius,
-                             geometry.left_y + std::sin(orbit) * orbit_radius,
-                             1.3f * kGridScale, 1.3f * kGridScale) ||
-               InsideEllipse(sample_x, right_y,
-                             geometry.right_x - std::cos(orbit) * orbit_radius,
-                             geometry.right_y - std::sin(orbit) * orbit_radius,
-                             1.3f * kGridScale, 1.3f * kGridScale);
-    }
-
-    return inside_eye(geometry.left_x, geometry.left_y,
-                      geometry.left_radius_x, geometry.left_radius_y,
-                      geometry.left_arc_width, geometry.left_arc_thickness,
-                      geometry.left_morph) ||
-           inside_eye(geometry.right_x, geometry.right_y,
-                      geometry.right_radius_x, geometry.right_radius_y,
-                      geometry.right_arc_width, geometry.right_arc_thickness,
-                      geometry.right_morph);
-}
-
-void ExpressionPlayer::BuildMask(
-    const FrameGeometry& geometry,
-    std::array<uint8_t, kMaskBytes>& mask) const {
-    mask.fill(0);
-    for (int y = 0; y < kGridSize; ++y) {
-        for (int x = 0; x < kGridSize; ++x) {
-            if (IsDotActive(static_cast<float>(x), static_cast<float>(y), geometry)) {
-                SetMaskBit(mask, y * kGridSize + x);
-            }
+    if (frame.glyph != nullptr) {
+        // The dissolve already handles arriving and leaving, so the graphic only
+        // breathes a little while it holds the surface.
+        frame.glyph_scale = 1.0f + SmoothStep(action_amount) * 0.08f;
+        if (rendered == Action::Warning) {
+            // A fault outlasts the animation, so the wobble rides the looping
+            // envelope instead of a one-shot progress.
+            frame.rotation +=
+                std::sin(seconds * kTau * 1.4f) * 1.2f * action_amount;
         }
     }
+    KeepEyesApart(frame.left, frame.right);
+    return frame;
 }
 
-void ExpressionPlayer::InvalidateCellBounds(int min_x, int min_y, int max_x,
-                                            int max_y) {
-    if (image_ == nullptr || min_x > max_x || min_y > max_y) return;
-    lv_area_t image_area;
-    lv_obj_get_coords(image_, &image_area);
-    const auto map_x = [this](int value) {
-        return value * surface_width_ / kGridSize;
-    };
-    const auto map_y = [this](int value) {
-        return (kLogicalOriginY + value * kLogicalExtent / kGridSize) *
-               surface_height_ / kExpressionHeight;
-    };
-    lv_area_t dirty = {
-        .x1 = image_area.x1 + std::max(0, map_x(min_x)),
-        .y1 = image_area.y1 + std::max(0, map_y(min_y)),
-        .x2 = image_area.x1 + std::min(surface_width_, map_x(max_x + 1)) - 1,
-        .y2 = image_area.y1 + std::min(surface_height_, map_y(max_y + 1)) - 1,
-    };
-    if (dirty.x1 > dirty.x2 || dirty.y1 > dirty.y2) return;
-    lv_obj_invalidate_area(image_, &dirty);
-}
-
-void ExpressionPlayer::RedrawChangedCells() {
-    int left_min_x = kGridSize;
-    int left_min_y = kGridSize;
-    int left_max_x = -1;
-    int left_max_y = -1;
-    int right_min_x = kGridSize;
-    int right_min_y = kGridSize;
-    int right_max_x = -1;
-    int right_max_y = -1;
-    const int render_step = pixel_step_;
-    const int render_grid = (kGridSize + render_step - 1) / render_step;
-    const int dot_size = render_step == 1 ? 7 : 6;
-    const auto group_active = [this, render_step](
-                                  const std::array<uint8_t, kMaskBytes>& mask,
-                                  int group_x, int group_y) {
-        const int start_x = group_x * render_step;
-        const int start_y = group_y * render_step;
-        for (int y = start_y; y < std::min(kGridSize, start_y + render_step); ++y) {
-            for (int x = start_x; x < std::min(kGridSize, start_x + render_step); ++x) {
-                if (GetMaskBit(mask, y * kGridSize + x)) return true;
-            }
-        }
-        return false;
-    };
-
-    for (int group_y = 0; group_y < render_grid; ++group_y) {
-        for (int group_x = 0; group_x < render_grid; ++group_x) {
-            const bool previous = group_active(previous_mask_, group_x, group_y);
-            const bool next = group_active(next_mask_, group_x, group_y);
-            if (previous == next) continue;
-
-            const int x = group_x * render_step;
-            const int y = group_y * render_step;
-
-            int& min_x = x < kGridSize / 2 ? left_min_x : right_min_x;
-            int& min_y = x < kGridSize / 2 ? left_min_y : right_min_y;
-            int& max_x = x < kGridSize / 2 ? left_max_x : right_max_x;
-            int& max_y = x < kGridSize / 2 ? left_max_y : right_max_y;
-            min_x = std::min(min_x, x);
-            min_y = std::min(min_y, y);
-            max_x = std::max(max_x, x);
-            max_y = std::max(max_y, y);
-
-            const int raw_x1 = x * surface_width_ / kGridSize;
-            const int raw_y1 =
-                (kLogicalOriginY + y * kLogicalExtent / kGridSize) *
-                surface_height_ / kExpressionHeight;
-            const int raw_x2 = std::min(
-                surface_width_, (x + render_step) * surface_width_ / kGridSize);
-            const int raw_y2 =
-                (kLogicalOriginY + std::min(kGridSize, y + render_step) *
-                                        kLogicalExtent / kGridSize) *
-                surface_height_ / kExpressionHeight;
-            const int pixel_x1 = std::max(0, raw_x1);
-            const int pixel_y1 = std::max(0, raw_y1);
-            const int pixel_x2 = std::min(surface_width_, raw_x2);
-            const int pixel_y2 = std::min(surface_height_, raw_y2);
-            for (int py = pixel_y1; py < pixel_y2; ++py) {
-                std::memset(a8_buffer_ + py * surface_width_ + pixel_x1, 0,
-                            static_cast<size_t>(pixel_x2 - pixel_x1));
-            }
-            if (!next) continue;
-
-            const int bounded_dot_size = std::min(
-                dot_size, std::max(1, std::min(pixel_x2 - pixel_x1,
-                                                 pixel_y2 - pixel_y1)));
-            const int dot_x1 = std::max(0, (raw_x1 + raw_x2 - bounded_dot_size) / 2);
-            const int dot_y1 = std::max(0, (raw_y1 + raw_y2 - bounded_dot_size) / 2);
-            const int dot_x2 = std::min(surface_width_, dot_x1 + bounded_dot_size);
-            const int dot_y2 = std::min(surface_height_, dot_y1 + bounded_dot_size);
-            for (int py = dot_y1; py < dot_y2; ++py) {
-                std::memset(a8_buffer_ + py * surface_width_ + dot_x1,
-                            LV_OPA_COVER,
-                            static_cast<size_t>(dot_x2 - dot_x1));
-            }
-        }
-    }
-
-    if (left_max_x >= 0 || right_max_x >= 0) {
-        lv_image_cache_drop(&image_descriptor_);
-    }
-    InvalidateCellBounds(left_min_x, left_min_y,
-                         left_max_x + render_step - 1,
-                         left_max_y + render_step - 1);
-    InvalidateCellBounds(right_min_x, right_min_y,
-                         right_max_x + render_step - 1,
-                         right_max_y + render_step - 1);
-    previous_mask_.swap(next_mask_);
-}
+// ------------------------------------------------------------------------ frames
 
 void ExpressionPlayer::UpdateFrame() {
     if (parent_ == nullptr || image_ == nullptr || a8_buffer_ == nullptr ||
-        !lv_obj_is_valid(image_)) {
+        current_shapes_ == nullptr || !lv_obj_is_valid(image_)) {
         return;
+    }
+    // The A8 buffer only carries alpha, so a theme change costs one style write
+    // instead of a re-render. Views are normally rebuilt on a theme change, but a
+    // long-lived player (Home, Standby) has to follow along on its own.
+    const uint32_t accent = Theme::Get().colors().accent;
+    if (accent != accent_) {
+        accent_ = accent;
+        lv_obj_set_style_image_recolor(image_, lv_color_hex(accent),
+                                       LV_PART_MAIN);
+        lv_obj_invalidate(image_);
     }
     const uint32_t now = lv_tick_get();
     UpdateListeningAudio(now);
@@ -1079,14 +1371,16 @@ void ExpressionPlayer::UpdateFrame() {
         const float progress =
             static_cast<float>(lv_tick_elaps(morph_started_ms_)) /
             static_cast<float>(expression_spec::kDirectMorphMs);
-        BuildMorphMask(Clamp(progress, 0.0f, 1.0f));
-        RedrawChangedCells();
+        Emit(BuildFrameGeometry(morph_target_seconds_, motion_seconds, 1.0f),
+             *current_shapes_);
+        Render(SmoothStep(progress));
         has_rendered_ = true;
         if (progress >= 1.0f) {
             morph_active_ = false;
             action_started_ms_ = now;
             action_elapsed_offset_ms_ = static_cast<uint32_t>(
                 morph_target_seconds_ * 1000.0f);
+            std::swap(current_shapes_, previous_shapes_);
             if (action_ == Action::Idle && state_ == AgentState::Idle) {
                 ScheduleAmbient();
             }
@@ -1108,16 +1402,18 @@ void ExpressionPlayer::UpdateFrame() {
         RequestAction(next);
         if (completed_wake) DispatchWakeCompleted();
         if (morph_active_) {
-            BuildMorphMask(0.0f);
-            RedrawChangedCells();
+            Emit(BuildFrameGeometry(morph_target_seconds_, motion_seconds, 1.0f),
+                 *current_shapes_);
+            Render(0.0f);
             has_rendered_ = true;
             return;
         }
         seconds = CurrentActionSeconds(now);
     }
 
-    BuildMask(BuildFrameGeometry(seconds, motion_seconds, 1.0f), next_mask_);
-    RedrawChangedCells();
+    Emit(BuildFrameGeometry(seconds, motion_seconds, 1.0f), *current_shapes_);
+    Render(1.0f);
+    std::swap(current_shapes_, previous_shapes_);
     has_rendered_ = true;
 }
 
@@ -1143,11 +1439,12 @@ void ExpressionPlayer::Stop() {
         a8_buffer_ = nullptr;
         image_descriptor_.data = nullptr;
     }
-    if (morph_from_field_ != nullptr) {
-        heap_caps_free(morph_from_field_);
-        morph_from_field_ = nullptr;
-        morph_to_field_ = nullptr;
-        distance_scratch_ = nullptr;
+    if (shape_sets_ != nullptr) {
+        heap_caps_free(reinterpret_cast<uint8_t*>(shape_sets_));
+        shape_sets_ = nullptr;
+        current_shapes_ = nullptr;
+        previous_shapes_ = nullptr;
+        row_coverage_ = nullptr;
     }
 }
 

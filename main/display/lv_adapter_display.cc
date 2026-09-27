@@ -153,6 +153,9 @@ void LVAdapterDisplay::SetStatus(const char* const status) {
         case kDeviceStateSpeaking:
             ui.SetAgentState(agent_ui::AgentState::Answering);
             break;
+        case kDeviceStateFatalError:
+            ui.SetAgentState(agent_ui::AgentState::Error);
+            break;
         default:
             ui.SetAgentState(agent_ui::AgentState::Idle);
             break;
