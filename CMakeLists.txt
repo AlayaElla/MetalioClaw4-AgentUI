@@ -23,6 +23,56 @@ include("${CMAKE_CURRENT_LIST_DIR}/main/boards/metalio-claw-4/validate_wifi_conf
 # patch that keeps one reusable 32 KiB internal executable arena after managed
 # dependencies are restored.
 find_package(Git QUIET)
+
+# managed_components/ is gitignored, and since git 2.44 `git apply` runs in
+# restricted mode: every hunk that touches an ignored path is reported as
+# "skipping patch" and exits 0, so the checks below used to pass while nothing
+# was patched. GIT_DIR pointing at a non-existent repository turns git apply
+# back into patch(1) semantics, which is what these guards need.
+function(apply_dependency_patch)
+    cmake_parse_arguments(DEP_PATCH "UNIDIFF_ZERO"
+                          "PATCH;SOURCE_DIR;APPLY_MESSAGE;MISMATCH_MESSAGE"
+                          "" ${ARGN})
+    set(DEP_PATCH_FLAGS "")
+    if(DEP_PATCH_UNIDIFF_ZERO)
+        list(APPEND DEP_PATCH_FLAGS --unidiff-zero)
+    endif()
+
+    set(DEP_PATCH_PREVIOUS_GIT_DIR "$ENV{GIT_DIR}")
+    set(ENV{GIT_DIR} "${CMAKE_BINARY_DIR}/git-apply-outside-repository")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply ${DEP_PATCH_FLAGS} --check
+                "${DEP_PATCH_PATCH}"
+        WORKING_DIRECTORY "${DEP_PATCH_SOURCE_DIR}"
+        RESULT_VARIABLE DEP_PATCH_NEEDED
+        OUTPUT_QUIET ERROR_QUIET)
+    if(DEP_PATCH_NEEDED EQUAL 0)
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply ${DEP_PATCH_FLAGS}
+                    "${DEP_PATCH_PATCH}"
+            WORKING_DIRECTORY "${DEP_PATCH_SOURCE_DIR}"
+            RESULT_VARIABLE DEP_PATCH_RESULT)
+        if(NOT DEP_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR "${DEP_PATCH_APPLY_MESSAGE}")
+        endif()
+    else()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" apply ${DEP_PATCH_FLAGS}
+                    --reverse --check "${DEP_PATCH_PATCH}"
+            WORKING_DIRECTORY "${DEP_PATCH_SOURCE_DIR}"
+            RESULT_VARIABLE DEP_PATCH_APPLIED
+            OUTPUT_QUIET ERROR_QUIET)
+        if(NOT DEP_PATCH_APPLIED EQUAL 0)
+            message(FATAL_ERROR "${DEP_PATCH_MISMATCH_MESSAGE}")
+        endif()
+    endif()
+    if(DEP_PATCH_PREVIOUS_GIT_DIR STREQUAL "")
+        unset(ENV{GIT_DIR})
+    else()
+        set(ENV{GIT_DIR} "${DEP_PATCH_PREVIOUS_GIT_DIR}")
+    endif()
+endfunction()
+
 # ESP-Hosted streaming RX must tolerate transient internal DMA allocation
 # pressure while the camera and voice pipeline are active.
 set(ESP_HOSTED_DIR "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_hosted")
@@ -155,74 +205,29 @@ endif()
 set(ESP_VIDEO_DIR "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_video")
 set(ESP_VIDEO_SENSOR_FORMAT_PATCH
     "${CMAKE_SOURCE_DIR}/patches/esp-video-select-sensor-format.patch")
-if(GIT_FOUND AND
-   EXISTS "${ESP_VIDEO_DIR}/src/device/esp_video_device_common.c" AND
+if(EXISTS "${ESP_VIDEO_DIR}/src/device/esp_video_device_common.c" AND
    EXISTS "${ESP_VIDEO_SENSOR_FORMAT_PATCH}")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" apply --check
-                "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-        WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
-        RESULT_VARIABLE ESP_VIDEO_PATCH_NEEDED
-        OUTPUT_QUIET ERROR_QUIET)
-    if(ESP_VIDEO_PATCH_NEEDED EQUAL 0)
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" apply
-                    "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-            WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
-            RESULT_VARIABLE ESP_VIDEO_PATCH_RESULT)
-        if(NOT ESP_VIDEO_PATCH_RESULT EQUAL 0)
-            message(FATAL_ERROR
-                "Failed to patch esp-video sensor format selection")
-        endif()
-    else()
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
-                    "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-            WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
-            RESULT_VARIABLE ESP_VIDEO_PATCH_ALREADY_APPLIED
-            OUTPUT_QUIET ERROR_QUIET)
-        if(NOT ESP_VIDEO_PATCH_ALREADY_APPLIED EQUAL 0)
-            message(FATAL_ERROR
-                "esp-video sources do not match the tested sensor format patch")
-        endif()
-    endif()
+    apply_dependency_patch(
+        PATCH "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
+        SOURCE_DIR "${ESP_VIDEO_DIR}"
+        APPLY_MESSAGE
+            "Failed to patch esp-video sensor format selection"
+        MISMATCH_MESSAGE
+            "esp-video sources do not match the tested sensor format patch")
 endif()
 
 set(ESP_CAM_SENSOR_DIR
     "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_cam_sensor")
 set(ESP_CAM_SENSOR_OV2710_720_PATCH
     "${CMAKE_SOURCE_DIR}/patches/esp-cam-sensor-ov2710-720x720.patch")
-if(GIT_FOUND AND
-   EXISTS "${ESP_CAM_SENSOR_DIR}/sensors/ov2710/ov2710.c" AND
+if(EXISTS "${ESP_CAM_SENSOR_DIR}/sensors/ov2710/ov2710.c" AND
    EXISTS "${ESP_CAM_SENSOR_OV2710_720_PATCH}")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" apply --check
-                "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-        WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
-        RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_NEEDED
-        OUTPUT_QUIET ERROR_QUIET)
-    if(ESP_CAM_SENSOR_PATCH_NEEDED EQUAL 0)
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" apply
-                    "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-            WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
-            RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_RESULT)
-        if(NOT ESP_CAM_SENSOR_PATCH_RESULT EQUAL 0)
-            message(FATAL_ERROR
-                "Failed to patch OV2710 720x720 sensor mode")
-        endif()
-    else()
-        execute_process(
-            COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
-                    "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-            WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
-            RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_ALREADY_APPLIED
-            OUTPUT_QUIET ERROR_QUIET)
-        if(NOT ESP_CAM_SENSOR_PATCH_ALREADY_APPLIED EQUAL 0)
-            message(FATAL_ERROR
-                "esp_cam_sensor sources do not match the tested OV2710 patch")
-        endif()
-    endif()
+    apply_dependency_patch(
+        PATCH "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
+        SOURCE_DIR "${ESP_CAM_SENSOR_DIR}"
+        APPLY_MESSAGE "Failed to patch OV2710 720x720 sensor mode"
+        MISMATCH_MESSAGE
+            "esp_cam_sensor sources do not match the tested OV2710 patch")
 endif()
 
 # Override esp-sr packed model with custom wakeword when present

@@ -852,11 +852,15 @@ public:
         return &backlight;
     }
 
-    // 电量来自 BQ27220；是否连接外部电源来自充电芯片的 VBUS 状态。不能用
-    // BQ27220 的瞬时电流当成插拔状态：接近满电时 top-off 会周期性启停，
-    // 从而制造假的 charging false -> true 边沿。
+    // 充电状态取两个信号里任一成立的那个：BQ27220 的电流方向是粘滞的（只有
+    // 读到反向电流才翻转），所以不会像瞬时电流那样在 top-off 启停时抖动；
+    // CX25601N 的 VBUS 状态则覆盖电流接近 0 的场合。实测两边会单独漏判：
+    // 线插着、电流判出 charging=true 的同时 vbus_stat 却读回 0，只用 VBUS
+    // 覆盖电流判定会让 UI 永远收不到 charging 边沿。
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        if (!Bq27220Gauge::GetInstance().GetBatteryLevel(level, charging, discharging)) {
+        bool gauge_charging = false;
+        if (!Bq27220Gauge::GetInstance().GetBatteryLevel(level, gauge_charging,
+                                                        discharging)) {
             return false;
         }
 
@@ -888,8 +892,10 @@ public:
                 }
             }
         }
-        if (charger_input_initialized_) {
-            charging = charger_input_present_;
+        charging = gauge_charging;
+        if (charger_input_initialized_ && charger_input_present_) {
+            charging = true;
+            discharging = false;
         }
         return true;
     }

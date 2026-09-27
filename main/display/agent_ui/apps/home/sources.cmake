@@ -1,5 +1,6 @@
 list(APPEND AGENT_UI_SOURCES
     "display/agent_ui/apps/home/home_adapter.cc"
+    "display/agent_ui/apps/home/home_app_icons.cc"
     "display/agent_ui/apps/home/home_controller.cc"
     "display/agent_ui/apps/home/home_module.cc"
     "display/agent_ui/apps/home/home_renderer.cc"
