@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include <esp_log.h>
 #include <esp_timer.h>
 #include <font_awesome.h>
 #include <wifi_station.h>
@@ -31,6 +32,10 @@
 
 namespace agent_ui::home {
 namespace {
+
+// Battery announcements are one-shot events on a physical cable change, so this
+// is the only place the charging edge and the glyph it picks get recorded.
+constexpr char kBatteryTag[] = "HomeBattery";
 
 constexpr int kHeroTop = metrics::kStatusBarHeight;
 constexpr int kHeroHeight = 470;
@@ -324,9 +329,12 @@ struct HomeState {
     bool suppress_click = false;
     bool snapping = false;
     bool battery_initialized = false;
+    bool battery_deferred_logged = false;
     bool charging = false;
     bool charging_candidate = false;
     uint32_t charging_candidate_since_tick = 0;
+    bool battery_low_announced = false;
+    bool battery_full_announced = false;
     bool conversation_active = false;
     bool standby = false;
     ScreenId pending_screen = ScreenId::Home;
@@ -1658,7 +1666,34 @@ void Renderer::UpdateBattery(bool has_battery, int level, bool charging) {
     // and accepting that false edge would announce the same cable again when
     // the device wakes.
     if (Application::GetInstance().IsLowPowerStandby()) {
+        if (charging != s_state->charging && !s_state->battery_deferred_logged) {
+            s_state->battery_deferred_logged = true;
+            ESP_LOGI(kBatteryTag, "Charging=%d deferred until standby exits",
+                     static_cast<int>(charging));
+        }
         return;
+    }
+    s_state->battery_deferred_logged = false;
+
+    // The battery graphics report a transition, so each one fires on the edge into
+    // the state it announces and re-arms on the way out. Without the hysteresis a
+    // level that sits on the threshold would replay the animation on every poll.
+    constexpr int kLowBatteryLevel = 20;
+    constexpr int kLowBatteryRearmLevel = 25;
+    const bool low = level < kLowBatteryLevel && !charging;
+    if (low && !s_state->battery_low_announced) {
+        s_state->battery_low_announced = true;
+        s_state->expression->PlayBatteryLow();
+    } else if (level >= kLowBatteryRearmLevel) {
+        s_state->battery_low_announced = false;
+    }
+    const bool full = charging && level >= 100;
+    if (full && !s_state->battery_full_announced) {
+        s_state->battery_full_announced = true;
+        ESP_LOGI(kBatteryTag, "Announcing battery full glyph at level=%d", level);
+        s_state->expression->PlayBatteryFull();
+    } else if (!full) {
+        s_state->battery_full_announced = false;
     }
 
     const uint32_t now = lv_tick_get();
@@ -1697,13 +1732,22 @@ void Renderer::UpdateBattery(bool has_battery, int level, bool charging) {
     }
 
     s_state->charging = charging;
+    ESP_LOGI(kBatteryTag, "Charging edge confirmed: level=%d sleeping=%d held=%d",
+             level, static_cast<int>(s_state->expression->IsSleeping()),
+             static_cast<int>(s_state->expression->HoldsSpecial()));
     if (charging) {
         // Charging can begin while the expression is in standby sleep. Wake
         // first so the charging action is rendered instead of only queued.
         if (s_state->expression->IsSleeping()) {
             s_state->expression->Wake();
         }
-        s_state->expression->PlayCharging();
+        // The plug-in edge gets the battery graphic; the bolt-eyed charging pose
+        // stays the expression held while the AI acknowledges the cable. A cable
+        // that arrives on a full battery has already been reported by the state
+        // check above, so only the not-full case is announced here.
+        if (level < 100) {
+            s_state->expression->PlayBattery();
+        }
     }
 }
 
