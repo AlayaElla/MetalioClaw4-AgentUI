@@ -56,6 +56,24 @@ void SetA8Color(lv_obj_t* image, uint32_t color) {
     lv_obj_set_style_image_recolor_opa(image, LV_OPA_COVER, LV_PART_MAIN);
 }
 
+// The words behind the face. Home hides the mini face and has no caption of its
+// own, so this is the only place its state is spelled out.
+const char* AgentStateText(AgentState state) {
+    switch (state) {
+        case AgentState::Connecting:
+            return "连接中";
+        case AgentState::Listening:
+            return "聆听中";
+        case AgentState::Answering:
+            return "说话中";
+        case AgentState::Error:
+            return "异常";
+        case AgentState::Idle:
+        default:
+            return "待机";
+    }
+}
+
 }  // namespace
 
 void StatusBar::AgentFaceClicked(lv_event_t* event) {
@@ -456,6 +474,11 @@ void StatusBar::UpdateAgentPresentation() {
     if (show_caption) {
         lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_text_align(agent_label_, LV_TEXT_ALIGN_LEFT,
+                                    LV_PART_MAIN);
+        lv_obj_set_style_text_color(agent_label_,
+                                    lv_color_hex(Theme::Get().colors().text),
+                                    LV_PART_MAIN);
         if (reply_presented_) return;
         reply_presented_ = true;
         if (reply_finish_timer_) { lv_timer_delete(reply_finish_timer_); reply_finish_timer_ = nullptr; }
@@ -511,9 +534,25 @@ void StatusBar::UpdateAgentPresentation() {
         return;
     }
     const bool show_activation = !last_center_text_.empty() && !lock_screen_mode_;
-    if (show_activation) {
+    // Home shows no mini face, so the state has to be said in words instead.
+    const bool show_state =
+        !show_activation && home_active_ && !lock_screen_mode_;
+    if (show_activation || show_state) {
+        const auto& colors = Theme::Get().colors();
         lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(agent_label_, last_center_text_.c_str());
+        lv_obj_set_style_text_align(agent_label_,
+                                    show_state ? LV_TEXT_ALIGN_CENTER
+                                               : LV_TEXT_ALIGN_LEFT,
+                                    LV_PART_MAIN);
+        lv_obj_set_style_text_color(
+            agent_label_,
+            lv_color_hex(show_state && agent_state_ != AgentState::Idle
+                             ? colors.accent
+                             : colors.text),
+            LV_PART_MAIN);
+        lv_label_set_text(agent_label_,
+                          show_activation ? last_center_text_.c_str()
+                                          : AgentStateText(agent_state_));
         lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);
         lv_obj_set_x(reply_clip_, home_active_ ? 0 : 140);
         lv_obj_set_width(reply_clip_, home_active_ ? 360 : 220);
@@ -524,8 +563,12 @@ void StatusBar::UpdateAgentPresentation() {
         lv_obj_set_style_translate_y(battery_group_, 0, LV_PART_MAIN);
         lv_obj_set_style_opa(battery_group_, LV_OPA_COVER, LV_PART_MAIN);
     }
-    if (lock_screen_mode_ || (home_active_ && !show_activation)) lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    if (lock_screen_mode_ ||
+        (home_active_ && !show_activation && !show_state)) {
+        lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    }
     AnimateAgentFace(0, 420);
 }
 
@@ -593,14 +636,6 @@ void StatusBar::AnimateAgentCluster(int32_t target, uint32_t duration_ms) {
 
 void StatusBar::SetHomeActive(bool active) {
     if (home_active_ == active) {
-        if (agent_cluster_ != nullptr && lv_obj_is_valid(agent_cluster_) &&
-            !lock_screen_mode_) {
-            if (active) {
-                lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
         UpdateAgentPresentation();
         return;
     }
@@ -612,12 +647,11 @@ void StatusBar::SetHomeActive(bool active) {
         lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    // Home keeps the cluster for the state words; only the mini face steps out.
+    lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
     if (active) {
-        lv_anim_delete(agent_cluster_, SetAgentClusterTranslateY);
-        lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_translate_y(agent_cluster_, 0, LV_PART_MAIN);
     } else {
-        lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_translate_y(agent_cluster_, -metrics::kStatusBarHeight,
                                      LV_PART_MAIN);
         AnimateAgentCluster(0, metrics::kTransitionMs);
