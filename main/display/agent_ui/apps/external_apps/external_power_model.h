@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace agent_ui::standby_test {
+namespace agent_ui::power_diagnostics {
 
 inline constexpr int kTargetStandbyHours = 24;
 inline constexpr int kBatteryCapacityMah = 1500;
@@ -138,4 +138,4 @@ private:
     TestResult result_{};
 };
 
-}  // namespace agent_ui::standby_test
+}  // namespace agent_ui::power_diagnostics

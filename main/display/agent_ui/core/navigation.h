@@ -26,7 +26,7 @@ private:
     Navigation() = default;
     void Load(ScreenId id, TransitionDirection direction, bool update_stack);
 
-    static constexpr size_t kAppCount = static_cast<size_t>(ScreenId::StandbyTest) + 1;
+    static constexpr size_t kAppCount = static_cast<size_t>(ScreenId::Power) + 1;
     std::array<AppFactory, kAppCount> factories_{};
     std::array<ScreenId, 8> stack_{};
     size_t stack_size_ = 0;

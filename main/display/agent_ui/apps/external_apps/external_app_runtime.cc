@@ -4,6 +4,7 @@
 #include "external_recording_service.h"
 #include "external_magnetic_service.h"
 #include "external_synth_service.h"
+#include "external_power_service.h"
 #include "external_app_symbols.h"
 
 #include <algorithm>
@@ -571,7 +572,8 @@ metalio_app_capabilities_t GetCapabilities(void* host_context) {
            METALIO_APP_CAP_UI_THEME |
            METALIO_APP_CAP_APP_STORAGE |
            METALIO_APP_CAP_UI_CONTROLS |
-           METALIO_APP_CAP_AI_ACTIONS;
+           METALIO_APP_CAP_AI_ACTIONS |
+           METALIO_APP_CAP_POWER_DIAGNOSTICS;
     if (auto* magnetic = MagneticService::Existing(); magnetic && magnetic->Available())
         capabilities |= METALIO_APP_CAP_MAGNETOMETER;
     if (Board::GetInstance().GetAudioCodec() != nullptr)
@@ -967,6 +969,29 @@ int SynthStop(void* host_context) {
 int SynthGetState(void* host_context, metalio_app_synth_state_t* output) {
     Runtime::State* state = CheckedState(host_context);
     return state ? SynthService::Get().GetState(state, output) : METALIO_APP_SYNTH_ERROR_INVALID;
+}
+
+int GetPowerReading(void* host_context, metalio_app_power_reading_t* reading) {
+    return CheckedState(host_context) ? PowerService::Get().Read(reading) : METALIO_APP_POWER_ERROR_INVALID;
+}
+
+int StandbyStart(void* host_context, uint32_t duration_ms) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state) return METALIO_APP_POWER_ERROR_INVALID;
+    if (state->paused) return METALIO_APP_POWER_ERROR_BUSY;
+    return PowerService::Get().Start(state, duration_ms);
+}
+
+int StandbyGetResult(void* host_context, metalio_app_standby_result_t* result) {
+    Runtime::State* state = CheckedState(host_context);
+    return state ? PowerService::Get().GetResult(state, result) : METALIO_APP_POWER_ERROR_INVALID;
+}
+
+int StandbyCancel(void* host_context) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state) return METALIO_APP_POWER_ERROR_INVALID;
+    auto* power = PowerService::Existing();
+    return power ? power->Cancel(state) : METALIO_APP_POWER_OK;
 }
 
 int AddBar(void* host_context, int16_t x, int16_t y, int16_t width,
@@ -3129,6 +3154,10 @@ bool Runtime::Launch(const AppInfo& app, lv_obj_t* content, lv_obj_t* actions,
         .synth_set = SynthSet,
         .synth_stop = SynthStop,
         .synth_get_state = SynthGetState,
+        .get_power_reading = GetPowerReading,
+        .standby_start = StandbyStart,
+        .standby_get_result = StandbyGetResult,
+        .standby_cancel = StandbyCancel,
     };
     state->launch_context = {
         .abi_version = METALIO_APP_ABI_VERSION,
@@ -3155,6 +3184,7 @@ void Runtime::SetPaused(bool paused) {
     if (state_ == nullptr || state_->paused == paused) return;
     state_->paused = paused;
     if (paused) {
+        if (auto* power = PowerService::Existing()) power->SuspendOwner(state_);
         if (auto* magnetic = MagneticService::Existing()) magnetic->SuspendOwner(state_);
         if (auto* synth = SynthService::Existing()) synth->SuspendOwner(state_);
         if (MediaService* media = MediaService::Existing(); media != nullptr) {
@@ -3311,6 +3341,7 @@ void Runtime::Unload() {
     if (state_ == nullptr) return;
     ++generation_;
     UnregisterAiActions(state_);
+    if (auto* power = PowerService::Existing()) power->UnloadOwner(state_);
     for (auto token : state_->ai_blocks) ai::Availability::Get().ReleaseBlock(token);
     state_->ai_blocks.clear();
     if (auto* magnetic = MagneticService::Existing()) magnetic->UnloadOwner(state_);

@@ -76,6 +76,7 @@ typedef uint64_t metalio_app_capabilities_t;
 #define METALIO_APP_CAP_UI_CONTROLS (UINT64_C(1) << 18)
 #define METALIO_APP_CAP_AI_ACTIONS (UINT64_C(1) << 19)
 #define METALIO_APP_CAP_AUDIO_SYNTH (UINT64_C(1) << 20)
+#define METALIO_APP_CAP_POWER_DIAGNOSTICS (UINT64_C(1) << 21)
 
 /*
  * AI actions are declared in manifest.json and bound by their exact id at
@@ -441,6 +442,59 @@ typedef struct {
     uint32_t missed_frame_count;
 } metalio_pet_render_stats_t;
 
+/* A fresh board snapshot. Validity flags distinguish missing gauges from zero. */
+typedef struct {
+    uint32_t cpu_frequency_mhz;
+    int32_t applied_max_mhz;
+    int32_t screen_off_max_mhz;
+    int32_t voltage_mv;
+    int32_t current_ma; /* Positive charging, negative discharging. */
+    int16_t battery_percent;
+    uint8_t battery_valid;
+    uint8_t power_valid;
+    uint8_t charging;
+    uint8_t external_power;
+    uint8_t standby_active;
+    uint8_t screen_off;
+} metalio_app_power_reading_t;
+
+typedef enum {
+    METALIO_APP_STANDBY_IDLE = 0,
+    METALIO_APP_STANDBY_WAITING = 1,
+    METALIO_APP_STANDBY_MEASURING = 2,
+    METALIO_APP_STANDBY_WAKING = 3,
+    METALIO_APP_STANDBY_COMPLETED = 4,
+    METALIO_APP_STANDBY_CANCELLED = 5,
+    METALIO_APP_STANDBY_ERROR = 6,
+} metalio_app_standby_state_t;
+
+typedef enum {
+    METALIO_APP_POWER_OK = 0,
+    METALIO_APP_POWER_ERROR_INVALID = -1,
+    METALIO_APP_POWER_ERROR_BUSY = -2,
+    METALIO_APP_POWER_ERROR_MEMORY = -3,
+    METALIO_APP_POWER_ERROR_SCREEN = -4,
+    METALIO_APP_POWER_ERROR_WAKE = -5,
+} metalio_app_power_result_t;
+
+typedef struct {
+    metalio_app_standby_state_t state;
+    int32_t error;
+    uint32_t requested_duration_ms;
+    uint32_t elapsed_ms;
+    uint32_t black_screen_mhz;
+    int32_t applied_max_mhz;
+    int32_t average_current_ma;
+    uint32_t sample_count;
+    uint32_t sample_attempts;
+    uint32_t sleep_ms;
+    uint32_t sleep_entries;
+    uint32_t sleep_rejected;
+    uint8_t external_power;
+    uint8_t woke_to_lock_screen;
+    uint8_t reserved[2];
+} metalio_app_standby_result_t;
+
 typedef struct metalio_app_host_api {
     uint32_t abi_version;
     uint32_t struct_size;
@@ -679,6 +733,15 @@ typedef struct metalio_app_host_api {
                       const metalio_app_synth_params_t* params);
     int (*synth_stop)(void* host_context);
     int (*synth_get_state)(void* host_context, metalio_app_synth_state_t* state);
+
+    /* ABI 1 power diagnostics. Check struct_size and POWER_DIAGNOSTICS.
+     * UI-thread requests; the host samples and wakes without App callbacks.
+     * duration_ms is 0 (manual standby), 15000 or 60000. Timed runs keep the
+     * normal network grace period. App unload cancels its pending timed wake. */
+    int (*get_power_reading)(void* host_context, metalio_app_power_reading_t* reading);
+    int (*standby_start)(void* host_context, uint32_t duration_ms);
+    int (*standby_get_result)(void* host_context, metalio_app_standby_result_t* result);
+    int (*standby_cancel)(void* host_context);
 } metalio_app_host_api_t;
 
 typedef struct metalio_app_launch_context {

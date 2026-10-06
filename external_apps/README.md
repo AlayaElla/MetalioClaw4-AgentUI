@@ -77,6 +77,12 @@ PCM16 WAV to `/sdcard/Recordings`, and plays the latest saved recording through
 playback and cancel controls between the timer and waveform. It requires firmware
 with recording-file playback support.
 
+**待机功耗** (`standby-power-1.0.0.eapp`) displays live CPU frequency, battery
+voltage/current and timed black-screen measurements. Its UI runs in the external
+App; the host samples during display suspension and restores the lock screen.
+Install it under `/metalio/apps/` on the SD card. See
+`examples/standby_power/README.md` and `build-standby-power.ps1`.
+
 The public ABI is `sdk/metalio_app_api.h`. ABI 1 contains a small LVGL-backed
 surface plus additive label, bar, timer, action-bar, Pet renderer, media,
 haptics and motion functions. Apps must inspect both `struct_size` and the
@@ -125,9 +131,23 @@ board has no angular-rate gyroscope, so the API deliberately does not report
 degrees-per-second values. External apps are native code, not a security sandbox,
 so only run apps from sources you trust.
 
+## Power diagnostics (ABI 1)
+
+`METALIO_APP_CAP_POWER_DIAGNOSTICS` gates the appended `get_power_reading`,
+`standby_start`, `standby_get_result` and `standby_cancel` calls. Check both the
+function-table size and capability before calling them. `standby_start` accepts
+0 for manual standby, or 15000/60000 ms for timed sampling and wake. The host
+creates its reusable timed worker only when first requested. Results belong to
+the requesting App instance; unload invalidates its pending wake and callbacks.
+Standby overlay suspension pauses the App UI while the host completes the test.
+Other App suspension cancels its scheduled test.
+
+Timed samples retain the normal network grace period. They describe connected
+black-screen power, not the later offline standby phase or measured battery life.
+
 ## Magnetic instruments (ABI 1)
 
-The new function-table tail follows `ai_get_availability` in this exact order:
+The instrument extension follows `ai_get_availability` in this exact order:
 `get_magnetic_sample_ex`, `synth_start`, `synth_set`, `synth_stop`,
 `synth_get_state`. All earlier fields and ABI version 1 are retained. The
 manifest and native import allowlist are unchanged. Check both the function

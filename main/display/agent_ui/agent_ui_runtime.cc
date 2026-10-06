@@ -23,7 +23,6 @@
 #include "agent_ui/apps/files/files_view.h"
 #include "agent_ui/apps/phone/phone_view.h"
 #include "agent_ui/apps/settings/settings_view.h"
-#include "agent_ui/apps/standby_test/standby_test_view.h"
 #include "agent_ui/apps/home/home_renderer.h"
 #include "ai/ai_availability.h"
 #include "ai/system_connectivity.h"
@@ -82,7 +81,6 @@ void Runtime::Initialize() {
     Navigation::Get().Register(ScreenId::ExternalAppHost,
                                external_apps::HostView::Create);
     Navigation::Get().Register(ScreenId::DisplayDebug, DisplayDebugView::Create);
-    Navigation::Get().Register(ScreenId::StandbyTest, StandbyTestView::Create);
     UiDispatcher::Init();
     ai::system_connectivity::RegisterProviders();
     RegisterAppMcpTools();

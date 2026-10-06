@@ -208,13 +208,12 @@ struct AppDefinition {
     bool requires_network;
 };
 
-const std::array<AppDefinition, 6> kBuiltInApps = {{
+const std::array<AppDefinition, 5> kBuiltInApps = {{
     {ScreenId::Codex, "01", "Codex", "", true},
     {ScreenId::Phone, "02", "电话", "", false},
     {ScreenId::Files, "03", "文件", "", false},
     {ScreenId::Camera, "04", "相机", "", false},
     {ScreenId::Settings, "05", "设置", "", false},
-    {ScreenId::StandbyTest, "06", "待机测试", "", false},
 }};
 
 std::vector<AppDefinition> BuildAppDefinitions() {

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+set(PROJECT_VER "1.0.0")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(metalio_standby_power)
+include(elf_loader)
+set(ELF_LIBS "-Wl,-z,max-page-size=16")
+project_elf(metalio_standby_power)
