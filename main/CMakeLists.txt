@@ -267,6 +267,7 @@ if(CONFIG_BOARD_TYPE_METALIO_CLAW_4)
     # lock creation unchanged.
     target_link_libraries(${COMPONENT_LIB} INTERFACE
         "-Wl,--wrap=esp_pm_lock_create"
+        "-Wl,--wrap=esp_light_sleep_start"
     )
 endif()
 

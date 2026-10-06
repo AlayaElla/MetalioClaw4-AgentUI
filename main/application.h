@@ -107,6 +107,9 @@ public:
     bool IsCodexVoiceCaptureActive() const {
         return codex_voice_capture_active_.load();
     }
+    bool IsCodexRealtimePlaybackActive() const {
+        return codex_realtime_playback_active_.load();
+    }
 private:
     Application();
     ~Application();
@@ -132,7 +135,7 @@ private:
     std::function<void()> codex_voice_stopped_callback_;
     std::string codex_realtime_request_id_;
     uint32_t codex_realtime_audio_sequence_ = 0;
-    bool codex_realtime_playback_active_ = false;
+    std::atomic<bool> codex_realtime_playback_active_{false};
     bool codex_realtime_restore_wake_word_ = false;
     std::atomic<bool> low_power_standby_{false};
     bool standby_restore_wake_word_ = false;

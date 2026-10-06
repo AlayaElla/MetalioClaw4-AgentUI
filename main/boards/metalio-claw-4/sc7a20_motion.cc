@@ -249,8 +249,14 @@ void Sc7a20MotionService::TaskMain() {
     while (true) {
         if (suspended_.load()) {
             if (device_ != nullptr) {
-                (void)WriteRegister(kCtrlReg1, kPowerDown);
+                if (!WriteRegister(kCtrlReg1, kPowerDown)) {
+                    // Keep the handle and retry; a failed write is not a
+                    // powered-down sensor.
+                    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+                    continue;
+                }
                 Disconnect();
+                ESP_LOGI(kTag, "Motion sensor powered down for standby");
             }
             detector_.Reset();
             ResetTilt();
@@ -258,14 +264,16 @@ void Sc7a20MotionService::TaskMain() {
             continue;
         }
         if (!Connect()) {
-            vTaskDelay(pdMS_TO_TICKS(kReconnectDelayMs));
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kReconnectDelayMs));
             continue;
         }
 
         detector_.Reset();
         int consecutive_errors = 0;
         vTaskDelay(pdMS_TO_TICKS(100));
-        while (device_ != nullptr) {
+        // The suspend request must also be observed after a successful
+        // connection, otherwise this inner loop samples throughout standby.
+        while (device_ != nullptr && !suspended_.load()) {
             Sc7a20Sample sample;
             if (!ReadSample(&sample)) {
                 ++consecutive_errors;
@@ -291,7 +299,7 @@ void Sc7a20MotionService::TaskMain() {
                     PostDizzyExpression(shake_action_count);
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(kSamplePeriodMs));
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kSamplePeriodMs));
         }
     }
 }

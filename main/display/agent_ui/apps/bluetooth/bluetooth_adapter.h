@@ -17,6 +17,11 @@ public:
     void Execute(const Command& command);
     bool IsEnabled() const;
     bool IsConnected() const;
+    // Called with application audio paused. Wake waits for the module's local
+    // I2S clock acknowledgement before allowing codec capture to resume.
+    bool SetLowPowerStandby(bool enabled);
+    bool PrepareLowPowerWake();
+    void CompleteLowPowerWake();
 
 private:
     Adapter();

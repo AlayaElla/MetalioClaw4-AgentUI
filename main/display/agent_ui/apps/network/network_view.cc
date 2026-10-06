@@ -55,7 +55,7 @@ void View::RenderLists(const ViewState& state) {
     std::vector<network_settings_ui::SavedItem> saved;
     saved.reserve(state.saved_networks.size());
     for (const auto& item : state.saved_networks) {
-        saved.push_back({item.ssid, item.is_default});
+        saved.push_back({item.ssid, item.is_connected});
     }
     network_settings_ui::RenderSaved(settings_, saved, OnSavedItem);
 

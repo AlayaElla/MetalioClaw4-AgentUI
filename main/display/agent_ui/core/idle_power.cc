@@ -188,8 +188,6 @@ void IdlePower::Tick() {
         Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
         expression_sleep_triggered_ = true;
         home::Renderer::SleepExpression();
-        Application::GetInstance().TriggerSpecialInteraction(
-            SpecialInteraction::Sleep);
         return;
     }
 }

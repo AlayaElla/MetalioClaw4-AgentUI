@@ -2,6 +2,8 @@
 #include "external_http_service.h"
 #include "external_media_service.h"
 #include "external_recording_service.h"
+#include "external_magnetic_service.h"
+#include "external_synth_service.h"
 #include "external_app_symbols.h"
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 
 #include <esp_elf.h>
 #include <esp_app_desc.h>
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_memory_utils.h>
@@ -58,7 +61,6 @@ constexpr size_t kMaxElfBytes = 4 * 1024 * 1024;
 constexpr size_t kMaxLabelBytes = 512;
 constexpr size_t kMaxAssetBytes = 8 * 1024 * 1024;
 constexpr uint16_t kElfMachineRiscV = 243;
-constexpr uint32_t kRelocationStackBytes = 6 * 1024;
 constexpr uint32_t kMinimumIntervalMs = 16;
 constexpr uint32_t kMaximumIntervalMs = 60 * 1000;
 constexpr uint32_t kMaximumPetKeyframes = 64;
@@ -443,11 +445,23 @@ struct Runtime::State {
 
 namespace {
 
+// Relocation cannot use a PSRAM stack while the ELF loader disables cache.
+// The loader uses bounded, non-recursive frames; the current P4 build measured
+// 808 bytes of peak use. Keep headroom without starving internal DMA buffers.
+constexpr uint32_t kRelocationStackBytes = 3 * 1024;
+constexpr size_t kRelocationStackDepth =
+    (kRelocationStackBytes + sizeof(StackType_t) - 1) / sizeof(StackType_t);
+DRAM_ATTR alignas(portBYTE_ALIGNMENT) static StackType_t
+    s_relocation_stack[kRelocationStackDepth];
+DRAM_ATTR static StaticTask_t s_relocation_task;
+static std::atomic_flag s_relocation_busy = ATOMIC_FLAG_INIT;
+
 struct RelocationRequest {
     Runtime::State* state = nullptr;
     SemaphoreHandle_t completion = nullptr;
     int init_result = -1;
     int relocate_result = -1;
+    UBaseType_t stack_high_water_bytes = 0;
 };
 
 void RelocateOnInternalStack(void* argument) {
@@ -458,13 +472,22 @@ void RelocateOnInternalStack(void* argument) {
         request->relocate_result = esp_elf_relocate(
             &request->state->elf, request->state->elf_bytes);
     }
+    request->stack_high_water_bytes = uxTaskGetStackHighWaterMark(nullptr);
     xSemaphoreGive(request->completion);
-    // The caller owns the WithCaps task and deletes it after this task is
-    // suspended. This avoids the self-delete cleanup task described by IDF.
+    // The caller waits for this task to stop running before reusing its static
+    // stack and TCB.
     vTaskSuspend(nullptr);
 }
 
 bool RelocateWithInternalStack(Runtime::State* state, std::string* error) {
+    if (s_relocation_busy.test_and_set(std::memory_order_acquire)) {
+        if (error != nullptr) *error = "ELF 重定位任务正忙，请稍后重试";
+        return false;
+    }
+    struct BusyGuard {
+        ~BusyGuard() { s_relocation_busy.clear(std::memory_order_release); }
+    } busy_guard;
+
     StaticSemaphore_t completion_storage{};
     SemaphoreHandle_t completion = xSemaphoreCreateBinaryStatic(&completion_storage);
     if (completion == nullptr) {
@@ -475,18 +498,40 @@ bool RelocateWithInternalStack(Runtime::State* state, std::string* error) {
         .state = state,
         .completion = completion,
     };
-    TaskHandle_t task = nullptr;
-    const BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+    const BaseType_t core_id = xPortGetCoreID();
+    TaskHandle_t task = xTaskCreateStaticPinnedToCore(
         RelocateOnInternalStack, "elf_relocate", kRelocationStackBytes,
-        &request, tskIDLE_PRIORITY + 5, &task, xPortGetCoreID(),
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (created != pdPASS) {
-        if (error != nullptr) *error = "内部 RAM 不足，无法创建 ELF 重定位任务";
+        &request, tskIDLE_PRIORITY + 5, s_relocation_stack,
+        &s_relocation_task, core_id);
+    if (task == nullptr) {
+        ESP_LOGE(kTag,
+                 "Failed to create static ELF relocation task: "
+                 "internal_free=%u internal_largest=%u stack_bytes=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(kRelocationStackBytes));
+        if (error != nullptr) *error = "无法创建 ELF 重定位任务";
         return false;
     }
 
     xSemaphoreTake(completion, portMAX_DELAY);
-    vTaskDeleteWithCaps(task);
+    for (;;) {
+        bool task_is_current = false;
+        for (BaseType_t core = 0; core < configNUMBER_OF_CORES; ++core) {
+            if (xTaskGetCurrentTaskHandleForCore(core) == task) {
+                task_is_current = true;
+                break;
+            }
+        }
+        if (!task_is_current && eTaskGetState(task) == eSuspended) break;
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    // This is a statically allocated task, so vTaskDelete keeps both buffers
+    // intact. Waiting until it is suspended and off every core makes them safe
+    // to reuse immediately after deletion returns.
+    vTaskDelete(task);
     if (request.init_result != 0) {
         if (error != nullptr) *error = "ELF 加载器初始化失败";
         return false;
@@ -495,6 +540,9 @@ bool RelocateWithInternalStack(Runtime::State* state, std::string* error) {
         if (error != nullptr) *error = "ELF 重定位失败；请检查 ABI 与目标芯片";
         return false;
     }
+    ESP_LOGI(kTag, "ELF relocation stack high-water: %u/%u bytes",
+             static_cast<unsigned>(request.stack_high_water_bytes),
+             static_cast<unsigned>(kRelocationStackBytes));
     return true;
 }
 
@@ -505,7 +553,7 @@ Runtime::State* CheckedState(void* host_context) {
 
 metalio_app_capabilities_t GetCapabilities(void* host_context) {
     if (CheckedState(host_context) == nullptr) return 0;
-    return METALIO_APP_CAP_HAPTICS |
+    metalio_app_capabilities_t capabilities = METALIO_APP_CAP_HAPTICS |
            METALIO_APP_CAP_MOTION_ACCELEROMETER |
            METALIO_APP_CAP_MOTION_TILT |
            METALIO_APP_CAP_MEDIA_HLS |
@@ -524,6 +572,11 @@ metalio_app_capabilities_t GetCapabilities(void* host_context) {
            METALIO_APP_CAP_APP_STORAGE |
            METALIO_APP_CAP_UI_CONTROLS |
            METALIO_APP_CAP_AI_ACTIONS;
+    if (auto* magnetic = MagneticService::Existing(); magnetic && magnetic->Available())
+        capabilities |= METALIO_APP_CAP_MAGNETOMETER;
+    if (Board::GetInstance().GetAudioCodec() != nullptr)
+        capabilities |= METALIO_APP_CAP_AUDIO_SYNTH;
+    return capabilities;
 }
 
 Runtime::State::AiActionBinding* FindAiAction(Runtime::State* state,
@@ -865,13 +918,55 @@ int GetDateTime(void* host_context, metalio_app_date_time_t* output) {
     return 0;
 }
 
+int GetMagneticSampleEx(void* host_context,
+                        metalio_app_magnetic_sample_ex_t* sample) {
+    Runtime::State* state = CheckedState(host_context);
+    if (state == nullptr || sample == nullptr) return -1;
+    *sample = {};
+    auto* magnetic = MagneticService::Existing();
+    if (!magnetic || !magnetic->Available()) return -2;
+    if (state->paused) return 0;
+    return magnetic->Read(state, sample);
+}
+
 int GetMagneticSample(void* host_context,
                       metalio_app_magnetic_sample_t* sample) {
-    if (CheckedState(host_context) == nullptr || sample == nullptr) return -1;
+    if (sample == nullptr) return -1;
     *sample = {};
-    // MetalioClaw4 currently has no magnetometer. Keep the ABI callable so a
-    // future board can advertise the capability without changing App code.
-    return -2;
+    metalio_app_magnetic_sample_ex_t precise{};
+    const int result = GetMagneticSampleEx(host_context, &precise);
+    if (result != 0) return result;
+    const auto rounded_microtesla = [](int32_t nanotesla) {
+        const int64_t value = nanotesla;
+        return static_cast<int32_t>((value + (value < 0 ? -500 : 500)) / 1000);
+    };
+    sample->x_microtesla = rounded_microtesla(precise.x_nanotesla);
+    sample->y_microtesla = rounded_microtesla(precise.y_nanotesla);
+    sample->z_microtesla = rounded_microtesla(precise.z_nanotesla);
+    sample->valid = precise.valid;
+    return 0;
+}
+
+int SynthStart(void* host_context) {
+    Runtime::State* state = CheckedState(host_context);
+    if (!state) return METALIO_APP_SYNTH_ERROR_INVALID;
+    if (state->paused) return METALIO_APP_SYNTH_ERROR_BUSY;
+    return SynthService::Get().Start(state);
+}
+
+int SynthSet(void* host_context, const metalio_app_synth_params_t* params) {
+    Runtime::State* state = CheckedState(host_context);
+    return state ? SynthService::Get().Set(state, params) : METALIO_APP_SYNTH_ERROR_INVALID;
+}
+
+int SynthStop(void* host_context) {
+    Runtime::State* state = CheckedState(host_context);
+    return state ? SynthService::Get().Stop(state) : METALIO_APP_SYNTH_ERROR_INVALID;
+}
+
+int SynthGetState(void* host_context, metalio_app_synth_state_t* output) {
+    Runtime::State* state = CheckedState(host_context);
+    return state ? SynthService::Get().GetState(state, output) : METALIO_APP_SYNTH_ERROR_INVALID;
 }
 
 int AddBar(void* host_context, int16_t x, int16_t y, int16_t width,
@@ -943,6 +1038,12 @@ int SetBarColors(void* host_context, metalio_app_widget_t widget,
 
 int MediaStart(void* host_context, const char* url) {
     Runtime::State* state = CheckedState(host_context);
+    if (state && url) {
+        if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) {
+            synth->Stop(state);
+            return -2;
+        }
+    }
     return state != nullptr ? MediaService::Get().Start(state, url) : -1;
 }
 
@@ -953,6 +1054,12 @@ int MediaPause(void* host_context) {
 
 int MediaResume(void* host_context) {
     Runtime::State* state = CheckedState(host_context);
+    if (state) {
+        if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) {
+            synth->Stop(state);
+            return -2;
+        }
+    }
     return state != nullptr ? MediaService::Get().Resume(state) : -1;
 }
 
@@ -1014,6 +1121,11 @@ int RecordingStart(
         void* host_context, const metalio_app_recording_config_t* config) {
     Runtime::State* state = CheckedState(host_context);
     if (state == nullptr) return METALIO_APP_RECORDING_ERROR_INVALID;
+    if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) {
+        synth->Stop(state);
+        ESP_LOGW(kTag, "recording blocked: synthesizer stopping");
+        return METALIO_APP_RECORDING_ERROR_BUSY;
+    }
     // Recording owns the external audio session; a Radio/Music App must stop
     // playback before the microphone route is activated.
     MediaService::Get().Stop(state);
@@ -2813,6 +2925,11 @@ bool ResetExternalServicesForLaunch(std::string* error) {
     const int64_t deadline_us =
         started_us + static_cast<int64_t>(kExternalServiceResetTimeoutMs) * 1000;
 
+    if (auto* synth = SynthService::Existing(); synth != nullptr &&
+        !synth->ResetForAppLaunch(RemainingResetTimeMs(deadline_us))) {
+        if (error != nullptr) *error = "音调服务清理超时，请稍后重试";
+        return false;
+    }
     MediaService* media = MediaService::Existing();
     if (media != nullptr &&
         !media->ResetForAppLaunch(RemainingResetTimeMs(deadline_us))) {
@@ -3007,6 +3124,11 @@ bool Runtime::Launch(const AppInfo& app, lv_obj_t* content, lv_obj_t* actions,
         .ai_acquire_block = AcquireAiBlock,
         .ai_release_block = ReleaseAiBlock,
         .ai_get_availability = GetAiAvailability,
+        .get_magnetic_sample_ex = GetMagneticSampleEx,
+        .synth_start = SynthStart,
+        .synth_set = SynthSet,
+        .synth_stop = SynthStop,
+        .synth_get_state = SynthGetState,
     };
     state->launch_context = {
         .abi_version = METALIO_APP_ABI_VERSION,
@@ -3033,6 +3155,8 @@ void Runtime::SetPaused(bool paused) {
     if (state_ == nullptr || state_->paused == paused) return;
     state_->paused = paused;
     if (paused) {
+        if (auto* magnetic = MagneticService::Existing()) magnetic->SuspendOwner(state_);
+        if (auto* synth = SynthService::Existing()) synth->SuspendOwner(state_);
         if (MediaService* media = MediaService::Existing(); media != nullptr) {
             media->SuspendOwner(state_);
         }
@@ -3189,6 +3313,8 @@ void Runtime::Unload() {
     UnregisterAiActions(state_);
     for (auto token : state_->ai_blocks) ai::Availability::Get().ReleaseBlock(token);
     state_->ai_blocks.clear();
+    if (auto* magnetic = MagneticService::Existing()) magnetic->UnloadOwner(state_);
+    if (auto* synth = SynthService::Existing()) synth->UnloadOwner(state_);
     if (MediaService* media = MediaService::Existing(); media != nullptr) {
         media->UnloadOwner(state_);
     }

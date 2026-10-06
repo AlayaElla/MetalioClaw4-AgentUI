@@ -138,36 +138,26 @@ void View::OpenPassword(const char* ssid, lv_event_cb_t connect_callback,
                               colors.muted);
     lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 42);
 
-    password_textarea_ = lv_textarea_create(card);
-    lv_obj_set_size(password_textarea_, LV_PCT(100), 58);
-    StyleTextInput(password_textarea_);
-    lv_obj_align(password_textarea_, LV_ALIGN_TOP_LEFT, 0, 82);
-    lv_textarea_set_one_line(password_textarea_, true);
-    lv_textarea_set_password_mode(password_textarea_, true);
+    password_textarea_ = ui_components::CreateTextField(card, "", nullptr, true);
+    lv_obj_set_pos(lv_obj_get_parent(password_textarea_), 0, 82);
+    lv_obj_set_width(password_textarea_, LV_PCT(100));
+    // Reserve the trailing action's 72 px area inside the shared input row.
+    lv_obj_set_style_pad_right(password_textarea_, 90, LV_PART_MAIN);
     IgnoreSwipeBack(password_textarea_, true);
 
-    lv_obj_t* show = lv_checkbox_create(card);
-    lv_checkbox_set_text(show, I18n::T("显示密码"));
-    lv_obj_set_style_text_font(show, fonts::Medium(), LV_PART_MAIN);
-    lv_obj_align(show, LV_ALIGN_BOTTOM_LEFT, 0, -6);
-    lv_obj_add_event_cb(show, OnShowPassword, LV_EVENT_VALUE_CHANGED, this);
-    IgnoreSwipeBack(show, true);
-
     lv_obj_t* cancel = ui_components::CreateButton(card);
-    lv_obj_set_size(cancel, 120, 50);
-    lv_obj_align(cancel, LV_ALIGN_BOTTOM_RIGHT, -132, 0);
-    lv_obj_set_style_bg_color(cancel, lv_color_hex(colors.raised), LV_PART_MAIN);
-    lv_obj_set_style_radius(cancel, 12, LV_PART_MAIN);
+    StyleButton(cancel);
+    lv_obj_set_size(cancel, 132, metrics::kTouchTarget);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_RIGHT, -144, 0);
     lv_obj_add_event_cb(cancel, OnCancelPassword, LV_EVENT_CLICKED, this);
     lv_obj_t* cancel_label = AddLabel(cancel, I18n::T("取消"), fonts::Medium(),
                                       colors.text);
     lv_obj_center(cancel_label);
 
     lv_obj_t* connect = ui_components::CreateButton(card);
-    lv_obj_set_size(connect, 120, 50);
+    StyleButton(connect, true);
+    lv_obj_set_size(connect, 132, metrics::kTouchTarget);
     lv_obj_align(connect, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_set_style_bg_color(connect, lv_color_hex(colors.accent), LV_PART_MAIN);
-    lv_obj_set_style_radius(connect, 12, LV_PART_MAIN);
     if (connect_callback != nullptr) {
         lv_obj_add_event_cb(connect, connect_callback, LV_EVENT_CLICKED, user_data);
     }
@@ -176,14 +166,6 @@ void View::OpenPassword(const char* ssid, lv_event_cb_t connect_callback,
     lv_obj_center(connect_label);
     Keyboard::Get().Bind(password_textarea_, "Wi-Fi 密码");
     Keyboard::Get().Show(password_textarea_, "Wi-Fi 密码");
-}
-
-void View::OnShowPassword(lv_event_t* event) {
-    auto* self = static_cast<View*>(lv_event_get_user_data(event));
-    if (self == nullptr || self->password_textarea_ == nullptr) return;
-    lv_textarea_set_password_mode(
-        self->password_textarea_,
-        !lv_obj_has_state(lv_event_get_target_obj(event), LV_STATE_CHECKED));
 }
 
 void View::OnCancelPassword(lv_event_t* event) {

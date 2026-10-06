@@ -36,6 +36,7 @@
 #include "agent_ui/core/navigation.h"
 #include "agent_ui/core/status_bar.h"
 #include "agent_ui/apps/external_apps/external_media_service.h"
+#include "agent_ui/apps/external_apps/external_synth_service.h"
 #include "esp_lv_adapter.h"
 #endif
 
@@ -389,6 +390,10 @@ void Application::SetAiWakeEnabled(bool enabled) {
 void Application::ApplyAiAvailability() {
     if (!audio_initialized_) return;
     if (!ai::Availability::Get().IsAvailable()) {
+#ifdef HAVE_LVGL
+        if (auto* synth = agent_ui::external_apps::SynthService::Existing())
+            synth->Interrupt();
+#endif
         CancelSpecialInteraction();
         if (device_state_ == kDeviceStateSpeaking) AbortSpeaking(kAbortReasonNone);
         if (device_state_ == kDeviceStateListening && protocol_) protocol_->SendStopListening();
@@ -418,6 +423,20 @@ void Application::ApplyAiAvailability() {
 bool Application::DeferAssistantForMedia(std::function<void()> continuation) {
     if (assistant_listen_pending_.load()) return true;
 #ifdef HAVE_LVGL
+    if (auto* synth = agent_ui::external_apps::SynthService::Existing();
+        synth && synth->IsActive()) {
+        if (assistant_listen_pending_.exchange(true)) return true;
+        const uint64_t generation = ai::Availability::Get().Generation();
+        if (synth->BeginAssistantInteraction([this, generation, continuation](bool ready) {
+                Schedule([this, generation, ready, continuation]() {
+                    assistant_listen_pending_.store(false);
+                    if (ready && ai::Availability::Get().IsAvailable() &&
+                        ai::Availability::Get().Generation() == generation &&
+                        !low_power_standby_.load()) continuation();
+                });
+            })) return true;
+        assistant_listen_pending_.store(false);
+    }
     if (device_state_ == kDeviceStateIdle) {
         auto* media = agent_ui::external_apps::MediaService::Existing();
         if (media && !media->HasAssistantInteraction()) {
@@ -665,6 +684,13 @@ void Application::TryStartCodexVoiceCapture() {
         return;
     }
     if (!codex_voice_start_pending_) return;
+#ifdef HAVE_LVGL
+    if (auto* synth = agent_ui::external_apps::SynthService::Existing();
+        synth && synth->IsActive()) {
+        synth->Interrupt();
+        return;
+    }
+#endif
     if (audio_service_.HasPendingSendAudio()) {
         const int64_t now_us = esp_timer_get_time();
         if (codex_voice_start_wait_started_at_us_ == 0) {
@@ -777,6 +803,9 @@ void Application::Start() {
     /* Setup the audio service */
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
+    // Model mapping may disable flash cache. Do it on app_main's internal
+    // stack before network provisioning can block and local apps become usable.
+    audio_service_.SetModelsList(esp_srmodel_init("model"));
     ai_wake_enabled_.store(Settings(ai_settings::kNamespace, false).GetInt("wake", 1) != 0);
     audio_service_.SetAiWakeEnabled(ai_wake_enabled_.load());
     audio_initialized_ = true;
@@ -849,8 +878,6 @@ void Application::Start() {
     // CheckAssetsVersion();
 
     ProvisionDevice(provisioning);
-    //加载唤醒词模型
-    GetAudioService().SetModelsList(esp_srmodel_init("model"));
     GetAudioService().EnableWakeWordDetection(false);
 
     // Initialize the protocol

@@ -144,8 +144,8 @@ void RenderSaved(Handles& handles, const std::vector<SavedItem>& items,
         controls::CreateCompactRow(
             handles.saved_list, FONT_AWESOME_WIFI, items[i].ssid.c_str(),
             nullptr,
-            items[i].is_default ? I18n::T("当前") : I18n::T("连接"), 68,
-            items[i].is_default, true, callback,
+            items[i].is_connected ? I18n::T("当前") : I18n::T("连接"), 68,
+            items[i].is_connected, true, callback,
             reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
     }
 }

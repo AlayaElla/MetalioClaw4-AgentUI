@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(metalio_voice_recorder)
+include(elf_loader)
+set(ELF_LIBS "-Wl,-z,max-page-size=16")
+project_elf(metalio_voice_recorder)

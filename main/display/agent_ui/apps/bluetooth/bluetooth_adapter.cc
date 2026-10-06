@@ -113,6 +113,17 @@ struct Adapter::Impl {
     std::atomic<AudioProfile> requested_profile{AudioProfile::None};
     std::atomic<ModuleMode> requested_mode{ModuleMode::None};
     std::atomic<ModuleMode> active_mode{ModuleMode::None};
+    std::mutex standby_mutex;
+    std::mutex uart_callback_mutex;
+    std::atomic<bool> standby{false};
+    std::atomic<bool> standby_waking{false};
+    bool standby_powered_off = false;
+    bool standby_boot_pending = false;
+    TickType_t standby_boot_tick = 0;
+    bool standby_restore_enabled = false;
+    bool standby_finish_pending = false;
+    Device standby_device;
+    std::atomic<AudioProfile> standby_profile{AudioProfile::None};
 
     void Publish() {
         Event event;
@@ -150,6 +161,9 @@ struct Adapter::Impl {
     }
 
     void ResumeWakeWord() {
+        // Keep ownership until the application has left standby; a late UART
+        // acknowledgement must not restart capture while I2S is disabled.
+        if (standby.load() || Application::GetInstance().IsLowPowerStandby()) return;
         if (!wake_word_paused.exchange(false)) return;
         ESP_LOGI(TAG, "Resuming wake word after Bluetooth releases the I2S input");
         Application::GetInstance().GetAudioService().EnableWakeWordDetection(
@@ -187,6 +201,7 @@ struct Adapter::Impl {
     }
 
     bool ActivateBluetoothOutput(AudioProfile profile) {
+        if (standby.load()) return false;
         bool connected = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -349,6 +364,8 @@ struct Adapter::Impl {
             snapshot.audio_profile = AudioProfile::None;
         }
         Publish();
+        const AudioProfile resume_profile = standby_profile.exchange(AudioProfile::None);
+        if (resume_profile != AudioProfile::None) SetAudioProfile(resume_profile);
     }
 
     struct VolumeSyncArgs {
@@ -398,6 +415,7 @@ struct Adapter::Impl {
     }
 
     void ScheduleVolumeSync() {
+        if (standby.load()) return;
         bool connected = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -602,6 +620,7 @@ struct Adapter::Impl {
     }
 
     void HandleDeviceDisconnected(const std::string& reason) {
+        if (standby.load()) return;
         if (reset_running.load()) return;
         bool expected = false;
         if (!local_recovery_running.compare_exchange_strong(expected, true)) {
@@ -677,6 +696,18 @@ struct Adapter::Impl {
         Trim(line);
         if (line.empty()) return;
         ESP_LOGI(TAG, "RX: %s", line.c_str());
+
+        if (standby.load()) {
+            // During power restoration accept only the clock-ready response.
+            // Connection callbacks stay gated until audio can be restored.
+            if (standby_waking.load() && events != nullptr) {
+                if (line.find("SET MODE 1") != std::string::npos)
+                    xEventGroupSetBits(events, kMode1Ready);
+                if (line.find("SET MODE 2") != std::string::npos)
+                    xEventGroupSetBits(events, kMode2Ready);
+            }
+            return;
+        }
 
         if (line.find("SET MODE 1") != std::string::npos) {
             if (MarkModeReady(ModuleMode::Local)) {
@@ -802,6 +833,7 @@ struct Adapter::Impl {
     }
 
     void OnUartData(const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> callback_lock(uart_callback_mutex);
         rx_buffer.append(data.begin(), data.end());
         std::size_t consumed = 0;
         while (true) {
@@ -857,12 +889,14 @@ struct Adapter::Impl {
         constexpr int kModeCommandAttempts = 3;
         bool acknowledged = false;
         for (int attempt = 1; attempt <= kModeCommandAttempts; ++attempt) {
+            if (self->standby.load()) break;
             xEventGroupClearBits(self->events, ready);
             const bool prepared = uart.sendString(prepare);
             ESP_LOGI(TAG, "TX: %.*s (attempt %d/%d)",
                      static_cast<int>(std::strlen(prepare) - 2), prepare,
                      attempt, kModeCommandAttempts);
             vTaskDelay(pdMS_TO_TICKS(700));
+            if (self->standby.load()) break;
             const bool sent = prepared && uart.sendString(command);
             ESP_LOGI(TAG, "TX: %.*s (attempt %d/%d)",
                      static_cast<int>(std::strlen(command) - 2), command,
@@ -880,6 +914,11 @@ struct Adapter::Impl {
             vTaskDelay(pdMS_TO_TICKS(300));
         }
         self->mode_command_running.store(false);
+
+        if (self->standby.load()) {
+            vTaskDelete(nullptr);
+            return;
+        }
 
         const ModuleMode requested = self->requested_mode.load();
         if (requested != mode) {
@@ -909,7 +948,7 @@ struct Adapter::Impl {
     }
 
     void StartMode(ModuleMode mode) {
-        if (!initialized.load()) return;
+        if (!initialized.load() || standby.load()) return;
         requested_mode.store(mode);
         bool expected = false;
         if (!mode_command_running.compare_exchange_strong(expected, true)) {
@@ -975,6 +1014,7 @@ struct Adapter::Impl {
     }
 
     void StartProfileCommand(AudioProfile profile) {
+        if (standby.load()) return;
         requested_profile.store(profile);
         bool expected = false;
         if (!profile_command_running.compare_exchange_strong(expected, true)) {
@@ -1011,6 +1051,7 @@ struct Adapter::Impl {
     }
 
     void ResetModule() {
+        if (standby.load()) return;
         bool expected = false;
         if (!reset_running.compare_exchange_strong(expected, true)) return;
         {
@@ -1036,6 +1077,7 @@ struct Adapter::Impl {
     }
 
     void SetEnabled(bool enabled) {
+        if (standby.load()) return;
         if (enabled) {
             local_recovery_running.store(false);
             SuspendOutputForRouteChange();
@@ -1060,6 +1102,7 @@ struct Adapter::Impl {
     }
 
     void Scan() {
+        if (standby.load()) return;
         bool enabled = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1085,6 +1128,7 @@ struct Adapter::Impl {
     }
 
     void Connect(std::size_t index) {
+        if (standby.load()) return;
         Device device;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1188,6 +1232,156 @@ bool Adapter::IsEnabled() const {
 bool Adapter::IsConnected() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->snapshot.connection == ConnectionState::Connected;
+}
+
+bool Adapter::PrepareLowPowerWake() {
+    auto& self = *impl_;
+    std::lock_guard<std::mutex> transition(self.standby_mutex);
+    if (!self.initialized.load() || self.events == nullptr) return false;
+    if (!self.standby.load() || !self.standby_powered_off) return true;
+    if (IOExpander::getInstance().setLevel(IOExpander::Pin::BT_POWER, true) != ESP_OK) return false;
+    self.standby_powered_off = false;
+    self.standby_boot_tick = xTaskGetTickCount();
+    self.standby_boot_pending = true;
+    ESP_LOGI(TAG, "Bluetooth boot started early; audio remains suspended");
+    return true;
+}
+
+bool Adapter::SetLowPowerStandby(bool enabled) {
+    auto& self = *impl_;
+    std::lock_guard<std::mutex> transition(self.standby_mutex);
+    if (!self.initialized.load() || self.events == nullptr) return false;
+    auto& io = IOExpander::getInstance();
+    if (enabled) {
+        {
+            std::lock_guard<std::mutex> callback_lock(self.uart_callback_mutex);
+            if (!self.standby.exchange(true)) {
+                std::lock_guard<std::mutex> lock(self.mutex);
+                self.standby_restore_enabled = self.snapshot.enabled;
+                self.standby_device = self.snapshot.current_device;
+                self.standby_profile.store(self.snapshot.audio_profile);
+            }
+        }
+        if (self.standby_powered_off) return true;
+        self.requested_mode.store(ModuleMode::None);
+        self.requested_profile.store(AudioProfile::None);
+        self.audio_session.fetch_add(1);
+        self.scan_expected.store(false);
+        self.scan_after_mode_ready.store(false);
+        // Let existing UART commands exit before changing their power rail.
+        const TickType_t started = xTaskGetTickCount();
+        while (self.mode_command_running.load() || self.reset_running.load() ||
+               self.profile_command_running.load() || self.volume_sync_running.load()) {
+            if (xTaskGetTickCount() - started >= pdMS_TO_TICKS(4000)) {
+                ESP_LOGW(TAG, "Standby deferred: Bluetooth command still active");
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        if (io.setLevel(IOExpander::Pin::BT_POWER, false) != ESP_OK) return false;
+        self.standby_powered_off = true;
+        self.standby_boot_pending = false;
+        self.active_mode.store(ModuleMode::None);
+        self.ClearConnectionExpectations();
+        self.ClearProfileState();
+        {
+            std::lock_guard<std::mutex> lock(self.mutex);
+            self.snapshot.connection = ConnectionState::Idle;
+            self.snapshot.scanning = false;
+            self.snapshot.has_current_device = false;
+            self.snapshot.current_device = {};
+        }
+        AudioOutput_SetTarget(AudioOutputTarget::LocalSpeaker, false);
+        ESP_LOGI(TAG, "Bluetooth power off for standby; pairing retained");
+        return true;
+    }
+    if (!self.standby.load()) return true;
+    if (self.standby_powered_off) {
+        if (io.setLevel(IOExpander::Pin::BT_POWER, true) != ESP_OK) return false;
+        self.standby_powered_off = false;
+        self.standby_boot_tick = xTaskGetTickCount();
+        self.standby_boot_pending = true;
+    }
+    if (self.standby_boot_pending) {
+        const TickType_t elapsed = xTaskGetTickCount() - self.standby_boot_tick;
+        const TickType_t boot_budget = pdMS_TO_TICKS(1200);
+        if (elapsed < boot_budget) vTaskDelay(boot_budget - elapsed);
+        self.standby_boot_pending = false;
+    }
+    self.standby_waking.store(true);
+    auto configure = [&self](ModuleMode mode) {
+        const bool local = mode == ModuleMode::Local;
+        const EventBits_t ready = ReadyBit(mode);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto& uart = SimpleUart::getInstance();
+            if (!uart.sendString(local ? "AT+RX=2\r\n" : "AT+TX=1\r\n")) continue;
+            vTaskDelay(pdMS_TO_TICKS(700));
+            xEventGroupClearBits(self.events, ready);
+            if (!uart.sendString(local ? "AT+MODE=1\r\n" : "AT+MODE=2\r\n")) continue;
+            if (xEventGroupWaitBits(self.events, ready, pdTRUE, pdFALSE,
+                                    pdMS_TO_TICKS(2200)) & ready) return true;
+        }
+        return false;
+    };
+    // Restore the local I2S clock first, even when a speaker will reconnect.
+    if (!configure(ModuleMode::Local)) {
+        self.standby_waking.store(false);
+        ESP_LOGE(TAG, "Standby wake: local I2S clock not acknowledged");
+        return false;
+    }
+    ModuleMode restored_mode = ModuleMode::Local;
+    if (self.standby_restore_enabled) {
+        if (configure(ModuleMode::Transmitter)) {
+            restored_mode = ModuleMode::Transmitter;
+        } else {
+            // A failed transmitter request may have changed the clock mode.
+            if (!configure(ModuleMode::Local)) {
+                self.standby_waking.store(false);
+                return false;
+            }
+            self.standby_restore_enabled = false;
+            ESP_LOGW(TAG, "Bluetooth reconnect unavailable; local audio recovered");
+        }
+    }
+    self.requested_mode.store(restored_mode);
+    self.active_mode.store(restored_mode);
+    self.standby_waking.store(false);
+    self.standby_finish_pending = true;
+    self.standby.store(false);
+    ESP_LOGI(TAG, "Bluetooth standby wake ready: mode=%d", static_cast<int>(restored_mode));
+    return true;
+}
+
+void Adapter::CompleteLowPowerWake() {
+    auto& self = *impl_;
+    std::lock_guard<std::mutex> transition(self.standby_mutex);
+    if (self.standby.load() || !self.standby_finish_pending ||
+        Application::GetInstance().IsLowPowerStandby()) return;
+    self.standby_finish_pending = false;
+    {
+        std::lock_guard<std::mutex> lock(self.mutex);
+        self.snapshot.enabled = self.standby_restore_enabled;
+    }
+    if (self.standby_restore_enabled) {
+        self.PauseWakeWord();
+        if (IsValidAddress(self.standby_device.address)) {
+            {
+                std::lock_guard<std::mutex> lock(self.mutex);
+                self.pending_device = self.standby_device;
+                self.snapshot.connection = ConnectionState::Connecting;
+            }
+            self.manual_connect_expected.store(true);
+            char command[48];
+            std::snprintf(command, sizeof(command), "AT+CONNECT=%s\r\n",
+                          self.standby_device.address.c_str());
+            if (!SimpleUart::getInstance().sendString(command))
+                self.manual_connect_expected.store(false);
+        }
+    } else {
+        self.standby_profile = AudioProfile::None;
+        self.ResumeWakeWord();
+    }
+    self.Publish();
 }
 
 void Adapter::Execute(const Command& command) {

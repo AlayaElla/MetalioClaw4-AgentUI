@@ -58,6 +58,7 @@ OperationResult NetworkState() {
         cJSON_AddNumberToObject(item, "index", i);
         cJSON_AddStringToObject(item, "ssid", state.saved_networks[i].ssid.c_str());
         cJSON_AddBoolToObject(item, "default", state.saved_networks[i].is_default);
+        cJSON_AddBoolToObject(item, "connected", state.saved_networks[i].is_connected);
         cJSON_AddItemToArray(saved, item);
     }
     auto* nearby = cJSON_AddArrayToObject(root, "nearby");

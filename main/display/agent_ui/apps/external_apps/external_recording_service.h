@@ -10,6 +10,7 @@ class RecordingService {
 public:
     static RecordingService& Get();
     static RecordingService* Existing();
+    bool IsActive() const;
 
     int Start(void* owner, const metalio_app_recording_config_t* config);
     int Stop(void* owner);

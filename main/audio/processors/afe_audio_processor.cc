@@ -1,5 +1,7 @@
 #include "afe_audio_processor.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
 
 #define PROCESSOR_RUNNING 0x01
 
@@ -67,11 +69,19 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
     
-    xTaskCreate([](void* arg) {
+    // Fetching processed PCM does not map flash. Keep this resident task's
+    // stack out of the internal DMA heap needed by the board's modem.
+    if (xTaskCreateWithCaps([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
-        vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+        vTaskDeleteWithCaps(nullptr);
+    }, "audio_communication", 4096, this, 3, &task_handle_,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        task_handle_ = nullptr;
+        ESP_LOGE(TAG, "Failed to allocate audio processing task (internal=%u psram=%u)",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    }
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {
@@ -96,6 +106,10 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
 }
 
 void AfeAudioProcessor::Start() {
+    if (task_handle_ == nullptr) {
+        ESP_LOGE(TAG, "Audio processing task is unavailable");
+        return;
+    }
     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
 }
 

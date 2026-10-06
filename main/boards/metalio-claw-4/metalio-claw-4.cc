@@ -9,9 +9,13 @@
 #include "esp_ldo_regulator.h"
 
 #include <driver/i2c_master.h>
+#include <driver/usb_serial_jtag.h>
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <wifi_station.h>
+#include "esp_hosted.h"
+#include "wifi_connection_ownership.h"
+#include "esp_sleep.h"
 #include "esp_lcd_touch_gt911.h"
 
 #include "esp_check.h"
@@ -19,6 +23,7 @@
 #include "esp_lcd_fl7707n.h"
 #include "esp_lcd_nv3051f.h"
 #include "mipi_dsi_power_control.h"
+#include "panel_transport_lifecycle.h"
 
 // ========== LCD 屏幕选择 ==========
 // 通过此宏在两款 720x720 MIPI-DSI 屏之间切换：
@@ -46,6 +51,7 @@
 
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include "IOExpander.hpp"
 #include "display/agent_ui/core/power_key.h"
 #include "SimpleUart.hpp"
@@ -57,6 +63,7 @@
 #include "bq27220_gauge.h"
 #include "cx25601n.h"
 #include "sc7a20_motion.h"
+#include "display/agent_ui/apps/external_apps/external_magnetic_service.h"
 #include "bt_audio_codec.h"
 #include "display/agent_ui/apps/bluetooth/bluetooth_module.h"
 
@@ -71,12 +78,18 @@
 
 static std::string uartBuffer;
 
-// NV3051F panel IO 的全局句柄，供功能界面（如相机界面）在摄像头驱动
-// 对共享 GPIO 3 复位线发出脉冲后重放厂商 DCS 初始化序列。
-// 在 InitializeLCD() 中赋值。
+// Serialize camera DCS traffic against panel recreation and transport teardown.
+// Clients use one board operation; the raw panel IO handle is never exposed.
+static std::mutex s_mipi_dsi_transport_mutex;
 static esp_lcd_panel_io_handle_t s_metalio_claw_4_panel_io = NULL;
 
-extern "C" esp_lcd_panel_io_handle_t metalio_claw_4_get_panel_io() { return s_metalio_claw_4_panel_io; }
+extern "C" esp_err_t metalio_claw_4_replay_panel_vendor_init() {
+    std::lock_guard<std::mutex> lock(s_mipi_dsi_transport_mutex);
+    if (s_metalio_claw_4_panel_io == nullptr) return ESP_ERR_INVALID_STATE;
+    return esp_lcd_nv3051f_replay_vendor_init(s_metalio_claw_4_panel_io);
+}
+
+static esp_ldo_channel_handle_t s_mipi_dsi_phy_ldo_channel = nullptr;
 
 // 板载 I2C 主总线（端口 1，GPIO 7/8）的全局句柄。
 // 摄像头 SCCB 必须复用此句柄，而不是在同一物理引脚上再分配控制器，
@@ -148,8 +161,10 @@ private:
     Display* display_;
 
     esp_lcd_touch_handle_t touch_handle = NULL;
+    esp_lcd_dsi_bus_handle_t dsi_bus_handle_ = NULL;
     esp_lcd_panel_io_handle_t panel_io_handle = NULL;
     esp_lcd_panel_handle_t panel_handle = NULL;
+    bool panel_dma2d_enabled_ = false;
 
     Wxcho* wxcho;
 
@@ -158,6 +173,117 @@ private:
     bool c_is_found_0x60 = false;
     bool l_is_found_0x60 = false;
     bool charge_limit_configured_ = false;
+
+    esp_err_t DiscardLcdPanel(esp_lcd_panel_handle_t panel,
+                              bool* dma2d_enabled,
+                              esp_lcd_panel_handle_t* retained_panel) {
+        ESP_RETURN_ON_FALSE(dma2d_enabled != nullptr, ESP_ERR_INVALID_ARG, TAG,
+                            "DMA2D state output is null");
+        if (retained_panel != nullptr) *retained_panel = nullptr;
+        if (*dma2d_enabled) {
+            const esp_err_t err = esp_lcd_dpi_panel_disable_dma2d(panel);
+            if (err != ESP_OK) {
+                if (retained_panel != nullptr) *retained_panel = panel;
+                return err;
+            }
+            *dma2d_enabled = false;
+        }
+        const esp_err_t err = esp_lcd_panel_del(panel);
+        if (err == ESP_OK) {
+            metalio_mipi_dsi_power_panel_deleted();
+            if (panel == panel_handle) panel_handle = nullptr;
+        } else if (retained_panel != nullptr) {
+            *retained_panel = panel;
+        }
+        return err;
+    }
+
+    esp_err_t DeletePanelTransportLocked() {
+        struct Ops {
+            METALIO_CLAW_4& owner;
+            esp_err_t error = ESP_OK;
+            void unpublish_io() { s_metalio_claw_4_panel_io = nullptr; }
+            bool delete_io() {
+                if (owner.panel_io_handle == nullptr) return true;
+                error = esp_lcd_panel_io_del(owner.panel_io_handle);
+                if (error == ESP_OK) owner.panel_io_handle = nullptr;
+                return error == ESP_OK;
+            }
+            bool delete_bus() {
+                if (owner.dsi_bus_handle_ == nullptr) return true;
+                error = esp_lcd_del_dsi_bus(owner.dsi_bus_handle_);
+                if (error == ESP_OK) owner.dsi_bus_handle_ = nullptr;
+                return error == ESP_OK;
+            }
+            bool release_phy_power() {
+                if (s_mipi_dsi_phy_ldo_channel == nullptr) return true;
+                error = esp_ldo_release_channel(s_mipi_dsi_phy_ldo_channel);
+                if (error == ESP_OK) {
+                    s_mipi_dsi_phy_ldo_channel = nullptr;
+                    ESP_LOGI(TAG, "MIPI DSI PHY power released for standby");
+                }
+                return error == ESP_OK;
+            }
+        } ops{*this};
+
+        const auto result = display_power::DestroyPanelTransport(ops);
+        if (result == display_power::TransportDeleteResult::Deleted) {
+            ESP_LOGI(TAG, "MIPI DBI IO and DSI bus deleted");
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "MIPI transport delete failed (stage=%u): %s",
+                 static_cast<unsigned>(result), esp_err_to_name(ops.error));
+        return ops.error != ESP_OK ? ops.error : ESP_FAIL;
+    }
+
+    esp_err_t CreatePanelTransportLocked(const esp_lcd_dbi_io_config_t* io_config) {
+        ESP_RETURN_ON_FALSE(io_config != nullptr, ESP_ERR_INVALID_ARG, TAG,
+                            "DBI IO configuration is null");
+        struct Ops {
+            METALIO_CLAW_4& owner;
+            const esp_lcd_dbi_io_config_t* io_config;
+            esp_err_t error = ESP_OK;
+            void unpublish_io() { s_metalio_claw_4_panel_io = nullptr; }
+            bool delete_stale_io() {
+                if (owner.panel_io_handle == nullptr) return true;
+                error = esp_lcd_panel_io_del(owner.panel_io_handle);
+                if (error == ESP_OK) owner.panel_io_handle = nullptr;
+                return error == ESP_OK;
+            }
+            bool delete_stale_bus() {
+                if (owner.dsi_bus_handle_ == nullptr) return true;
+                error = esp_lcd_del_dsi_bus(owner.dsi_bus_handle_);
+                if (error == ESP_OK) owner.dsi_bus_handle_ = nullptr;
+                return error == ESP_OK;
+            }
+            bool create_bus() {
+                error = owner.bsp_enable_dsi_phy_power();
+                if (error != ESP_OK) return false;
+                esp_lcd_dsi_bus_config_t config = {
+                    .bus_id = 0,
+                    .num_data_lanes = 2,
+                    .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+                    .lane_bit_rate_mbps = 1000,
+                };
+                error = esp_lcd_new_dsi_bus(&config, &owner.dsi_bus_handle_);
+                return error == ESP_OK;
+            }
+            bool create_io() {
+                error = esp_lcd_new_panel_io_dbi(owner.dsi_bus_handle_, io_config,
+                                                 &owner.panel_io_handle);
+                return error == ESP_OK;
+            }
+        } ops{*this, io_config};
+
+        const auto result = display_power::CreatePanelTransport(ops);
+        if (result == display_power::TransportCreateResult::Ready) {
+            ESP_LOGI(TAG, "MIPI DSI host reset in command mode; fresh DBI IO created");
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "MIPI transport create failed (stage=%u): %s",
+                 static_cast<unsigned>(result), esp_err_to_name(ops.error));
+        return ops.error != ESP_OK ? ops.error : ESP_FAIL;
+    }
 
     void gpio_output_init(gpio_num_t gpio_num, uint8_t initial_level) {
         gpio_config_t io_conf = {
@@ -300,13 +426,16 @@ private:
     static esp_err_t bsp_enable_dsi_phy_power(void) {
 #if MIPI_DSI_PHY_PWR_LDO_CHAN > 0
         // 为 MIPI DSI PHY 上电，使其从「无电源」状态进入「关闭」状态
-        static esp_ldo_channel_handle_t phy_pwr_chan = NULL;
-        esp_ldo_channel_config_t ldo_cfg = {
-            .chan_id = MIPI_DSI_PHY_PWR_LDO_CHAN,
-            .voltage_mv = MIPI_DSI_PHY_PWR_LDO_VOLTAGE_MV,
-        };
-        esp_ldo_acquire_channel(&ldo_cfg, &phy_pwr_chan);
-        ESP_LOGI(TAG, "MIPI DSI PHY Powered on");
+        if (s_mipi_dsi_phy_ldo_channel == nullptr) {
+            esp_ldo_channel_config_t ldo_cfg = {
+                .chan_id = MIPI_DSI_PHY_PWR_LDO_CHAN,
+                .voltage_mv = MIPI_DSI_PHY_PWR_LDO_VOLTAGE_MV,
+            };
+            ESP_RETURN_ON_ERROR(
+                esp_ldo_acquire_channel(&ldo_cfg, &s_mipi_dsi_phy_ldo_channel),
+                TAG, "acquire MIPI DSI PHY power channel failed");
+            ESP_LOGI(TAG, "MIPI DSI PHY power channel acquired");
+        }
 #endif  // 当 MIPI_DSI_PHY_PWR_LDO_CHAN > 0 时
 
         return ESP_OK;
@@ -325,23 +454,25 @@ private:
     // ---------- NV3051F (TRULY HE396-040T2BZZ, 36MHz DPI, RGB888) ----------
     // 量产屏初始化。构造函数中调用 InitializeLCD()，预处理器在
     // METALIO_CLAW_4_USE_FL7707N == 0 时把它替换为本函数。
-    void InitializeNV3051FLCD() {
-        bsp_enable_dsi_phy_power();
-
-        esp_lcd_dsi_bus_handle_t mipi_dsi_bus = NULL;
-        esp_lcd_dsi_bus_config_t bus_config = {
-            .bus_id = 0,
-            .num_data_lanes = 2,
-            .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-            .lane_bit_rate_mbps = 1000,
-        };
-        ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
-
-        ESP_LOGI(TAG, "Install MIPI DSI LCD control panel (NV3051F)");
-        // 使用 DBI 接口发送 LCD 命令和参数
-        esp_lcd_dbi_io_config_t dbi_config = NV3051F_PANEL_IO_DBI_CONFIG();
-        ESP_ERROR_CHECK(
-            esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &panel_io_handle));
+    esp_err_t InitializeNV3051FLCD(esp_lcd_panel_handle_t* ret_panel,
+                                   esp_lcd_panel_io_handle_t* ret_panel_io) {
+        ESP_RETURN_ON_FALSE(ret_panel != nullptr && ret_panel_io != nullptr,
+                            ESP_ERR_INVALID_ARG, TAG, "panel output is null");
+        *ret_panel = nullptr;
+        *ret_panel_io = nullptr;
+        if (panel_handle != nullptr) {
+            esp_lcd_panel_handle_t retained = nullptr;
+            const esp_err_t cleanup_err =
+                DiscardLcdPanel(panel_handle, &panel_dma2d_enabled_, &retained);
+            panel_handle = retained;
+            if (cleanup_err != ESP_OK) {
+                *ret_panel = retained;
+                return cleanup_err;
+            }
+        }
+        const esp_lcd_dbi_io_config_t dbi_config = NV3051F_PANEL_IO_DBI_CONFIG();
+        ESP_RETURN_ON_ERROR(CreatePanelTransportLocked(&dbi_config), TAG,
+                            "reset/recreate NV3051F DSI transport failed");
 
         esp_lcd_dpi_panel_config_t dpi_config = {};
         // 1. 时钟源配置
@@ -377,7 +508,7 @@ private:
         nv3051f_vendor_config_t vendor_config = {
             .mipi_config =
                 {
-                    .dsi_bus = mipi_dsi_bus,
+                    .dsi_bus = dsi_bus_handle_,
                     .dpi_config = &dpi_config,
                 },
         };
@@ -389,38 +520,57 @@ private:
             .vendor_config = &vendor_config,
         };
 
-        ESP_ERROR_CHECK(esp_lcd_new_panel_nv3051f(panel_io_handle, &lcd_dev_config, &panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_dpi_panel_enable_dma2d(panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-        // ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-
-        // 暴露 panel IO 句柄，供其他组件（相机界面）在 GPIO 3 摄像头
-        // 复位脉冲后重放厂商 DCS 初始化序列。
-        s_metalio_claw_4_panel_io = panel_io_handle;
+        esp_lcd_panel_handle_t panel = nullptr;
+        esp_err_t err =
+            esp_lcd_new_panel_nv3051f(panel_io_handle, &lcd_dev_config, &panel);
+        if (err != ESP_OK) {
+            metalio_mipi_dsi_power_panel_deleted();
+            return err;
+        }
+        err = esp_lcd_dpi_panel_enable_dma2d(panel);
+        const bool dma2d_enabled = err == ESP_OK;
+        panel_dma2d_enabled_ = dma2d_enabled;
+        if (err == ESP_OK) err = esp_lcd_panel_reset(panel);
+        if (err == ESP_OK) err = esp_lcd_panel_init(panel);
+        if (err != ESP_OK) {
+            esp_lcd_panel_handle_t retained = nullptr;
+            const esp_err_t del_err =
+                DiscardLcdPanel(panel, &panel_dma2d_enabled_, &retained);
+            panel_handle = retained;
+            *ret_panel = retained;
+            ESP_LOGE(TAG, "initialize NV3051F panel failed: %s (cleanup=%s)",
+                     esp_err_to_name(err), esp_err_to_name(del_err));
+            return err;
+        }
+        panel_dma2d_enabled_ = true;
+        *ret_panel = panel;
+        *ret_panel_io = panel_io_handle;
+        return ESP_OK;
     }
 
     // ---------- FL7707N (48MHz DPI, RGB888) ----------
     // 备选屏初始化。参数源自厂商 example (esp32-p4-fl7707n-gt911)。
     // 构造函数中调用 InitializeLCD()，预处理器在
     // METALIO_CLAW_4_USE_FL7707N == 1 时把它替换为本函数。
-    void InitializeFL7707NLCD() {
-        bsp_enable_dsi_phy_power();
-
-        esp_lcd_dsi_bus_handle_t mipi_dsi_bus = NULL;
-        esp_lcd_dsi_bus_config_t bus_config = {
-            .bus_id = 0,
-            .num_data_lanes = 2,
-            .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-            .lane_bit_rate_mbps = 1000,
-        };
-        ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
-
-        ESP_LOGI(TAG, "Install MIPI DSI LCD control panel (FL7707N)");
-        // 使用 DBI 接口发送 LCD 命令和参数
-        esp_lcd_dbi_io_config_t dbi_config = FL7707N_PANEL_IO_DBI_CONFIG();
-        ESP_ERROR_CHECK(
-            esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &panel_io_handle));
+    esp_err_t InitializeFL7707NLCD(esp_lcd_panel_handle_t* ret_panel,
+                                   esp_lcd_panel_io_handle_t* ret_panel_io) {
+        ESP_RETURN_ON_FALSE(ret_panel != nullptr && ret_panel_io != nullptr,
+                            ESP_ERR_INVALID_ARG, TAG, "panel output is null");
+        *ret_panel = nullptr;
+        *ret_panel_io = nullptr;
+        if (panel_handle != nullptr) {
+            esp_lcd_panel_handle_t retained = nullptr;
+            const esp_err_t cleanup_err =
+                DiscardLcdPanel(panel_handle, &panel_dma2d_enabled_, &retained);
+            panel_handle = retained;
+            if (cleanup_err != ESP_OK) {
+                *ret_panel = retained;
+                return cleanup_err;
+            }
+        }
+        const esp_lcd_dbi_io_config_t dbi_config = FL7707N_PANEL_IO_DBI_CONFIG();
+        ESP_RETURN_ON_ERROR(CreatePanelTransportLocked(&dbi_config), TAG,
+                            "reset/recreate FL7707N DSI transport failed");
 
         esp_lcd_dpi_panel_config_t dpi_config = {};
         // 1. 时钟源配置
@@ -457,7 +607,7 @@ private:
         fl7707n_vendor_config_t vendor_config = {
             .mipi_config =
                 {
-                    .dsi_bus = mipi_dsi_bus,
+                    .dsi_bus = dsi_bus_handle_,
                     .dpi_config = &dpi_config,
                 },
         };
@@ -469,22 +619,99 @@ private:
             .vendor_config = &vendor_config,
         };
 
-        ESP_ERROR_CHECK(esp_lcd_new_panel_fl7707n(panel_io_handle, &lcd_dev_config, &panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_dpi_panel_enable_dma2d(panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
-        ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
-        // ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
-
-        // 暴露 panel IO 句柄，供其他组件（相机界面）在 GPIO 3 摄像头
-        // 复位脉冲后重放厂商 DCS 初始化序列。
-        // 注意：camera_screen 当前调用的是 esp_lcd_nv3051f_replay_vendor_init，
-        // replay 函数并在 camera_screen 里按宏分发。
-        s_metalio_claw_4_panel_io = panel_io_handle;
+        esp_lcd_panel_handle_t panel = nullptr;
+        esp_err_t err =
+            esp_lcd_new_panel_fl7707n(panel_io_handle, &lcd_dev_config, &panel);
+        if (err != ESP_OK) {
+            metalio_mipi_dsi_power_panel_deleted();
+            return err;
+        }
+        err = esp_lcd_dpi_panel_enable_dma2d(panel);
+        const bool dma2d_enabled = err == ESP_OK;
+        panel_dma2d_enabled_ = dma2d_enabled;
+        if (err == ESP_OK) err = esp_lcd_panel_reset(panel);
+        if (err == ESP_OK) err = esp_lcd_panel_init(panel);
+        if (err != ESP_OK) {
+            esp_lcd_panel_handle_t retained = nullptr;
+            const esp_err_t del_err =
+                DiscardLcdPanel(panel, &panel_dma2d_enabled_, &retained);
+            panel_handle = retained;
+            *ret_panel = retained;
+            ESP_LOGE(TAG, "initialize FL7707N panel failed: %s (cleanup=%s)",
+                     esp_err_to_name(err), esp_err_to_name(del_err));
+            return err;
+        }
+        panel_dma2d_enabled_ = true;
+        *ret_panel = panel;
+        *ret_panel_io = panel_io_handle;
+        return ESP_OK;
     }
 
     void InitializeDisplay() {
         display_ = new LVAdapterDisplay(panel_handle, panel_io_handle, touch_handle, DISPLAY_WIDTH,
-                                        DISPLAY_HEIGHT);
+                                        DISPLAY_HEIGHT,
+                                        [this](esp_lcd_panel_handle_t* panel,
+                                               esp_lcd_panel_io_handle_t* panel_io) {
+                                            std::lock_guard<std::mutex> lock(
+                                                s_mipi_dsi_transport_mutex);
+                                            const esp_err_t err =
+                                                InitializeLCD(panel, panel_io);
+                                            if (err == ESP_OK || *panel != nullptr) {
+                                                panel_handle = *panel;
+                                            }
+                                            if (err == ESP_OK) panel_io_handle = *panel_io;
+                                            return err;
+                                        },
+                                        [this](esp_lcd_panel_handle_t panel, bool dma2d_enabled) {
+                                            panel_handle = panel;
+                                            panel_dma2d_enabled_ = dma2d_enabled;
+                                        },
+                                        [this](esp_lcd_panel_handle_t panel) {
+                                            if (panel == nullptr || panel != panel_handle) {
+                                                return ESP_ERR_INVALID_STATE;
+                                            }
+                                            if (panel_dma2d_enabled_) return ESP_OK;
+                                            const esp_err_t err =
+                                                esp_lcd_dpi_panel_enable_dma2d(panel);
+                                            if (err == ESP_OK) panel_dma2d_enabled_ = true;
+                                            return err;
+                                        },
+                                        [this](esp_lcd_panel_handle_t panel) {
+                                            std::lock_guard<std::mutex> lock(
+                                                s_mipi_dsi_transport_mutex);
+                                            const esp_lcd_panel_io_handle_t saved_io =
+                                                s_metalio_claw_4_panel_io;
+                                            s_metalio_claw_4_panel_io = nullptr;
+                                            const esp_err_t err = esp_lcd_panel_del(panel);
+                                            if (err != ESP_OK) {
+                                                s_metalio_claw_4_panel_io = saved_io;
+                                                return err;
+                                            }
+                                            if (panel_handle == panel) panel_handle = nullptr;
+                                            panel_dma2d_enabled_ = false;
+                                            return ESP_OK;
+                                        },
+                                        [this]() {
+                                            std::lock_guard<std::mutex> lock(
+                                                s_mipi_dsi_transport_mutex);
+                                            return DeletePanelTransportLocked();
+                                        },
+                                        [](esp_lcd_panel_handle_t panel, bool on) {
+                                            std::lock_guard<std::mutex> lock(
+                                                s_mipi_dsi_transport_mutex);
+                                            return esp_lcd_panel_disp_on_off(panel, on);
+                                        },
+                                        [this](esp_lcd_panel_io_handle_t panel_io) {
+                                            std::lock_guard<std::mutex> lock(
+                                                s_mipi_dsi_transport_mutex);
+                                            if (panel_io == nullptr ||
+                                                panel_io != panel_io_handle ||
+                                                panel_handle == nullptr) {
+                                                return ESP_ERR_INVALID_STATE;
+                                            }
+                                            s_metalio_claw_4_panel_io = panel_io;
+                                            return ESP_OK;
+                                        });
     }
 
     uint8_t ProbeGT911I2CAddress() {
@@ -640,6 +867,9 @@ public:
         // 开机失败 Bq27220Gauge::GetBatteryLevel 内部会节流自愈，这里不需要
         // ESP_ERROR_CHECK。
         (void)Bq27220Gauge::GetInstance().Begin(i2c_bus_);
+        // Probe optional hardware after power setup, before Apps can query
+        // capabilities. Continuous measurement stays off until an App reads.
+        (void)MagneticService::Get().InitBus(i2c_bus_);
         if (io_expander_ready) {
             CheckBatteryLevelAtBoot();
             InitializeBTAudio();
@@ -653,7 +883,13 @@ public:
         // InitializeNoLCD();
         /* 顺序：LCD 上电稳定后再初始化 GT911，最后构造 LVGL 显示（触摸已就绪） */
         ResetLcdBeforeInit();
-        InitializeLCD();
+        {
+            std::lock_guard<std::mutex> lock(s_mipi_dsi_transport_mutex);
+            ESP_ERROR_CHECK(InitializeLCD(&panel_handle, &panel_io_handle));
+            // Cold boot has no LV adapter recovery phase. Publish only after
+            // the complete factory (including panel init) has succeeded.
+            s_metalio_claw_4_panel_io = panel_io_handle;
+        }
         ESP_ERROR_CHECK(metalio_mipi_dsi_power_init());
         vTaskDelay(pdMS_TO_TICKS(100));
         InitializeTouch();
@@ -814,7 +1050,154 @@ public:
     }
 
     void SetLowPowerStandby(bool enabled) override {
+        std::lock_guard<std::recursive_mutex> transition(standby_transition_mutex_);
+        if (!enabled) {
+            (void)ResumeLowPowerStandby();
+            return;
+        }
+        if (standby_active_) return;
         Sc7a20MotionService::GetInstance().SetSuspended(enabled);
+        // Application has already stopped capture before requesting standby.
+        // The codec's software enable flags alone leave both DMA channels on.
+        if (!static_cast<BTAudioCodec*>(GetAudioCodec())->SetStandby(enabled)) {
+            ESP_LOGW(TAG, "Audio hardware standby transition incomplete");
+            return;
+        }
+        // The cellular transport needs its own quiesce protocol. Do not put
+        // a live modem UART to sleep through this WiFi-only transaction.
+        if (GetBoardType() != "wifi") {
+            ESP_LOGW(TAG, "Offline sleep not enabled for cellular mode");
+            return;
+        }
+        // Keep both radio modules powered during short breaks. Application
+        // audio and codec DMA are paused, but the Wi-Fi association is retained.
+        (void)metalio_mipi_dsi_power_set_standby_sleep(false);
+        standby_active_ = true;
+        standby_wake_requested_ = false;
+        offline_standby_complete_ = false;
+        standby_deadline_us_ = esp_timer_get_time() +
+                              (offline_standby_pending_ ? 0 : 10LL * 60 * 1000000);
+        agent_ui::PowerKey::NotifyStandbyStarted();
+        ESP_LOGI(TAG, "Standby grace started: retain Wi-Fi/Bluetooth for 600 seconds");
+    }
+
+    void TickLowPowerStandby() override {
+        std::lock_guard<std::recursive_mutex> transition(standby_transition_mutex_);
+        if (!standby_active_ || standby_wake_requested_ || offline_standby_complete_ ||
+            esp_timer_get_time() < standby_deadline_us_) return;
+        auto* display = GetDisplay();
+        if (display == nullptr || !display->IsPowerSaveActive()) return;
+        // Retry partial shutdowns at a bounded rate. Wake uses this same mutex
+        // and cannot reopen audio halfway through a delayed radio shutdown.
+        standby_deadline_us_ = esp_timer_get_time() + 5LL * 1000000;
+        offline_standby_pending_ = true;
+        ESP_LOGI(TAG, "Standby grace expired; entering offline low-power standby");
+        const bool wifi_stopped = WifiConnectionOwnership::GetInstance().SetStandby(
+            true, [](bool asleep) {
+                return WifiStation::GetInstance().SetOfflineStandby(asleep, [](bool off) {
+                    return esp_hosted_set_coprocessor_standby(off) == ESP_OK;
+                });
+            });
+        const bool bluetooth_stopped =
+            agent_ui::bluetooth::Adapter::Get().SetLowPowerStandby(true);
+        if (!wifi_stopped || !bluetooth_stopped) {
+            ESP_LOGW(TAG, "Offline standby incomplete: wifi=%d bluetooth=%d",
+                     wifi_stopped, bluetooth_stopped);
+            return;
+        }
+        // C5 is held in reset and has no control traffic. A floating/low D1
+        // must not keep waking P4. The side key remains serviced by its timer.
+        esp_err_t err = gpio_wakeup_disable(GPIO_NUM_34);
+        if (err == ESP_OK) err = metalio_mipi_dsi_power_set_standby_sleep(true);
+        offline_standby_complete_ = err == ESP_OK;
+        ESP_LOGI(TAG, "Offline standby: C5 reset held, Bluetooth off, auto_sleep=%s",
+                 esp_err_to_name(err));
+    }
+
+    bool PrepareLowPowerWake() override {
+        std::lock_guard<std::recursive_mutex> transition(standby_transition_mutex_);
+        if (!standby_active_ && !offline_standby_pending_) return false;
+        if (metalio_mipi_dsi_power_set_standby_sleep(false) != ESP_OK) return false;
+        standby_wake_requested_ = true;
+        if (!offline_standby_pending_) {
+            ESP_LOGI(TAG, "Short standby wake: Wi-Fi and Bluetooth retained");
+            return true;
+        }
+        const bool prepared = WifiConnectionOwnership::GetInstance().PrepareStandbyWake([] {
+            return esp_hosted_prepare_coprocessor_wake() == ESP_OK;
+        });
+        if (!prepared) ESP_LOGW(TAG, "C5 early boot unavailable; normal network resume will retry");
+        if (!agent_ui::bluetooth::Adapter::Get().PrepareLowPowerWake()) {
+            ESP_LOGW(TAG, "Bluetooth early boot unavailable; normal audio resume will retry");
+        }
+        return true;
+    }
+
+    void CancelLowPowerWake() override {
+        std::lock_guard<std::recursive_mutex> transition(standby_transition_mutex_);
+        standby_wake_requested_ = false;
+        if (!offline_standby_pending_) return;
+        const bool wifi_off = WifiConnectionOwnership::GetInstance().PrepareStandbyWake([] {
+            return esp_hosted_set_coprocessor_standby(true) == ESP_OK;
+        });
+        const bool bluetooth_off = agent_ui::bluetooth::Adapter::Get().SetLowPowerStandby(true);
+        offline_standby_complete_ = false;
+        if (wifi_off && bluetooth_off) {
+            // The PM helper also checks that the display is still shut down.
+            offline_standby_complete_ = metalio_mipi_dsi_power_set_standby_sleep(true) == ESP_OK;
+        }
+        if (!offline_standby_complete_) standby_deadline_us_ = esp_timer_get_time() + 5LL * 1000000;
+    }
+
+    bool ResumeLowPowerStandby() override {
+        return ResumeLowPowerStandby({});
+    }
+
+    bool ResumeLowPowerStandby(const std::function<void()>& audio_ready) override {
+        std::lock_guard<std::recursive_mutex> transition(standby_transition_mutex_);
+        standby_active_ = false;
+        standby_wake_requested_ = true;
+        if (metalio_mipi_dsi_power_set_standby_sleep(false) != ESP_OK) return false;
+        if (offline_standby_pending_) (void)PrepareLowPowerWake();
+        // The Bluetooth module supplies the I2S clock even for local audio.
+        // Confirm that clock, restore DMA, then publish audio readiness before
+        // starting the network handshake. C5 can boot during the clock wait,
+        // while its SDIO workers remain parked and own no in-flight buffers.
+        if (offline_standby_pending_ &&
+            !agent_ui::bluetooth::Adapter::Get().SetLowPowerStandby(false)) {
+            ESP_LOGW(TAG, "Audio wake incomplete: Bluetooth clock not ready");
+            return false;
+        }
+        if (!static_cast<BTAudioCodec*>(GetAudioCodec())->SetStandby(false)) return false;
+        Sc7a20MotionService::GetInstance().SetSuspended(false);
+        if (audio_ready) audio_ready();
+        ESP_LOGI(TAG, "Audio hardware ready; restoring network next");
+        if (offline_standby_pending_) {
+            const bool wifi_ready = WifiConnectionOwnership::GetInstance().SetStandby(
+                false, [](bool asleep) {
+                    return WifiStation::GetInstance().SetOfflineStandby(asleep, [](bool off) {
+                        return esp_hosted_set_coprocessor_standby(off) == ESP_OK;
+                    });
+                });
+            if (!wifi_ready) {
+                ESP_LOGW(TAG, "Network wake incomplete; audio remains available");
+                return false;
+            }
+            offline_standby_pending_ = false;
+        }
+        standby_wake_requested_ = false;
+        offline_standby_complete_ = false;
+        standby_deadline_us_ = 0;
+        return true;
+    }
+
+    void CompleteLowPowerWake() override {
+        agent_ui::bluetooth::Adapter::Get().CompleteLowPowerWake();
+    }
+
+    StandbySleepStats GetStandbySleepStats() override {
+        const auto stats = metalio_mipi_dsi_power_sleep_stats();
+        return {stats.slept_us, stats.entries, stats.rejected};
     }
 
     void SetPerformanceMaxMhz(int max_freq_mhz) override {
@@ -827,15 +1210,11 @@ public:
     }
 
     int GetActiveDisplayMinMhz() const override {
-        // The production RGB888 MIPI-DPI stream underruns below this floor.
         return 360;
     }
 
     int GetScreenOffMinMhz() const override {
-        // Panel sleep leaves RGB888 GDMA reading the framebuffer from PSRAM.
-        // Hardware testing underruns at 180 MHz, so the continuous DSI stream
-        // must retain the same 360 MHz floor used while the panel is visible.
-        return 360;
+        return display_ != nullptr && !display_->IsPanelPresent() ? 40 : 360;
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -843,6 +1222,22 @@ public:
                                               AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_MIC_GPIO_WS,
                                               AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_DIN);
         return &audio_codec;
+    }
+
+    bool ReadBatteryPower(BatteryPowerReading& reading) override {
+        uint16_t voltage_mv = 0;
+        int16_t current_ma = 0;
+        uint8_t vbus_stat = 0;
+        auto& gauge = Bq27220Gauge::GetInstance();
+        if (!gauge.ReadVoltageMv(voltage_mv) ||
+            !gauge.ReadCurrentMa(current_ma) ||
+            cx25601n_get_vbus_stat(&vbus_stat) != ESP_OK) return false;
+        // Native debug USB can power the board while the charger reports no
+        // VBUS. Such a sample is not evidence of battery-only standby draw.
+        const bool external_power = (vbus_stat != 0 && vbus_stat != 7) ||
+                                    usb_serial_jtag_is_connected();
+        reading = {voltage_mv, current_ma, external_power};
+        return true;
     }
 
     virtual Display* GetDisplay() override { return display_; }
@@ -895,6 +1290,12 @@ public:
     }
 
 private:
+    std::recursive_mutex standby_transition_mutex_;
+    bool standby_active_ = false;
+    bool standby_wake_requested_ = false;
+    bool offline_standby_complete_ = false;
+    int64_t standby_deadline_us_ = 0;
+    bool offline_standby_pending_ = false;
     bool charger_input_initialized_ = false;
     bool charger_input_present_ = false;
     uint8_t charger_input_candidate_samples_ = 0;

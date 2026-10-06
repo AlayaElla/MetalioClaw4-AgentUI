@@ -3,7 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
 #include <cstring>
+#ifdef HAVE_LVGL
+#include "agent_ui/apps/external_apps/external_synth_service.h"
+#endif
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
@@ -110,6 +115,14 @@ void AudioService::Initialize(AudioCodec* codec) {
 }
 
 void AudioService::Start() {
+    // AFE initialization may map flash models and allocates its worker stack.
+    // Prepare it on the startup task's internal stack before UI callbacks can
+    // request microphone processing from the LVGL task's PSRAM stack.
+    if (!audio_processor_initialized_) {
+        audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+        audio_processor_initialized_ = true;
+        ESP_LOGI(TAG, "Audio processor prepared before service tasks");
+    }
     service_stopped_ = false;
     xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
         AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_ALL_TASKS_RUNNING);
@@ -146,12 +159,28 @@ void AudioService::Start() {
     }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
 #endif
 
-    /* Start the opus codec task */
+    /* Opus needs a large stack, but its PCM/packet processing does not map
+     * flash. Preserve internal DMA memory for the modem when PSRAM is usable. */
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    if (xTaskCreateWithCaps([](void* arg) {
+        AudioService* audio_service = (AudioService*)arg;
+        audio_service->OpusCodecTask();
+        vTaskDeleteWithCaps(nullptr);
+    }, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to allocate Opus worker in PSRAM");
+    } else {
+        ESP_LOGI(TAG, "Opus worker stack in PSRAM; internal free=%u largest=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+    }
+#else
     xTaskCreate([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
     }, "opus_codec", 2048 * 13, this, 2, &opus_codec_task_handle_);
+#endif
 }
 
 void AudioService::Stop() {
@@ -322,6 +351,16 @@ void AudioService::AudioOutputTask() {
         audio_queue_cv_.notify_all();
         lock.unlock();
 
+#ifdef HAVE_LVGL
+        // System/assistant PCM must wait for the App's fade and route release
+        // before writing to the same codec. This wait stays on the output task.
+        if (auto* synth = agent_ui::external_apps::SynthService::Existing()) {
+            synth->Interrupt();
+            while (synth->IsActive()) {
+                vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(5)));
+            }
+        }
+#endif
         if (!codec_->output_enabled()) {
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -686,15 +725,14 @@ void AudioService::ApplyVoiceProcessingLocked(bool enable) {
         (xEventGroupGetBits(event_group_) &
          AS_EVENT_AUDIO_PROCESSOR_RUNNING) != 0;
     if (enable == currently_enabled) return;
+    if (enable && !audio_processor_initialized_) {
+        ESP_LOGW(TAG, "voice processing unavailable: audio processor not prepared");
+        return;
+    }
     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
     if (enable) {
         network_audio_production_generation_.fetch_add(1, std::memory_order_acq_rel);
         network_audio_production_active_.store(true, std::memory_order_release);
-        if (!audio_processor_initialized_) {
-            audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
-            audio_processor_initialized_ = true;
-        }
-
         /* We should make sure no audio is playing */
         ResetDecoder();
         audio_input_need_warmup_ = true;
@@ -703,6 +741,12 @@ void AudioService::ApplyVoiceProcessingLocked(bool enable) {
         listening_audio_enabled_.store(true, std::memory_order_release);
         listening_audio_features_.Clear();
         audio_processor_->Start();
+        if (!audio_processor_->IsRunning()) {
+            network_audio_production_active_.store(false, std::memory_order_release);
+            listening_audio_enabled_.store(false, std::memory_order_release);
+            ESP_LOGW(TAG, "voice processing unavailable: audio worker did not start");
+            return;
+        }
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
     } else {
         // AFE::Stop resets its buffer but does not join an output callback.
@@ -807,8 +851,8 @@ void AudioService::EnableAudioTesting(bool enable) {
 void AudioService::EnableDeviceAec(bool enable) {
     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
     if (!audio_processor_initialized_) {
-        audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
-        audio_processor_initialized_ = true;
+        ESP_LOGW(TAG, "device AEC unavailable: audio processor not prepared");
+        return;
     }
 
     audio_processor_->EnableDeviceAec(enable);

@@ -9,7 +9,7 @@ namespace agent_ui::network_settings_ui {
 
 struct SavedItem {
     std::string ssid;
-    bool is_default = false;
+    bool is_connected = false;
 };
 
 struct NearbyItem {

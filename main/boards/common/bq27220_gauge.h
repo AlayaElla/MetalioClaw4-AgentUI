@@ -18,6 +18,8 @@
 //   - GetBatteryLevel() 走 "电压 -> SOC 线性内插 + 60 点滑动平均" 路径，
 //     不依赖芯片未标定的 SOC 寄存器；同时会自动节流重试 probe（10s/次），
 //     后插电池场景能自愈。
+//   - 冷启动或超过 60 秒没有成功读取电量时，用首笔新读数重新填充窗口，
+//     避免长待机唤醒后显示旧电量并缓慢追赶。
 //   - 充电方向用电流寄存器 (0x0C, int16, mA) 的符号判定，留 5mA 死区避免
 //     空载抖动。电流读取失败时保留上一次有效方向，不把瞬时 I2C 错误伪装成
 //     0mA/停止充电。
@@ -83,7 +85,7 @@ private:
     // 读 BQ27220 一个 uint16 寄存器（标准命令均按 little-endian 解析）。
     bool ReadU16(uint8_t reg, uint16_t* out);
 
-    // 60 点滑动平均；首次填满整窗口避免开机一两秒内 SOC 大跳。
+    // 60 点滑动平均；首次或缓存过期时，用新读数填满整个窗口。
     float FilterPush(float sample);
 
     static constexpr int kFilterSize = 60;
@@ -103,6 +105,7 @@ private:
     int   filter_count_    = 0;
     float filter_sum_      = 0.0f;
     bool  filter_primed_   = false;
+    int64_t filter_last_sample_us_ = 0;
 };
 
 #endif  // BQ27220_GAUGE_H

@@ -28,7 +28,6 @@ public:
     void SetStatusMessage(const char* text);
 
 private:
-    static void OnShowPassword(lv_event_t* event);
     static void OnCancelPassword(lv_event_t* event);
     lv_obj_t* CreateOverlay();
     lv_obj_t* CreateStatusCard();

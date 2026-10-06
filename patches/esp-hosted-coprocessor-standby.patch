@@ -1,0 +1,683 @@
+diff --git a/host/api/src/esp_hosted_api.c b/host/api/src/esp_hosted_api.c
+--- a/host/api/src/esp_hosted_api.c
++++ b/host/api/src/esp_hosted_api.c
+@@ -20,6 +20,9 @@
+ #include "rpc_wrap.h"
+ #include "esp_log.h"
+ #include "esp_hosted_event.h"
++#if defined(CONFIG_IDF_TARGET_ESP32P4) && defined(CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE)
++#include "sdio_drv.h"
++#endif
+ 
+ #if H_DPP_SUPPORT
+ #include "esp_dpp.h"
+@@ -167,6 +170,31 @@
+ 			ESP_HOSTED_EVENT_TRANSPORT_DOWN,
+ 			NULL, 0, HOSTED_BLOCK_MAX);
+ 	return ESP_OK;
++}
++
++int esp_hosted_prepare_coprocessor_wake(void)
++{
++#if defined(CONFIG_IDF_TARGET_ESP32P4) && defined(CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE)
++    if (!esp_hosted_init_done) return ESP_ERR_INVALID_STATE;
++    return bus_prepare_coprocessor_wake();
++#else
++    return ESP_ERR_NOT_SUPPORTED;
++#endif
++}
++
++int esp_hosted_set_coprocessor_standby(int enabled)
++{
++#if defined(CONFIG_IDF_TARGET_ESP32P4) && defined(CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE)
++    if (!esp_hosted_init_done) return ESP_ERR_INVALID_STATE;
++    // Close the API gate before parking transport workers. On a failed pause
++    // the old link remains usable; on a failed wake only a fresh INIT reopens it.
++    if (enabled) esp_hosted_transport_up = 0;
++    int ret = bus_set_coprocessor_standby(enabled);
++    if (ret != ESP_OK && enabled && is_transport_tx_ready()) esp_hosted_transport_up = 1;
++    return ret;
++#else
++    return ESP_ERR_NOT_SUPPORTED;
++#endif
+ }
+ 
+ static inline esp_err_t esp_hosted_reconfigure(void)
+diff --git a/host/drivers/serial/serial_ll_if.c b/host/drivers/serial/serial_ll_if.c
+--- a/host/drivers/serial/serial_ll_if.c
++++ b/host/drivers/serial/serial_ll_if.c
+@@ -415,3 +415,11 @@
+ 
+ 	return serial_ll_hdl;
+ }
++
++// Called only with the transport RX worker parked. Complete queued messages
++// remain owned by RPC; a fragment from the old C5 cannot prefix the new one.
++void serial_ll_reset_partial_rx(void)
++{
++    HOSTED_FREE(r.data);
++    r.len = 0;
++}
+diff --git a/host/drivers/serial/serial_ll_if.h b/host/drivers/serial/serial_ll_if.h
+--- a/host/drivers/serial/serial_ll_if.h
++++ b/host/drivers/serial/serial_ll_if.h
+@@ -90,6 +90,7 @@
+   */
+ serial_ll_handle_t * serial_ll_init(void(*rx_data_ind)(void));
+ 
++void serial_ll_reset_partial_rx(void);
+ int serial_ll_rx_handler(interface_buffer_handle_t * buf_handle);
+ #ifdef __cplusplus
+ }
+diff --git a/host/drivers/transport/sdio/sdio_drv.c b/host/drivers/transport/sdio/sdio_drv.c
+--- a/host/drivers/transport/sdio/sdio_drv.c
++++ b/host/drivers/transport/sdio/sdio_drv.c
+@@ -77,6 +77,7 @@
+ #include "sdio_drv.h"
+ #include "sdio_reg.h"
+ #include "serial_drv.h"
++#include "serial_ll_if.h"
+ #include "stats.h"
+ #include "esp_hosted_log.h"
+ #include "hci_drv.h"
+@@ -88,6 +89,7 @@
+ #include "esp_hosted_bt.h"
+ #include "port_esp_hosted_host_config.h"
+ #include "esp_hosted_event.h"
++#include "esp_heap_caps.h"
+ 
+ static const char TAG[] = "H_SDIO_DRV";
+ 
+@@ -151,7 +153,9 @@
+ #endif
+ 
+ /* Create mempool for cache mallocs */
++#ifndef CONFIG_IDF_TARGET_ESP32P4
+ static struct mempool * buf_mp_g;
++#endif
+ 
+ extern transport_channel_t *chan_arr[ESP_MAX_IF];
+ 
+@@ -167,6 +171,8 @@
+ 
+ /* Counter to hold the amount of buffers already sent to sdio slave */
+ static uint32_t sdio_tx_buf_count = 0;
++static uint32_t sdio_write_buf_available = 0;
++static bool sdio_reopen_data_path = false;
+ 
+ /* Counter to hold the amount of bytes already received from sdio slave */
+ static uint32_t sdio_rx_byte_count = 0;
+@@ -207,29 +213,50 @@
+ static void sdio_read_task(void const* pvParameters);
+ static void sdio_process_rx_task(void const* pvParameters);
+ 
++#include "sdio_standby_gate.h"
++
+ static inline void sdio_mempool_create(void)
+ {
++#ifdef CONFIG_IDF_TARGET_ESP32P4
++    // P4 SDMMC supports aligned PSRAM DMA with cache synchronization. Keep
++    // transport payloads out of the scarce internal heap used by audio/tasks.
++    return;
++#else
+ 	buf_mp_g = mempool_create(MAX_SDIO_BUFFER_SIZE);
+ #ifdef H_USE_MEMPOOL
+ 	assert(buf_mp_g);
+ #endif
++#endif
+ }
+ 
+ static inline void sdio_mempool_destroy(void)
+ {
++#ifndef CONFIG_IDF_TARGET_ESP32P4
+ 	ESP_LOGD(TAG, "Destroying SDIO mempool");
+ 	mempool_destroy(buf_mp_g);
+ 	buf_mp_g = NULL;
++#endif
+ }
+ 
+ static inline void *sdio_buffer_alloc(uint need_memset)
+ {
++#ifdef CONFIG_IDF_TARGET_ESP32P4
++    void *buf = heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE,
++            MAX_SDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++    if (buf && need_memset) memset(buf, 0, MAX_SDIO_BUFFER_SIZE);
++    return buf;
++#else
+ 	return mempool_alloc(buf_mp_g, MAX_SDIO_BUFFER_SIZE, need_memset);
++#endif
+ }
+ 
+ static inline void sdio_buffer_free(void *buf)
+ {
++#ifdef CONFIG_IDF_TARGET_ESP32P4
++    heap_caps_free(buf);
++#else
+ 	mempool_free(buf_mp_g, buf);
++#endif
+ }
+ 
+ void bus_deinit_internal(void *bus_handle)
+@@ -486,7 +513,8 @@
+ 
+ static int sdio_is_write_buffer_available(uint32_t buf_needed)
+ {
+-	static uint32_t buf_available = 0;
++	// Cleared when the coprocessor restarts.
++#define buf_available sdio_write_buf_available
+ 	uint8_t retry = MAX_WRITE_BUF_RETRIES;
+ 	uint32_t max_retry_sdio_not_responding = 2;
+ 	uint32_t interval_us = 400;
+@@ -537,6 +565,7 @@
+ 	}
+ 
+ 	return BUFFER_AVAILABLE;
++#undef buf_available
+ }
+ 
+ static void sdio_write_task(void const* pvParameters)
+@@ -561,8 +590,17 @@
+ 		g_h.funcs->_h_msleep(10);
+ 
+ 	for (;;) {
+-		/* Check if higher layers have anything to transmit */
+-		g_h.funcs->_h_get_semaphore(sem_to_slave_queue, HOSTED_BLOCK_MAX);
++
++        sdio_standby_checkpoint(SDIO_WORKER_TX);
++        /* Check if higher layers have anything to transmit. A standby wake
++         * token can be empty; never reuse the previous packet in that case. */
++        g_h.funcs->_h_get_semaphore(sem_to_slave_queue, HOSTED_BLOCK_MAX);
++        sdio_standby_checkpoint(SDIO_WORKER_TX);
++        buf_handle = (interface_buffer_handle_t){0};
++        len = flag = 0;
++        tx_needed = 1;
++        sendbuf = NULL;
++        free_func = NULL;
+ 
+ 		/* Tx msg is present as per sem */
+ 		if (g_h.funcs->_h_dequeue_item(to_slave_queue[PRIO_Q_SERIAL], &buf_handle, 0))
+@@ -571,6 +609,7 @@
+ 					tx_needed = 0; /* No Tx msg */
+ 				}
+ 
++		if (!tx_needed) continue;
+ 		if (tx_needed) {
+ 			len = buf_handle.payload_len;
+ 			flag = buf_handle.flag;
+@@ -587,7 +626,6 @@
+ 
+ 		if (!buf_handle.payload_zcopy) {
+ 			sendbuf = sdio_buffer_alloc(MEMSET_REQUIRED);
+-			assert(sendbuf);
+ 			free_func = sdio_buffer_free;
+ 		} else {
+ 			sendbuf = buf_handle.payload;
+@@ -878,6 +916,8 @@
+ // return a buffer big enough to contain the data
+ static uint8_t * sdio_rx_get_buffer(uint32_t len)
+ {
++    // The port takes uint16_t byte lengths; account for block-mode padding.
++    if (len > (UINT16_MAX / ESP_BLOCK_SIZE) * ESP_BLOCK_SIZE) return NULL;
+ #if H_SDIO_RX_BLOCK_ONLY_XFER
+ 	// we need to allocate enough memory to hold the padded data
+ 	len = ((len + ESP_BLOCK_SIZE - 1) / ESP_BLOCK_SIZE) * ESP_BLOCK_SIZE;
+@@ -888,12 +928,16 @@
+ 	uint8_t ** buf = &double_buf.buffer[index].buf;
+ 
+ 	if (len > double_buf.buffer[index].buf_size) {
+-		if (*buf) {
+-			// free already allocated memory
+-			g_h.funcs->_h_free_align(*buf);
+-		}
+-		*buf = (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
+-		assert(*buf);
++        // Allocate first: a failed growth must preserve the old buffer/capacity.
++#ifdef CONFIG_IDF_TARGET_ESP32P4
++        uint8_t *larger = (uint8_t *)heap_caps_aligned_alloc(CONFIG_CACHE_L2_CACHE_LINE_SIZE,
++                len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
++#else
++        uint8_t *larger = (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
++#endif
++        if (!larger) return NULL;
++        if (*buf) g_h.funcs->_h_free_align(*buf);
++        *buf = larger;
+ 		double_buf.buffer[index].buf_size = len;
+ 		ESP_LOGD(TAG, "buf %d size: %ld", index, double_buf.buffer[index].buf_size);
+ 	}
+@@ -961,10 +1005,12 @@
+ 	ESP_LOGI(TAG, "sdio_data_to_rx_buf_task started");
+ 
+ 	while (1) {
++		sdio_standby_checkpoint(SDIO_WORKER_COPY);
+ 		g_h.funcs->_h_get_semaphore(sem_double_buf_xfer_data, HOSTED_BLOCK_MAX);
++		sdio_standby_checkpoint(SDIO_WORKER_COPY);
+ 
+ 		if (double_buf.read_index < 0) {
+-			ESP_LOGE(TAG, "invalid double buf read_index");
++			// The standby gate may wake an empty semaphore.
+ 			continue;
+ 		}
+ 
+@@ -1021,6 +1067,28 @@
+ }
+ #endif
+ 
++// Called under SDIO_DRV_LOCK when allocating a complete RX batch failed.
++// Drain the slave FIFO in small transfers so both ends retain the same byte
++// count. Never publish a partial batch or overwrite the other worker's buffer.
++static uint32_t sdio_rx_discard_batch(uint32_t len)
++{
++    static uint8_t scratch[ESP_BLOCK_SIZE] __attribute__((aligned(HOSTED_MEM_ALIGNMENT_64)));
++    uint32_t remaining = len;
++    while (remaining) {
++        uint32_t chunk = remaining < sizeof(scratch) ? remaining : sizeof(scratch);
++#if H_SDIO_RX_BLOCK_ONLY_XFER
++        uint32_t transfer = ESP_BLOCK_SIZE;
++#else
++        uint32_t transfer = chunk;
++#endif
++        int err = g_h.funcs->_h_sdio_read_block(sdio_handle,
++                ESP_SLAVE_CMD53_END_ADDR - remaining, scratch, transfer, ACQUIRE_LOCK);
++        if (err) break;
++        remaining -= chunk;
++    }
++    return len - remaining;
++}
++
+ static void sdio_read_task(void const* pvParameters)
+ {
+ 	esp_err_t res = ESP_OK;
+@@ -1072,12 +1140,19 @@
+ 
+ 	for (;;) {
+ 
+-		// wait for sdio interrupt from slave
++
++        sdio_standby_checkpoint(SDIO_WORKER_READ);
++        if (sdio_reopen_data_path) {
++            sdio_reopen_data_path = false;
++            sdio_generate_slave_intr(ESP_OPEN_DATA_PATH);
++        }
++        // wait for sdio interrupt from slave
+ 		/* call will block until there is an interrupt, timeout or error */
+ 		ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
+-		res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, HOSTED_BLOCK_MAX);
++		res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, pdMS_TO_TICKS(1000));
+ 		ESP_LOGD(TAG, "--- SDIO intr received ---");
+ 
++		if (res == ESP_ERR_TIMEOUT) continue; // bounded wait lets the worker park
+ 		if (res != ESP_OK) {
+ 			ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
+ 			continue;
+@@ -1163,7 +1238,13 @@
+ 
+ 		/* Allocate rx buffer */
+ 		rxbuff = sdio_rx_get_buffer(len_from_slave);
+-		assert(rxbuff);
++        if (!rxbuff) {
++            uint32_t consumed = sdio_rx_discard_batch(len_from_slave);
++            sdio_rx_byte_count = (sdio_rx_byte_count + consumed) % ESP_RX_BYTE_MAX;
++            SDIO_DRV_UNLOCK();
++            ESP_LOGW(TAG, "SDIO RX allocation failed; drained %lu/%lu bytes", consumed, len_from_slave);
++            continue;
++        }
+ 
+ 		data_left = len_from_slave;
+ 		pos = rxbuff;
+@@ -1197,9 +1278,8 @@
+ 
+ 		SDIO_DRV_UNLOCK();
+ 
+-		//TODO: unclear, on failure case
+-		//sdio_rx_byte_count += (len_from_slave-data_left);
+-		sdio_rx_byte_count += len_from_slave;
++		// Only completed transfers advanced the slave FIFO.
++		sdio_rx_byte_count += len_from_slave - data_left;
+ 		sdio_rx_byte_count = sdio_rx_byte_count % ESP_RX_BYTE_MAX;
+ 
+ 		if (unlikely(ret))
+@@ -1237,12 +1317,14 @@
+ 	ESP_LOGI(TAG, "Starting SDIO process rx task");
+ 
+ 	while (1) {
++		sdio_standby_checkpoint(SDIO_WORKER_RX);
+ 		g_h.funcs->_h_get_semaphore(sem_from_slave_queue, HOSTED_BLOCK_MAX);
++		sdio_standby_checkpoint(SDIO_WORKER_RX);
+ 
+ 		if (g_h.funcs->_h_dequeue_item(from_slave_queue[PRIO_Q_SERIAL], &buf_handle_l, 0))
+ 			if (g_h.funcs->_h_dequeue_item(from_slave_queue[PRIO_Q_BT], &buf_handle_l, 0))
+ 				if (g_h.funcs->_h_dequeue_item(from_slave_queue[PRIO_Q_OTHERS], &buf_handle_l, 0)) {
+-					ESP_LOGI(TAG, "No element in any queue found");
++					// Empty token after standby/resume is expected.
+ 					continue;
+ 				}
+ 
+@@ -1332,6 +1414,7 @@
+ 
+ void *bus_init_internal(void)
+ {
++	sdio_standby_gate_init();
+ 	uint8_t prio_q_idx = 0;
+ 
+ 	int tx_queue_size = DEFAULT_TO_SLAVE_QUEUE_SIZE;
+@@ -1471,8 +1554,18 @@
+ 		pkt_stats.sta_tx_in_pass++;
+ #endif
+ 
+-	g_h.funcs->_h_queue_item(to_slave_queue[pkt_prio], &buf_handle, HOSTED_BLOCK_MAX);
+-	g_h.funcs->_h_post_semaphore(sem_to_slave_queue);
++
++    /* Serialize the last enqueue with the standby gate. A bounded send also
++     * prevents a stalled producer from blocking the power transition forever. */
++    xSemaphoreTake(sdio_standby_tx_mutex, portMAX_DELAY);
++    int queued = sdio_standby_accept_tx ?
++        g_h.funcs->_h_queue_item(to_slave_queue[pkt_prio], &buf_handle, pdMS_TO_TICKS(50)) : ESP_FAIL;
++    if (!queued) g_h.funcs->_h_post_semaphore(sem_to_slave_queue);
++    xSemaphoreGive(sdio_standby_tx_mutex);
++    if (queued) {
++        H_FREE_PTR_WITH_FUNC(free_func, buffer_to_free);
++        return ESP_FAIL;
++    }
+ 
+ 
+ 	return ESP_OK;
+@@ -1607,6 +1700,8 @@
+ 	return res;
+ }
+ 
++#include "sdio_standby_impl.h"
++
+ int bus_inform_slave_host_power_save_start(void)
+ {
+ 	ESP_LOGI(TAG, "Inform slave, host power save is started");
+diff --git a/host/drivers/transport/sdio/sdio_drv.h b/host/drivers/transport/sdio/sdio_drv.h
+--- a/host/drivers/transport/sdio/sdio_drv.h
++++ b/host/drivers/transport/sdio/sdio_drv.h
+@@ -19,5 +19,7 @@
+ /** Inline functions **/
+ 
+ /** Exported Functions **/
++int bus_set_coprocessor_standby(int enabled);
++int bus_prepare_coprocessor_wake(void);
+ 
+ #endif /* __SDIO_DRV_H */
+diff --git a/host/drivers/transport/transport_drv.c b/host/drivers/transport/transport_drv.c
+--- a/host/drivers/transport/transport_drv.c
++++ b/host/drivers/transport/transport_drv.c
+@@ -716,6 +716,10 @@
+ {
+ 	ESP_LOGI(TAG, "transport_delayed_init");
+ 	rpc_start();
++	/* Host services persist across a coprocessor-only restart. */
++	static bool host_services_started;
++	if (host_services_started) return 0;
++	host_services_started = true;
+ 	/* Add up cli */
+ #ifdef H_ESP_HOSTED_CLI_ENABLED
+ 	esp_hosted_cli_start();
+diff --git a/host/esp_hosted.h b/host/esp_hosted.h
+--- a/host/esp_hosted.h
++++ b/host/esp_hosted.h
+@@ -25,6 +25,13 @@
+ /* --------- Hosted Minimal APIs --------- */
+ int esp_hosted_init(void);
+ int esp_hosted_deinit(void);
++/* P4/SDIO offline standby. Caller must serialize transitions and stop/deinit
++ * WiFi first. Retains tasks, queues, channels and the shared SDMMC controller.
++ * On any failure call with enabled=0 before using WiFi again. */
++int esp_hosted_set_coprocessor_standby(int enabled);
++/* Start a parked C5 boot without opening SDIO or accepting network requests.
++ * Serialized with standby/resume; subsequent normal resume finishes INIT. */
++int esp_hosted_prepare_coprocessor_wake(void);
+ 
+ int esp_hosted_connect_to_slave(void);
+ int esp_hosted_get_coprocessor_fwversion(esp_hosted_coprocessor_fwver_t *ver_info);
+diff --git a/host/port/esp/freertos/src/port_esp_hosted_host_sdio.c b/host/port/esp/freertos/src/port_esp_hosted_host_sdio.c
+--- a/host/port/esp/freertos/src/port_esp_hosted_host_sdio.c
++++ b/host/port/esp/freertos/src/port_esp_hosted_host_sdio.c
+@@ -379,7 +379,7 @@
+ 	}
+ 
+ 	// initialise connected SDIO card/slave
+-	context.card = (sdmmc_card_t *)g_h.funcs->_h_malloc(sizeof(sdmmc_card_t));
++	context.card = (sdmmc_card_t *)g_h.funcs->_h_calloc(1, sizeof(sdmmc_card_t));
+ 	if (!context.card) {
+ 		ESP_LOGE(TAG, "Failed to allocate memory for SDMMC card");
+ 		return NULL;
+@@ -405,7 +405,8 @@
+ 	sdmmc_host_t config = SDMMC_HOST_DEFAULT();
+ 	config.slot = sdio_config->slot; // override default slot set
+ 
+-	if (!hosted_sdio_enable_ldo(&config)) {
++	config.pwr_ctrl_handle = context->card->host.pwr_ctrl_handle;
++	if (!config.pwr_ctrl_handle && !hosted_sdio_enable_ldo(&config)) {
+ 		goto fail;
+ 	}
+ 
+@@ -436,7 +437,13 @@
+ 	// Set this flag to allocate aligned buffer of 512 bytes to meet
+ 	// DMA's requirements for CMD53 byte mode. Mandatory when any
+ 	// buffer is behind the cache, or not aligned to 4 byte boundary.
+-	config.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
++
++    // IDF clears the card structure on each init attempt. Carry the existing
++    // DMA scratch buffer through config and suppress a second allocation.
++    // This also retains an allocation made by a failed earlier init attempt.
++    config.dma_aligned_buffer = context->card->host.dma_aligned_buffer;
++    if (!config.dma_aligned_buffer) config.flags |= SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
++    else config.flags &= ~SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
+ #endif
+ 
+ 	if (sdmmc_card_init(&config, context->card) != ESP_OK) {
+diff --git a/host/drivers/transport/sdio/sdio_standby_gate.h b/host/drivers/transport/sdio/sdio_standby_gate.h
+new file mode 100644
+--- /dev/null
++++ b/host/drivers/transport/sdio/sdio_standby_gate.h
+@@ -0,0 +1,63 @@
++/* Metalio offline standby: park workers only at buffer/lock-free boundaries. */
++#pragma once
++#include "freertos/FreeRTOS.h"
++#include "freertos/event_groups.h"
++#include "freertos/semphr.h"
++#include "freertos/task.h"
++#include "driver/gpio.h"
++
++enum {
++    SDIO_WORKER_READ = BIT0,
++    SDIO_WORKER_TX = BIT1,
++    SDIO_WORKER_COPY = BIT2,
++    SDIO_WORKER_RX = BIT3,
++    SDIO_WORKERS_ALL = BIT0 | BIT1 | BIT2 | BIT3,
++    SDIO_ACK_SHIFT = 4,
++};
++static StaticEventGroup_t sdio_standby_events_storage;
++static EventGroupHandle_t sdio_standby_events;
++static StaticSemaphore_t sdio_standby_tx_mutex_storage;
++static SemaphoreHandle_t sdio_standby_tx_mutex;
++static bool sdio_standby_accept_tx = true; // protected by tx_mutex
++static bool sdio_coprocessor_off;
++static bool sdio_coprocessor_starting;
++static bool sdio_coprocessor_boot_started;
++static TickType_t sdio_coprocessor_boot_tick;
++
++static void sdio_standby_gate_init(void)
++{
++    sdio_standby_events = xEventGroupCreateStatic(&sdio_standby_events_storage);
++    sdio_standby_tx_mutex = xSemaphoreCreateMutexStatic(&sdio_standby_tx_mutex_storage);
++    xEventGroupSetBits(sdio_standby_events, SDIO_WORKERS_ALL);
++}
++
++static void sdio_standby_checkpoint(EventBits_t worker)
++{
++    while (!(xEventGroupGetBits(sdio_standby_events) & worker)) {
++        xEventGroupSetBits(sdio_standby_events, worker << SDIO_ACK_SHIFT);
++        xEventGroupWaitBits(sdio_standby_events, worker, pdFALSE, pdTRUE, portMAX_DELAY);
++        xEventGroupClearBits(sdio_standby_events, worker << SDIO_ACK_SHIFT);
++    }
++}
++
++static void sdio_standby_release_workers(void)
++{
++    xEventGroupSetBits(sdio_standby_events, SDIO_WORKERS_ALL);
++    // Don't start another pause while acknowledgements from the old one remain.
++    while (xEventGroupGetBits(sdio_standby_events) & (SDIO_WORKERS_ALL << SDIO_ACK_SHIFT)) {
++        vTaskDelay(1);
++    }
++}
++
++static bool sdio_standby_park(EventBits_t workers)
++{
++    xEventGroupClearBits(sdio_standby_events, workers);
++    // Wake semaphore-blocked consumers so they can reach a safe boundary.
++    // Their loops explicitly tolerate an empty token on abort/resume.
++    if (workers & SDIO_WORKER_TX) g_h.funcs->_h_post_semaphore(sem_to_slave_queue);
++    if (workers & SDIO_WORKER_COPY) g_h.funcs->_h_post_semaphore(sem_double_buf_xfer_data);
++    if (workers & SDIO_WORKER_RX) g_h.funcs->_h_post_semaphore(sem_from_slave_queue);
++    EventBits_t ack = workers << SDIO_ACK_SHIFT;
++    return (xEventGroupWaitBits(sdio_standby_events, ack, pdFALSE, pdTRUE,
++                               pdMS_TO_TICKS(2500)) & ack) == ack;
++}
+diff --git a/host/drivers/transport/sdio/sdio_standby_impl.h b/host/drivers/transport/sdio/sdio_standby_impl.h
+new file mode 100644
+--- /dev/null
++++ b/host/drivers/transport/sdio/sdio_standby_impl.h
+@@ -0,0 +1,139 @@
++/* Included after the SDIO implementation so no private buffer ownership escapes. */
++static void sdio_standby_drain(void)
++{
++    interface_buffer_handle_t packet;
++    for (int p = 0; p < MAX_PRIORITY_QUEUES; ++p) {
++        while (!g_h.funcs->_h_dequeue_item(to_slave_queue[p], &packet, 0)) {
++            H_FREE_PTR_WITH_FUNC(packet.free_buf_handle, packet.priv_buffer_handle);
++        }
++        while (!g_h.funcs->_h_dequeue_item(from_slave_queue[p], &packet, 0)) {
++            H_FREE_PTR_WITH_FUNC(packet.free_buf_handle, packet.priv_buffer_handle);
++        }
++    }
++    while (!g_h.funcs->_h_get_semaphore(sem_to_slave_queue, 0)) {}
++    while (!g_h.funcs->_h_get_semaphore(sem_from_slave_queue, 0)) {}
++    while (!g_h.funcs->_h_get_semaphore(sem_double_buf_xfer_data, 0)) {}
++    // Retain all buffers/pools/tasks; the next slave has new byte/buffer counters.
++    double_buf.read_index = -1;
++    double_buf.write_index = 0;
++    double_buf.read_data_len = 0;
++    sdio_tx_buf_count = sdio_rx_byte_count = sdio_write_buf_available = 0;
++    wifi_tx_throttling = 0;
++    sdio_start_write_thread = false;
++    serial_ll_reset_partial_rx();
++}
++
++int bus_prepare_coprocessor_wake(void)
++{
++    gpio_pin_t pin = { .port = H_GPIO_PORT_RESET, .pin = H_GPIO_PIN_RESET };
++    if (!sdio_handle || !sdio_standby_events ||
++        esp_hosted_transport_get_reset_config(&pin) != ESP_TRANSPORT_OK ||
++        !GPIO_IS_VALID_OUTPUT_GPIO(pin.pin)) return ESP_ERR_INVALID_STATE;
++    if (!sdio_coprocessor_off || sdio_coprocessor_boot_started) return ESP_OK;
++    // Only release EN. SDIO workers and the public transport gate stay closed
++    // until the normal resume transaction confirms a fresh INIT.
++    esp_err_t err = gpio_hold_dis(pin.pin);
++    if (err != ESP_OK) return err;
++    err = gpio_set_level(pin.pin, H_RESET_VAL_ACTIVE);
++    if (err != ESP_OK) return err;
++    sdio_coprocessor_boot_tick = xTaskGetTickCount();
++    sdio_coprocessor_boot_started = true;
++    ESP_LOGI(TAG, "C5 boot started early; SDIO remains parked");
++    return ESP_OK;
++}
++
++int bus_set_coprocessor_standby(int enabled)
++{
++    gpio_pin_t pin = { .port = H_GPIO_PORT_RESET, .pin = H_GPIO_PIN_RESET };
++    if (!sdio_handle || !sdio_standby_events ||
++        esp_hosted_transport_get_reset_config(&pin) != ESP_TRANSPORT_OK ||
++        !GPIO_IS_VALID_OUTPUT_GPIO(pin.pin)) return ESP_ERR_INVALID_STATE;
++
++    if (enabled) {
++        if (sdio_coprocessor_off) {
++            // An audio wake failure can return to standby after early EN
++            // release. Do not latch EN high and silently leave C5 running.
++            if (sdio_coprocessor_boot_started) {
++                esp_err_t err = gpio_set_level(pin.pin, H_RESET_VAL_INACTIVE);
++                if (err != ESP_OK) return err;
++                sdio_coprocessor_boot_started = false;
++            }
++            return gpio_hold_en(pin.pin);
++        }
++        xSemaphoreTake(sdio_standby_tx_mutex, portMAX_DELAY);
++        sdio_standby_accept_tx = false;
++        xSemaphoreGive(sdio_standby_tx_mutex);
++        // Park upstream first; downstream must still drain any full queue while
++        // its producer finishes. Never delete a task holding an SDMMC mutex.
++        bool parked = sdio_standby_park(SDIO_WORKER_READ | SDIO_WORKER_TX) &&
++                      sdio_standby_park(SDIO_WORKER_COPY) &&
++                      sdio_standby_park(SDIO_WORKER_RX);
++        if (!parked) {
++            sdio_standby_release_workers();
++            xSemaphoreTake(sdio_standby_tx_mutex, portMAX_DELAY);
++            sdio_standby_accept_tx = true;
++            xSemaphoreGive(sdio_standby_tx_mutex);
++            ESP_LOGW(TAG, "C5 standby aborted: transport did not quiesce; EN unchanged");
++            return ESP_ERR_TIMEOUT;
++        }
++        // transport_gpio_reset() finishes at ACTIVE (EN high on this board).
++        // INACTIVE is the level that holds the C5 in reset, not ACTIVE.
++        esp_err_t err = gpio_set_level(pin.pin, H_RESET_VAL_INACTIVE);
++        if (err != ESP_OK) {
++            sdio_standby_release_workers();
++            xSemaphoreTake(sdio_standby_tx_mutex, portMAX_DELAY);
++            sdio_standby_accept_tx = true;
++            xSemaphoreGive(sdio_standby_tx_mutex);
++            return err;
++        }
++        sdio_coprocessor_off = true; // wake must restore even if GPIO hold fails
++        sdio_coprocessor_starting = false;
++        sdio_coprocessor_boot_started = false;
++        set_transport_state(TRANSPORT_INACTIVE);
++        sdio_standby_drain();
++        err = gpio_hold_en(pin.pin);
++        ESP_LOGI(TAG, "C5 held in reset; SDIO workers parked, SD card slot retained (%s)",
++                 esp_err_to_name(err));
++        return err;
++    }
++
++    if (!sdio_coprocessor_off && !sdio_coprocessor_starting) return ESP_OK;
++    // A failed handshake is retryable. Quiesce before giving the C5 another reset.
++    if (sdio_coprocessor_starting) {
++        int err = bus_set_coprocessor_standby(1);
++        if (err != ESP_OK) return err;
++    }
++    esp_err_t err = bus_prepare_coprocessor_wake();
++    if (err != ESP_OK) return err;
++    const TickType_t elapsed = xTaskGetTickCount() - sdio_coprocessor_boot_tick;
++    const TickType_t required = pdMS_TO_TICKS(H_HOST_SDIO_RESET_DELAY_MS);
++    if (elapsed < required) g_h.funcs->_h_msleep((required - elapsed) * portTICK_PERIOD_MS);
++    err = transport_card_init(sdio_handle, 1500);
++    if (err != ESP_OK) {
++        gpio_set_level(pin.pin, H_RESET_VAL_INACTIVE);
++        sdio_coprocessor_boot_started = false;
++        gpio_hold_en(pin.pin);
++        ESP_LOGW(TAG, "C5 card reinit failed; transport remains parked for retry");
++        return err;
++    }
++    sdio_reopen_data_path = true;
++    sdio_coprocessor_off = false;
++    sdio_coprocessor_boot_started = false;
++    sdio_coprocessor_starting = true;
++    set_transport_state(TRANSPORT_RX_ACTIVE);
++    xSemaphoreTake(sdio_standby_tx_mutex, portMAX_DELAY);
++    sdio_standby_accept_tx = true;
++    xSemaphoreGive(sdio_standby_tx_mutex);
++    sdio_standby_release_workers();
++    // Wait for the complete INIT handler, including its reply and rpc_start().
++    for (int attempt = 0; attempt < 400; ++attempt) {
++        if (is_transport_tx_ready() && sdio_start_write_thread) {
++            sdio_coprocessor_starting = false;
++            ESP_LOGI(TAG, "C5 fresh INIT confirmed; transport restored");
++            return ESP_OK;
++        }
++        g_h.funcs->_h_msleep(20);
++    }
++    ESP_LOGW(TAG, "C5 fresh INIT timed out; wake can retry");
++    return ESP_ERR_TIMEOUT;
++}

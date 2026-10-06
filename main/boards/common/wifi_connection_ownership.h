@@ -15,7 +15,7 @@ public:
     template <typename Start>
     uint64_t StartAutomatic(Start start) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (manual_) return 0;
+        if (manual_ || standby_) return 0;
         const auto generation = ++generation_;
         start();
         return generation;
@@ -23,13 +23,13 @@ public:
 
     bool IsCurrent(uint64_t generation) {
         std::lock_guard<std::mutex> lock(mutex_);
-        return !manual_ && generation != 0 && generation == generation_;
+        return !manual_ && !standby_ && generation != 0 && generation == generation_;
     }
 
     template <typename Stop>
     void StopAutomatic(uint64_t generation, Stop stop) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (manual_ || generation == 0 || generation != generation_) return;
+        if (manual_ || standby_ || generation == 0 || generation != generation_) return;
         ++generation_;
         stop();
     }
@@ -55,4 +55,28 @@ private:
     std::mutex mutex_;
     uint64_t generation_ = 0;
     bool manual_ = false;
+    bool standby_ = false;
+
+public:
+    // Prepare hardware while retaining the offline ownership gate. Do not
+    // let a manual settings owner or old automatic waiter race this step.
+    template <typename Prepare>
+    bool PrepareStandbyWake(Prepare prepare) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (manual_ || !standby_) return false;
+        return prepare();
+    }
+
+    // Settings relinquishes its manual stack on screen suspension. If an
+    // owner is still active, fail safely instead of stopping its driver.
+    template <typename Transition>
+    bool SetStandby(bool enabled, Transition transition) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (manual_) return false;
+        if (enabled && !standby_) ++generation_;
+        if (enabled) standby_ = true;
+        if (!transition(enabled)) return false;
+        if (!enabled) standby_ = false;
+        return true;
+    }
 };

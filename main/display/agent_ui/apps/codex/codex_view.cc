@@ -565,6 +565,8 @@ void ShowRealtimePage(bool show) {
 void EndRealtimeSession(bool notify_pc, bool keep_page = false) {
     const std::string request_id = s_ui.realtime_request_id;
     const ai::Availability::Token availability_token = s_ui.realtime_availability_token;
+    const bool had_session = !request_id.empty() || availability_token != 0 ||
+                             s_ui.realtime_capture_started;
     s_ui.realtime_availability_token = 0;
     s_ui.realtime_capture_started = false;
     s_ui.realtime_request_id.clear();
@@ -575,7 +577,9 @@ void EndRealtimeSession(bool notify_pc, bool keep_page = false) {
     s_ui.realtime_last_sequence = 0;
     s_ui.realtime_captions.Clear();
     UpdateRealtimeCaptionText();
-    Application::GetInstance().EndCodexRealtimeSession();
+    // Call cleanup shares capture state with dictation. Only its owner may
+    // clear that state, so dictation's stop can still release its AI lease.
+    if (had_session) Application::GetInstance().EndCodexRealtimeSession();
     // EndCodexRealtimeSession schedules capture/audio cleanup. Queue this
     // release after it so another AI owner cannot begin while the call still
     // owns microphone, playback, or wake-word state.
@@ -1666,7 +1670,7 @@ void BuildConfigDialog(lv_obj_t* root) {
     if (CodexWsClient::GetInstance().LoadToken(saved_token)) {
         lv_textarea_set_text(s_ui.token, saved_token.c_str());
     }
-    Keyboard::Get().Bind(s_ui.remote_ip, "服务器地址", LV_KEYBOARD_MODE_TEXT_LOWER);
+    Keyboard::Get().Bind(s_ui.remote_ip, "服务器地址", LV_KEYBOARD_MODE_USER_1);
     Keyboard::Get().Bind(s_ui.token, "Codex Token");
     Settings settings("codex", false);
     const std::string saved_remote_url = settings.GetString("remote_url");

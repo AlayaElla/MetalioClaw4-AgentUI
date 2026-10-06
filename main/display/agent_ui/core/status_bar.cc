@@ -7,6 +7,7 @@
 #include <utility>
 
 #include <font_awesome.h>
+#include <esp_log.h>
 
 #include "application.h"
 #include "ai/ai_availability.h"
@@ -297,6 +298,11 @@ void StatusBar::Refresh(bool force) {
     const char* network_icon = Board::GetInstance().GetNetworkStateIcon();
     const lv_image_dsc_t* network_asset = SelectNetworkAsset(network_mode_, network_icon);
     if (force || last_network_asset_ != network_asset) {
+        if (network_mode_ == NetworkMode::Wifi &&
+            last_network_asset_ == &status_signal_assets::kDisconnected &&
+            network_asset != &status_signal_assets::kDisconnected) {
+            ESP_LOGI("AgentStatusBar", "Wi-Fi icon updated after connection");
+        }
         last_network_asset_ = network_asset;
         lv_image_set_src(network_icon_, network_asset);
     }
@@ -450,8 +456,10 @@ void StatusBar::AnimateAgentFace(int32_t target, uint32_t duration_ms) {
 
 void StatusBar::UpdateAgentPresentation() {
     if (!agent_face_slot_ || !agent_label_ || !reply_clip_) return;
-    const bool show_caption = !reply_caption_.empty() && !lock_screen_mode_ && ai_available_;
-    if (home_active_ || lock_screen_mode_ || !ai_available_) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+    const bool show_activation = !last_center_text_.empty() && !lock_screen_mode_;
+    if (show_activation && !reply_caption_.empty()) ClearReplyCaption();
+    const bool show_caption = !reply_caption_.empty() && !lock_screen_mode_ && ai_available_ && !show_activation;
+    if (home_active_ || lock_screen_mode_ || !ai_available_ || show_activation) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
     if (show_caption) {
         lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
@@ -510,8 +518,8 @@ void StatusBar::UpdateAgentPresentation() {
         }, duration, this);
         return;
     }
-    const bool show_activation = !last_center_text_.empty() && !lock_screen_mode_;
     if (show_activation) {
+        lv_anim_delete(agent_label_, SetObjectTranslateX);
         lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(agent_label_, last_center_text_.c_str());
         lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);

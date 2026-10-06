@@ -1,6 +1,7 @@
 #include "bq27220_gauge.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #define TAG "Bq27220Gauge"
 
@@ -18,6 +19,9 @@ constexpr int      kProbeTimeoutMs = 50;
 // 单节锂电典型：3.3V≈0%，4.2V≈100%。
 constexpr float kBatteryEmptyV = 3.3f;
 constexpr float kBatteryFullV  = 4.2f;
+// The normal status bar reads at 1 Hz; the home screen may read every 30 s.
+// After a longer gap, those samples describe an earlier power state.
+constexpr int64_t kFilterMaxGapUs = 60LL * 1000000;
 }  // namespace
 
 bool Bq27220Gauge::Begin(i2c_master_bus_handle_t bus, uint8_t addr) {
@@ -133,6 +137,7 @@ void Bq27220Gauge::ResetFilter() {
     filter_count_   = 0;
     filter_sum_     = 0.0f;
     filter_primed_  = false;
+    filter_last_sample_us_ = 0;
 }
 
 bool Bq27220Gauge::ReadU16(uint8_t reg, uint16_t* out) {
@@ -155,7 +160,16 @@ bool Bq27220Gauge::ReadU16(uint8_t reg, uint16_t* out) {
 }
 
 float Bq27220Gauge::FilterPush(float sample) {
-    if (!filter_primed_) {
+    const int64_t now_us = esp_timer_get_time();
+    const bool expired = filter_primed_ &&
+                         now_us - filter_last_sample_us_ >= kFilterMaxGapUs;
+    // Only successful percentage reads reach here. Failed I2C reads and raw
+    // diagnostic reads must not extend the life of a stale averaging window.
+    filter_last_sample_us_ = now_us;
+    if (!filter_primed_ || expired) {
+        if (expired) {
+            ESP_LOGI(TAG, "Battery averaging window expired; fresh level=%.0f%%", sample);
+        }
         for (int i = 0; i < kFilterSize; ++i) {
             filter_buf_[i] = sample;
         }

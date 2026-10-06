@@ -7,8 +7,10 @@
 #include <string>
 
 #include <esp_random.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 
 #include "agent_ui/apps/boot/boot_view.h"
@@ -21,6 +23,7 @@
 #include "agent_ui/apps/files/files_view.h"
 #include "agent_ui/apps/phone/phone_view.h"
 #include "agent_ui/apps/settings/settings_view.h"
+#include "agent_ui/apps/standby_test/standby_test_view.h"
 #include "agent_ui/apps/home/home_renderer.h"
 #include "ai/ai_availability.h"
 #include "ai/system_connectivity.h"
@@ -79,6 +82,7 @@ void Runtime::Initialize() {
     Navigation::Get().Register(ScreenId::ExternalAppHost,
                                external_apps::HostView::Create);
     Navigation::Get().Register(ScreenId::DisplayDebug, DisplayDebugView::Create);
+    Navigation::Get().Register(ScreenId::StandbyTest, StandbyTestView::Create);
     UiDispatcher::Init();
     ai::system_connectivity::RegisterProviders();
     RegisterAppMcpTools();
@@ -113,16 +117,30 @@ void Runtime::OnBoardReady(Board& board) {
 void Runtime::Start() {
     bool expected = false;
     if (!start_started_.compare_exchange_strong(expected, true)) return;
-    if (xTaskCreate(StartTask, "app_install", 8192, this, 4, nullptr) != pdPASS) {
+    // Ordinary FreeRTOS task creation requires an internal-RAM stack, which
+    // competes with the modem and network tasks during startup.
+    if (xTaskCreateWithCaps(StartTask, "app_install", 8192, this, 4, nullptr,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         start_started_.store(false);
-        ESP_LOGE(kTag, "Failed to create external app installation task");
+        ESP_LOGE(kTag,
+                 "Failed to create external app installation task: "
+                 "internal_free=%u internal_largest=%u "
+                 "psram_free=%u psram_largest=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(
+                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(heap_caps_get_free_size(
+                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(
+                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
         Navigation::Get().Start();
     }
 }
 
 void Runtime::StartTask(void* argument) {
     static_cast<Runtime*>(argument)->RunStartTask();
-    vTaskDelete(nullptr);
+    vTaskDeleteWithCaps(nullptr);
 }
 
 void Runtime::RunStartTask() {

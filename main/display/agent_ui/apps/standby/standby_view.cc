@@ -1,6 +1,7 @@
 #include "standby_view.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <ctime>
 
@@ -16,6 +17,7 @@
 #include "core/fonts.h"
 #include "core/idle_power.h"
 #include "core/performance_manager.h"
+#include "core/power_key.h"
 #include "core/status_bar.h"
 #include "core/theme.h"
 #include "core/ui_utils.h"
@@ -56,12 +58,32 @@ struct State {
     bool black = false;
     bool dragging = false;
     bool invalidation_suspended = false;
+    bool peripherals_pending = false;
+    bool peripherals_failed = false;
+    bool audio_ready = false;
+    bool sleep_after_wake = false;
+    bool immediate_sleep_after_wake = false;
 };
 
 State s_ui;
+std::atomic<bool> s_active_snapshot{false};
+std::atomic<bool> s_screen_off_snapshot{false};
 
 void ScheduleScreenOff();
 void UnlockToSource();
+
+void StartPeripheralWake() {
+    s_ui.peripherals_pending = true;
+    s_ui.peripherals_failed = false;
+    s_ui.audio_ready = false;
+    if (!PowerKey::ResumeStandbyPeripherals()) {
+        s_ui.peripherals_pending = false;
+        s_ui.peripherals_failed = true;
+    }
+    if (s_ui.slider_label != nullptr) {
+        lv_label_set_text(s_ui.slider_label, "向右滑动解锁");
+    }
+}
 
 void DeleteTimer(lv_timer_t*& timer) {
     if (timer == nullptr) return;
@@ -293,6 +315,12 @@ void DeleteLockUi() {
 
 void EnterScreenOff() {
     DeleteTimer(s_ui.off_timer);
+    if (s_ui.peripherals_pending) {
+        s_ui.sleep_after_wake = true;
+        s_ui.immediate_sleep_after_wake = true;
+        return;
+    }
+    s_ui.peripherals_failed = false;
     if (!s_ui.active || s_ui.black || s_ui.lock_overlay == nullptr ||
         !lv_obj_is_valid(s_ui.lock_overlay)) {
         return;
@@ -315,19 +343,34 @@ void EnterScreenOff() {
     lv_obj_move_foreground(s_ui.black_overlay);
     lv_refr_now(nullptr);
     s_ui.black = true;
+    s_screen_off_snapshot.store(true, std::memory_order_release);
     if (s_ui.clock_timer != nullptr) {
         lv_timer_pause(s_ui.clock_timer);
     }
-    // The DSI stream is about to stop. Suppress every hidden UI invalidation
-    // so LVGL cannot start a flush that has no active video engine to finish.
+    // The adapter detaches the LVGL display before deleting the DPI producer.
+    // Keep all invalidation suppressed until the new panel is rebound.
     SuspendDisplayInvalidation();
 
     Application::GetInstance().SetLowPowerStandby(true);
     bool panel_suspended = true;
-    if (Display* display = Board::GetInstance().GetDisplay()) {
+    Display* display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
         panel_suspended = display->SetPowerSaveModeChecked(true);
     }
     if (!panel_suspended) {
+        // A failed delete/recovery can leave the adapter detached. Preserve
+        // the black overlay and invalidation guard until a later key retry.
+        if (display != nullptr && display->IsPowerSaveActive()) {
+            PerformanceManager::Get().SetStandbyPhase(
+                StandbyPerformancePhase::ScreenOff);
+            Board::GetInstance().SetLowPowerStandby(true);
+            if (Backlight* backlight = Board::GetInstance().GetBacklight()) {
+                backlight->SetBrightness(0, false);
+            }
+            ESP_LOGE(kTag,
+                     "Panel suspend failed after detachment; keeping UI black for recovery");
+            return;
+        }
         Application::GetInstance().SetLowPowerStandby(false);
         if (s_ui.black_overlay != nullptr &&
             lv_obj_is_valid(s_ui.black_overlay)) {
@@ -335,6 +378,7 @@ void EnterScreenOff() {
         }
         s_ui.black_overlay = nullptr;
         s_ui.black = false;
+        s_screen_off_snapshot.store(false, std::memory_order_release);
         if (s_ui.expression != nullptr) {
             s_ui.expression->SetRenderingPaused(false);
         }
@@ -365,7 +409,7 @@ void OnScreenOff(lv_timer_t*) {
 
 void ScheduleScreenOff() {
     DeleteTimer(s_ui.off_timer);
-    if (!s_ui.active || s_ui.black) return;
+    if (!s_ui.active || s_ui.black || s_ui.peripherals_pending) return;
     s_ui.off_timer = lv_timer_create(OnScreenOff, kScreenOffDelayMs, nullptr);
     lv_timer_set_repeat_count(s_ui.off_timer, 1);
 }
@@ -375,24 +419,34 @@ void WakeLockScreen() {
              s_ui.active, s_ui.black);
     if (!s_ui.active || !s_ui.black) return;
 
-    // Temporarily boost before restarting the continuous DSI stream, then
-    // settle back to the visible-lock tier after the lock UI is restored.
+    // Hardware recovery runs on the power-key worker before this LVGL-only
+    // callback. Keep the UI paused and black if that recovery did not finish.
+    if (Display* display = Board::GetInstance().GetDisplay()) {
+        if (display->IsPowerSaveActive()) {
+            ESP_LOGE(kTag,
+                     "Display recovery is still pending; retaining black standby state");
+            return;
+        }
+        if (!display->SetPowerSaveModeChecked(false)) {
+            ESP_LOGE(kTag, "Display wake failed; retaining black standby state");
+            return;
+        }
+    }
+
+    // Show the recovered panel before waiting for radio/audio clocks. Keep
+    // the application audio gate closed until the worker confirms readiness.
     PerformanceManager::Get().SetStandbyPhase(
         StandbyPerformancePhase::Awake);
-    Board::GetInstance().SetLowPowerStandby(false);
     if (Display* display = Board::GetInstance().GetDisplay()) {
-        ESP_LOGI(kTag, "Resuming display panel");
-        display->SetPowerSaveMode(false);
-        ESP_LOGI(kTag, "Display panel resume returned");
+        ESP_LOGI(kTag, "Display panel recovery confirmed");
     }
-    Application::GetInstance().SetLowPowerStandby(false);
-
     if (s_ui.black_overlay != nullptr &&
         lv_obj_is_valid(s_ui.black_overlay)) {
         lv_obj_delete(s_ui.black_overlay);
     }
     s_ui.black_overlay = nullptr;
     s_ui.black = false;
+    s_screen_off_snapshot.store(false, std::memory_order_release);
     if (s_ui.expression != nullptr) {
         s_ui.expression->SetRenderingPaused(false);
     }
@@ -408,15 +462,14 @@ void WakeLockScreen() {
         backlight->RestoreBrightness();
     }
     StatusBar::Get().SetLockScreenMode(true);
+    StartPeripheralWake();
     lv_obj_invalidate(s_ui.lock_overlay);
     lv_refr_now(nullptr);
     PerformanceManager::Get().SetStandbyPhase(
         StandbyPerformancePhase::Dim);
     ScheduleScreenOff();
     ESP_LOGI(kTag,
-             "Side key woke lock screen at configured brightness; "
-             "screen-off in %u ms",
-             static_cast<unsigned>(kScreenOffDelayMs));
+             "Lock screen visible; peripheral recovery continues on worker");
 }
 
 void UnlockToSource() {
@@ -425,9 +478,11 @@ void UnlockToSource() {
 
     PerformanceManager::Get().SetStandbyPhase(
         StandbyPerformancePhase::Awake);
-    Board::GetInstance().SetLowPowerStandby(false);
-    Application::GetInstance().SetLowPowerStandby(false);
-    AudioOutput_SetStandby(false);
+    // The worker owns hardware recovery. Unlock must not repeat it or open
+    // audio before the peripheral clocks have been confirmed ready.
+    if (s_ui.audio_ready || (!s_ui.peripherals_pending && !s_ui.peripherals_failed)) {
+        AudioOutput_SetStandby(false);
+    }
     StatusBar::Get().SetLockScreenMode(false);
 
     DeleteLockUi();
@@ -443,6 +498,8 @@ void UnlockToSource() {
     }
     s_ui.active = false;
     s_ui.black = false;
+    s_active_snapshot.store(false, std::memory_order_release);
+    s_screen_off_snapshot.store(false, std::memory_order_release);
     s_ui.dragging = false;
     s_ui.source_screen = nullptr;
     IdlePower::Get().SetStandbyActive(false);
@@ -453,8 +510,16 @@ void UnlockToSource() {
 
 }  // namespace
 
-void StandbyView::Show() {
-    if (s_ui.active) return;
+void StandbyView::Show(bool screen_off_immediately) {
+    if (s_ui.peripherals_pending) {
+        s_ui.sleep_after_wake = true;
+        s_ui.immediate_sleep_after_wake |= screen_off_immediately;
+        return;
+    }
+    if (s_ui.active) {
+        if (screen_off_immediately) EnterScreenOff();
+        return;
+    }
     ResumeDisplayInvalidation();
     s_ui.source_screen = lv_screen_active();
     if (s_ui.source_screen == nullptr ||
@@ -467,6 +532,8 @@ void StandbyView::Show() {
     Application::GetInstance().ForceReturnToIdle();
     s_ui.active = true;
     s_ui.black = false;
+    s_active_snapshot.store(true, std::memory_order_release);
+    s_screen_off_snapshot.store(false, std::memory_order_release);
     s_ui.dragging = false;
     s_ui.black_overlay = nullptr;
     SendAppLifecycle(s_ui.source_screen, AppLifecycleEvent::Suspend);
@@ -480,6 +547,11 @@ void StandbyView::Show() {
     if (Backlight* backlight = Board::GetInstance().GetBacklight()) {
         backlight->SetBrightness(kDimBrightnessPercent, false);
     }
+    if (screen_off_immediately) {
+        ESP_LOGI(kTag, "Immediate screen-off requested");
+        EnterScreenOff();
+        return;
+    }
     ScheduleScreenOff();
     ESP_LOGI(kTag,
              "Lock screen active at %u%% brightness; screen-off in %u ms",
@@ -488,6 +560,11 @@ void StandbyView::Show() {
 }
 
 void StandbyView::HandlePowerKey() {
+    if (s_ui.peripherals_pending) return;
+    if (s_ui.peripherals_failed) {
+        StartPeripheralWake();
+        return;
+    }
     if (!s_ui.active) {
         Show();
         return;
@@ -499,8 +576,45 @@ void StandbyView::HandlePowerKey() {
     }
 }
 
-bool StandbyView::IsActive() { return s_ui.active; }
+void StandbyView::CompleteAudioWake() {
+    if (s_ui.black || !s_ui.peripherals_pending || s_ui.audio_ready) return;
+    s_ui.audio_ready = true;
+    Application::GetInstance().SetLowPowerStandby(false);
+    Board::GetInstance().CompleteLowPowerWake();
+    if (!s_ui.active) AudioOutput_SetStandby(false);
+    ESP_LOGI(kTag, "Audio resumed; network recovery continues in background");
+}
 
-bool StandbyView::IsScreenOff() { return s_ui.black; }
+void StandbyView::CompletePeripheralWake(bool ready) {
+    if (s_ui.black || !s_ui.peripherals_pending) return;
+    if (ready) CompleteAudioWake();
+    s_ui.peripherals_pending = false;
+    s_ui.peripherals_failed = !ready;
+    if (!ready) {
+        ESP_LOGW(kTag, "Peripheral wake incomplete; UI remains available, audio_ready=%d", s_ui.audio_ready);
+    } else {
+        ESP_LOGI(kTag, "Background peripherals recovered");
+    }
+    if (s_ui.sleep_after_wake) {
+        const bool immediate = s_ui.immediate_sleep_after_wake;
+        s_ui.sleep_after_wake = s_ui.immediate_sleep_after_wake = false;
+        StandbyView::Show(immediate);
+    } else if (s_ui.active) {
+        ScheduleScreenOff();
+    }
+}
+
+void StandbyView::WakeScreen() {
+    if (!s_ui.active || !s_ui.black) return;
+    WakeLockScreen();
+}
+
+bool StandbyView::IsActive() {
+    return s_active_snapshot.load(std::memory_order_acquire);
+}
+
+bool StandbyView::IsScreenOff() {
+    return s_screen_off_snapshot.load(std::memory_order_acquire);
+}
 
 }  // namespace agent_ui

@@ -186,12 +186,15 @@ static const fl7707n_lcd_init_cmd_t vendor_specific_init_default[] = {
 static esp_err_t panel_fl7707n_del(esp_lcd_panel_t *panel)
 {
     fl7707n_panel_t *fl7707n = (fl7707n_panel_t *)panel->user_data;
-
+    // Delete MIPI DPI panel
+    esp_err_t err = fl7707n->del(panel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "delete MIPI DPI panel failed: %s", esp_err_to_name(err));
+        return err;
+    }
     if (fl7707n->reset_gpio_num >= 0) {
         gpio_reset_pin(fl7707n->reset_gpio_num);
     }
-    // Delete MIPI DPI panel
-    fl7707n->del(panel);
     ESP_LOGD(TAG, "del fl7707n panel @%p", fl7707n);
     free(fl7707n);
 

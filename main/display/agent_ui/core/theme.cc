@@ -128,8 +128,14 @@ void StyleButton(lv_obj_t* button, bool accent) {
     lv_obj_set_style_bg_color(
         button, lv_color_hex(accent ? colors.accent : colors.raised), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(button, lv_color_hex(colors.accent_pressed),
-                              LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(
+        button, accent ? lv_color_hex(colors.accent_pressed)
+                       : lv_color_mix(lv_color_hex(colors.text),
+                                      lv_color_hex(colors.raised), LV_OPA_10),
+        Selector(LV_PART_MAIN, LV_STATE_PRESSED));
+    lv_obj_set_style_text_font(button, fonts::Medium(), LV_PART_MAIN);
+    lv_obj_set_style_text_color(
+        button, lv_color_hex(accent ? colors.accent_ink : colors.text), LV_PART_MAIN);
     lv_obj_set_style_border_color(
         button, lv_color_hex(accent ? colors.accent : colors.border), LV_PART_MAIN);
     lv_obj_set_style_border_width(button, 1, LV_PART_MAIN);
@@ -140,6 +146,9 @@ void StyleButton(lv_obj_t* button, bool accent) {
 void StyleTextInput(lv_obj_t* textarea) {
     if (textarea == nullptr) return;
     const auto& colors = Theme::Get().colors();
+    lv_obj_set_style_pad_hor(textarea, 16, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(textarea, 8, LV_PART_MAIN);
+    lv_obj_set_scrollbar_mode(textarea, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_bg_color(textarea, lv_color_hex(colors.raised), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(textarea, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_color(textarea, lv_color_hex(colors.border),
@@ -155,6 +164,8 @@ void StyleTextInput(lv_obj_t* textarea) {
     lv_obj_set_style_text_color(textarea, lv_color_hex(colors.text), LV_PART_MAIN);
     lv_obj_set_style_text_color(textarea, lv_color_hex(colors.muted),
                                 LV_PART_TEXTAREA_PLACEHOLDER);
+    lv_obj_set_style_bg_color(textarea, lv_color_hex(colors.accent), LV_PART_SELECTED);
+    lv_obj_set_style_text_color(textarea, lv_color_hex(colors.accent_ink), LV_PART_SELECTED);
     lv_obj_set_style_border_color(
         textarea, lv_color_hex(colors.accent),
         Selector(LV_PART_CURSOR, LV_STATE_FOCUSED));

@@ -4,7 +4,7 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VER "0.2.3")
+set(PROJECT_VER "0.2.4")
 
 # Make the local ESP-IDF components available to this firmware.
 set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
@@ -23,6 +23,31 @@ include("${CMAKE_CURRENT_LIST_DIR}/main/boards/metalio-claw-4/validate_wifi_conf
 # patch that keeps one reusable 32 KiB internal executable arena after managed
 # dependencies are restored.
 find_package(Git QUIET)
+# Keep the station's standby gate reproducible when managed dependencies are
+# restored. It stops radio activity without dismantling the shared SDMMC host.
+set(WIFI_STANDBY_PATCH "${CMAKE_SOURCE_DIR}/patches/wifi-station-standby.patch")
+if(EXISTS "${CMAKE_SOURCE_DIR}/managed_components/78__esp-wifi-connect/wifi_station.cc" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check
+        --directory=managed_components/78__esp-wifi-connect "${WIFI_STANDBY_PATCH}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE WIFI_STANDBY_PATCH_NEEDED OUTPUT_QUIET ERROR_QUIET)
+    if(WIFI_STANDBY_PATCH_NEEDED EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply
+            --directory=managed_components/78__esp-wifi-connect "${WIFI_STANDBY_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" RESULT_VARIABLE WIFI_STANDBY_PATCH_RESULT)
+        if(NOT WIFI_STANDBY_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to apply WiFi station standby patch")
+        endif()
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+            --directory=managed_components/78__esp-wifi-connect "${WIFI_STANDBY_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE WIFI_STANDBY_PATCH_APPLIED OUTPUT_QUIET ERROR_QUIET)
+        if(NOT WIFI_STANDBY_PATCH_APPLIED EQUAL 0)
+            message(FATAL_ERROR "WiFi station sources do not match standby patch")
+        endif()
+    endif()
+endif()
 # ESP-Hosted streaming RX must tolerate transient internal DMA allocation
 # pressure while the camera and voice pipeline are active.
 set(ESP_HOSTED_DIR "${CMAKE_SOURCE_DIR}/managed_components/espressif__esp_hosted")
@@ -46,6 +71,30 @@ if(EXISTS "${ESP_HOSTED_DIR}/host/drivers/transport/sdio/sdio_drv.c" AND Git_FOU
             RESULT_VARIABLE ESP_HOSTED_RX_PATCH_APPLIED OUTPUT_QUIET ERROR_QUIET)
         if(NOT ESP_HOSTED_RX_PATCH_APPLIED EQUAL 0)
             message(FATAL_ERROR "ESP-Hosted sources do not match the tested SDIO RX patch")
+        endif()
+    endif()
+endif()
+# Preserve the shared SD-card controller while parking and restarting C5.
+set(ESP_HOSTED_STANDBY_PATCH "${CMAKE_SOURCE_DIR}/patches/esp-hosted-coprocessor-standby.patch")
+if(EXISTS "${ESP_HOSTED_DIR}/host/drivers/transport/sdio/sdio_drv.c" AND Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check
+        --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_STANDBY_PATCH}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        RESULT_VARIABLE ESP_HOSTED_STANDBY_NEEDED OUTPUT_QUIET ERROR_QUIET)
+    if(ESP_HOSTED_STANDBY_NEEDED EQUAL 0)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply
+            --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_STANDBY_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" RESULT_VARIABLE ESP_HOSTED_STANDBY_RESULT)
+        if(NOT ESP_HOSTED_STANDBY_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to apply C5 standby patch")
+        endif()
+    else()
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+            --directory=managed_components/espressif__esp_hosted "${ESP_HOSTED_STANDBY_PATCH}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            RESULT_VARIABLE ESP_HOSTED_STANDBY_APPLIED OUTPUT_QUIET ERROR_QUIET)
+        if(NOT ESP_HOSTED_STANDBY_APPLIED EQUAL 0)
+            message(FATAL_ERROR "ESP-Hosted sources do not match C5 standby patch")
         endif()
     endif()
 endif()

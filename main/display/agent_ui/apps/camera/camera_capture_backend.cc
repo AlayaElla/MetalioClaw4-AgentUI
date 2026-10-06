@@ -38,9 +38,7 @@
 #include "freertos/task.h"
 #include "linux/videodev2.h"
 
-extern "C" esp_err_t esp_lcd_nv3051f_replay_vendor_init(
-    esp_lcd_panel_io_handle_t io);
-extern "C" esp_lcd_panel_io_handle_t metalio_claw_4_get_panel_io();
+extern "C" esp_err_t metalio_claw_4_replay_panel_vendor_init();
 extern "C" i2c_master_bus_handle_t metalio_claw_4_get_i2c_bus();
 
 namespace agent_ui::camera {
@@ -854,9 +852,7 @@ struct CaptureBackend::Impl : std::enable_shared_from_this<CaptureBackend::Impl>
         } else {
             vTaskDelay(pdMS_TO_TICKS(kCamResetRecoverMs));
             if (running.load(std::memory_order_acquire)) {
-                if (auto panel = metalio_claw_4_get_panel_io(); panel != nullptr) {
-                    esp_lcd_nv3051f_replay_vendor_init(panel);
-                }
+                (void)metalio_claw_4_replay_panel_vendor_init();
                 if (OpenDevice(true) != ESP_OK) {
                     EmitStatus("Camera device open failed",
                                StatusCode::CameraStartupFailed);

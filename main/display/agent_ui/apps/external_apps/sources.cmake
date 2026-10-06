@@ -5,6 +5,9 @@ list(APPEND AGENT_UI_SOURCES
     "display/agent_ui/apps/external_apps/external_http_service.cc"
     "display/agent_ui/apps/external_apps/external_media_service.cc"
     "display/agent_ui/apps/external_apps/external_recording_service.cc"
+    "display/agent_ui/apps/external_apps/external_magnetic_service.cc"
+    "display/agent_ui/apps/external_apps/external_synth_service.cc"
+    "display/agent_ui/apps/external_apps/external_synth_renderer.cc"
     "display/agent_ui/apps/external_apps/external_apps_view.cc"
 )
 

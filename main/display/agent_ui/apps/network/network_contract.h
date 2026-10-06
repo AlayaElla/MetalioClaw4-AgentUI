@@ -10,9 +10,11 @@ namespace agent_ui::network {
 struct SavedNetwork {
     std::string ssid;
     bool is_default = false;
+    bool is_connected = false;
 
     bool operator==(const SavedNetwork& other) const {
-        return ssid == other.ssid && is_default == other.is_default;
+        return ssid == other.ssid && is_default == other.is_default &&
+               is_connected == other.is_connected;
     }
 };
 

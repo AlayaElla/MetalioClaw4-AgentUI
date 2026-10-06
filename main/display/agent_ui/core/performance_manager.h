@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 class Board;
@@ -51,7 +52,12 @@ public:
     void Tick();
 
     const PerformancePolicy& policy() const { return policy_; }
-    int current_max_mhz() const { return current_max_mhz_; }
+    int current_max_mhz() const {
+        return current_max_mhz_.load(std::memory_order_acquire);
+    }
+    int current_requested_mhz() const {
+        return current_requested_mhz_.load(std::memory_order_acquire);
+    }
     uint8_t current_cpu_load_percent() const { return cpu_load_percent_; }
     uint32_t animation_frame_period_ms() const;
 
@@ -69,8 +75,8 @@ private:
     uint32_t demand_mask_ = 0;
     StandbyPerformancePhase standby_phase_ =
         StandbyPerformancePhase::Awake;
-    int current_requested_mhz_ = -1;
-    int current_max_mhz_ = -1;
+    std::atomic<int> current_requested_mhz_{-1};
+    std::atomic<int> current_max_mhz_{-1};
     const char* current_reason_ = nullptr;
     uint64_t last_load_sample_us_ = 0;
     uint64_t last_idle_runtime_us_ = 0;

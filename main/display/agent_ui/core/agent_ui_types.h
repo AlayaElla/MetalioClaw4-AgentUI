@@ -16,6 +16,7 @@ enum class ScreenId : uint8_t {
     Boot,
     Standby,
     Power,
+    StandbyTest,
 };
 
 enum class AgentState : uint8_t {

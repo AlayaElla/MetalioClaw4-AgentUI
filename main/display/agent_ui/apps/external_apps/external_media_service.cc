@@ -1,4 +1,6 @@
 #include "external_media_service.h"
+#include "external_synth_service.h"
+#include "external_media_source.h"
 
 #include <algorithm>
 #include <array>
@@ -63,7 +65,7 @@ bool IsSupportedUrl(const char* url) {
     if (url == nullptr) return false;
     const size_t length = strnlen(url, kMaxUrlBytes + 1);
     if (length == 0 || length > kMaxUrlBytes) return false;
-    return strncasecmp(url, "http://", 7) == 0 ||
+    return IsRecordingWavPath(url) || strncasecmp(url, "http://", 7) == 0 ||
            strncasecmp(url, "https://", 8) == 0;
 }
 
@@ -498,6 +500,8 @@ struct MediaService::Impl {
             .out = {.cb = OutputCallback, .user_ctx = this},
             .task_prio = 5,
             .task_stack = 8 * 1024,
+            // WAV decoding can use PSRAM; preserve internal memory for DMA.
+            .task_stack_in_ext = true,
             .prev = PreviousCallback,
             .prev_ctx = this,
         };
@@ -610,6 +614,19 @@ struct MediaService::Impl {
                 break;
             }
             if (!want_play.load(std::memory_order_relaxed)) continue;
+            // Local recordings play once. Keep a newly queued source intact
+            // if the user changed it while the previous run was finishing.
+            if (IsRecordingWavPath(current_url)) {
+                if (result != ESP_GMF_ERR_OK) {
+                    public_state.store(MediaState::Error, std::memory_order_release);
+                    vTaskDelay(pdMS_TO_TICKS(1200));
+                }
+                if (BeginStop(owner.load(std::memory_order_acquire), false,
+                              &current_url) == 0) {
+                    break;
+                }
+                continue;
+            }
             if (result != ESP_GMF_ERR_OK) {
                 ESP_LOGW(kTag, "stream ended with 0x%x", result);
                 public_state.store(MediaState::Error,
@@ -854,8 +871,13 @@ struct MediaService::Impl {
         xTaskNotifyGive(stop_task);
     }
 
-    int BeginStop(void* requested_owner, bool suspend) {
+    int BeginStop(void* requested_owner, bool suspend,
+                  const std::string* completed_url = nullptr) {
         if (!Lock()) return -1;
+        if (completed_url != nullptr && url != *completed_url) {
+            Unlock();
+            return 1;
+        }
         if (pending_owner.load(std::memory_order_acquire) == requested_owner) {
             pending_owner.store(nullptr, std::memory_order_release);
             pending_url.clear();
@@ -927,6 +949,7 @@ MediaService* MediaService::Existing() {
 }
 
 int MediaService::Start(void* owner, const char* url) {
+    if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) return -2;
     if (impl_ == nullptr || owner == nullptr || !IsSupportedUrl(url) ||
         !impl_->EnsureStopTask() || !impl_->Lock()) {
         return -1;
@@ -991,6 +1014,7 @@ int MediaService::Pause(void* owner) {
 }
 
 int MediaService::Resume(void* owner) {
+    if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) return -2;
     if (impl_ == nullptr || !impl_->Lock()) return -1;
     const LifeState current = impl_->life.load(std::memory_order_relaxed);
     if (!impl_->OwnerMatches(owner)) {

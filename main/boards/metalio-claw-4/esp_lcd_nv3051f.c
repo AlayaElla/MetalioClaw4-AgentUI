@@ -308,12 +308,15 @@ esp_err_t esp_lcd_nv3051f_replay_vendor_init(esp_lcd_panel_io_handle_t io)
 static esp_err_t panel_nv3051f_del(esp_lcd_panel_t *panel)
 {
     nv3051f_panel_t *nv3051f = (nv3051f_panel_t *)panel->user_data;
-
+    // Delete MIPI DPI panel
+    esp_err_t err = nv3051f->del(panel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "delete MIPI DPI panel failed: %s", esp_err_to_name(err));
+        return err;
+    }
     if (nv3051f->reset_gpio_num >= 0) {
         gpio_reset_pin(nv3051f->reset_gpio_num);
     }
-    // Delete MIPI DPI panel
-    nv3051f->del(panel);
     ESP_LOGD(TAG, "del nv3051f panel @%p", nv3051f);
     free(nv3051f);
 

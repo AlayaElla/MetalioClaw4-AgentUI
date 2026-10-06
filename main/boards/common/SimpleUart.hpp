@@ -2,6 +2,7 @@
 #define SIMPLE_UART_HPP
 
 #include <driver/uart.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <functional>
@@ -157,9 +158,25 @@ private:
         uint8_t buffer[RX_BUFFER_SIZE];
         
         while (true) {
-            int length = uart_read_bytes(uart->m_uartNum, buffer, RX_BUFFER_SIZE - 1, pdMS_TO_TICKS(100));
-            
-            if (length > 0) {
+            // The driver already owns an event queue. Wait for received bytes
+            // instead of waking every 100 ms while the Bluetooth rail is off.
+            uart_event_t event{};
+            if (xQueueReceive(uart->m_uartQueue, &event, portMAX_DELAY) != pdTRUE)
+                continue;
+            if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
+                ESP_LOGW("SimpleUart", "RX overflow; discarding incomplete input");
+                uart_flush_input(uart->m_uartNum);
+                xQueueReset(uart->m_uartQueue);
+                continue;
+            }
+            if (event.type != UART_DATA) continue;
+
+            // Drain all buffered bytes, including batches whose event could
+            // not fit in the queue. Stale DATA events then harmlessly read 0.
+            while (true) {
+                const int length = uart_read_bytes(uart->m_uartNum, buffer,
+                                                  RX_BUFFER_SIZE - 1, 0);
+                if (length <= 0) break;
                 std::vector<uint8_t> data(buffer, buffer + length);
                 std::function<void(const std::vector<uint8_t>&)> system_callback;
                 std::function<void(const std::vector<uint8_t>&)> page_callback;

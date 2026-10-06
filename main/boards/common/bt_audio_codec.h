@@ -29,6 +29,11 @@ protected:
     gpio_num_t din_ = GPIO_NUM_NC;
     i2s_role_t clock_role_ = I2S_ROLE_SLAVE;
     bool channels_started_ = false;
+    std::atomic<bool> standby_requested_{false};
+    bool standby_rx_stopped_ = false;
+    bool standby_tx_stopped_ = false;
+    bool standby_ws_stopped_ = false;
+    bool standby_ws_disabled_ = false;
 
     bool ConfigureI2sChannels(i2s_role_t role, bool start_channels);
     void DeleteI2sChannels();
@@ -48,6 +53,8 @@ public:
     virtual void SetOutputVolume(int volume) override;
     virtual void EnableOutput(bool enable) override;
     virtual bool SetOutputTransportEnabled(bool enabled) override;
+    // Stop DMA without freeing its buffers; wake reuses the same channels.
+    bool SetStandby(bool enabled);
 };
 
 class BTAudioCodecDuplex : public BTAudioCodec {

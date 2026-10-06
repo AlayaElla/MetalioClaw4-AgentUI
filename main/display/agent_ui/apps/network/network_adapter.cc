@@ -150,16 +150,33 @@ struct Adapter::Impl {
         Emit(event);
     }
 
-    void EmitSavedNetworks() {
+    std::string ConnectedWifiSsid() const {
+        // IP information can be cached after disconnect, so require a live
+        // interface and association before labeling a saved network current.
+        auto* station = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t ip{};
+        wifi_ap_record_t ap{};
+        if (station == nullptr || !esp_netif_is_netif_up(station) ||
+            esp_netif_get_ip_info(station, &ip) != ESP_OK || ip.ip.addr == 0 ||
+            esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return {};
+        const char* ssid = reinterpret_cast<const char*>(ap.ssid);
+        return std::string(ssid, strnlen(ssid, sizeof(ap.ssid)));
+    }
+
+    void EmitSavedNetworks(const std::string& connected_ssid) {
         Event event;
         event.type = EventType::SavedNetworks;
         const auto& list = SsidManager::GetInstance().GetSsidList();
         event.saved_networks.reserve(list.size());
         for (std::size_t i = 0; i < list.size(); ++i) {
-            event.saved_networks.push_back({list[i].ssid, i == 0});
+            event.saved_networks.push_back(
+                {list[i].ssid, i == 0,
+                 !connected_ssid.empty() && list[i].ssid == connected_ssid});
         }
         Emit(event);
     }
+
+    void EmitSavedNetworks() { EmitSavedNetworks(ConnectedWifiSsid()); }
 
     void EmitNearbyNetworks(bool scanning, bool scan_started) {
         Event event;
@@ -208,15 +225,68 @@ struct Adapter::Impl {
     static void WifiEvent(void* arg, esp_event_base_t base, int32_t id,
                           void* data) {
         auto* self = static_cast<Impl*>(arg);
-        if (self == nullptr || self->events == nullptr) return;
+        if (self == nullptr || self->events == nullptr ||
+            !self->active.load(std::memory_order_acquire)) return;
         if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
             xEventGroupSetBits(self->events, kScanDone);
         } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
             const auto* event = static_cast<wifi_event_sta_disconnected_t*>(data);
             self->last_disconnect_reason = event != nullptr ? event->reason : 0;
+            xEventGroupClearBits(self->events, kConnected);
             xEventGroupSetBits(self->events, kDisconnected);
+            self->EmitSavedNetworks("");
+        } else if ((base == WIFI_EVENT && id == WIFI_EVENT_STA_STOP) ||
+                   (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP)) {
+            xEventGroupClearBits(self->events, kConnected);
+            self->EmitSavedNetworks("");
         } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+            const auto* event = static_cast<ip_event_got_ip_t*>(data);
+            if (event == nullptr || event->ip_info.ip.addr == 0 ||
+                event->esp_netif != esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) return;
+            const auto ssid = self->ConnectedWifiSsid();
+            if (ssid.empty()) return;
+            xEventGroupClearBits(self->events, kDisconnected);
+            self->EmitSavedNetworks(ssid);
+            // The connect task may update the saved list once it wakes.
             xEventGroupSetBits(self->events, kConnected);
+        }
+    }
+
+    bool ObserveWifi() {
+        std::lock_guard<std::recursive_mutex> lock(wifi_lifecycle_mutex);
+        if (!active.load(std::memory_order_acquire)) return false;
+        if (events == nullptr) {
+            events = xEventGroupCreate();
+            if (events == nullptr) {
+                EmitStatus(I18n::T("无法创建 WiFi 事件状态"), kErrorColor);
+                return false;
+            }
+        }
+        esp_err_t error = ESP_OK;
+        if (wifi_event_instance == nullptr) {
+            error = esp_event_handler_instance_register(
+                WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiEvent, this, &wifi_event_instance);
+            if (error != ESP_OK) return false;
+        }
+        if (ip_event_instance == nullptr) {
+            error = esp_event_handler_instance_register(
+                IP_EVENT, ESP_EVENT_ANY_ID, &WifiEvent, this, &ip_event_instance);
+            if (error != ESP_OK) return false;
+        }
+        return true;
+    }
+
+    void StopObservingWifi() {
+        std::lock_guard<std::recursive_mutex> lock(wifi_lifecycle_mutex);
+        if (wifi_event_instance != nullptr) {
+            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                  wifi_event_instance);
+            wifi_event_instance = nullptr;
+        }
+        if (ip_event_instance != nullptr) {
+            esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID,
+                                                  ip_event_instance);
+            ip_event_instance = nullptr;
         }
     }
 
@@ -224,16 +294,8 @@ struct Adapter::Impl {
         std::lock_guard<std::recursive_mutex> lock(wifi_lifecycle_mutex);
         if (!active.load(std::memory_order_acquire)) return false;
         if (wifi_initialized.load(std::memory_order_acquire)) return true;
-
-        if (events == nullptr) {
-            events = xEventGroupCreate();
-            if (events == nullptr) {
-                EmitStatus(I18n::T("无法创建 WiFi 事件状态"), kErrorColor);
-                return false;
-            }
-        } else {
-            xEventGroupClearBits(events, kScanDone | kConnected | kDisconnected);
-        }
+        if (!ObserveWifi()) return false;
+        xEventGroupClearBits(events, kScanDone | kConnected | kDisconnected);
 
         WifiConnectionOwnership::GetInstance().AcquireManual([this]() {
             wifi_mode_t mode = WIFI_MODE_NULL;
@@ -260,13 +322,6 @@ struct Adapter::Impl {
         if (error != ESP_OK) return fail();
         wifi_driver_initialized = true;
 
-        error = esp_event_handler_instance_register(
-            WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiEvent, this, &wifi_event_instance);
-        if (error != ESP_OK) return fail();
-        error = esp_event_handler_instance_register(
-            IP_EVENT, IP_EVENT_STA_GOT_IP, &WifiEvent, this, &ip_event_instance);
-        if (error != ESP_OK) return fail();
-
         if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK || esp_wifi_start() != ESP_OK) {
             return fail();
         }
@@ -281,16 +336,6 @@ struct Adapter::Impl {
         if (wifi_driver_initialized) {
             esp_wifi_scan_stop();
             esp_wifi_disconnect();
-        }
-        if (wifi_event_instance != nullptr) {
-            esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                  wifi_event_instance);
-            wifi_event_instance = nullptr;
-        }
-        if (ip_event_instance != nullptr) {
-            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                  ip_event_instance);
-            ip_event_instance = nullptr;
         }
         if (wifi_driver_initialized) {
             esp_wifi_stop();
@@ -500,7 +545,7 @@ struct Adapter::Impl {
             vTaskDelete(nullptr);
             return;
         }
-        if (bits & kConnected) {
+        if ((bits & kConnected) && ConnectedWifiSsid() == context.ssid) {
             SsidManager::GetInstance().AddSsid(context.ssid, context.password);
             SaveNetworkType(kNetworkWifi);
             EmitSavedNetworks();
@@ -808,6 +853,9 @@ struct Adapter::Impl {
 
     void Start() {
         if (active.exchange(true, std::memory_order_acq_rel)) return;
+        // Observe automatic reconnects as soon as settings opens, without
+        // taking the Wi-Fi driver away from the automatic connection owner.
+        if (!ObserveWifi()) ESP_LOGW(kTag, "Failed to observe WiFi state");
         EmitModeSnapshot();
         EmitSavedNetworks();
         EmitNearbyNetworks(false, false);
@@ -820,6 +868,7 @@ struct Adapter::Impl {
 
     void Stop() {
         if (!active.exchange(false, std::memory_order_acq_rel)) return;
+        StopObservingWifi();
         if (events != nullptr) {
             xEventGroupSetBits(events, kScanDone | kConnected | kDisconnected);
         }

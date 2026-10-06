@@ -75,6 +75,7 @@ typedef uint64_t metalio_app_capabilities_t;
 #define METALIO_APP_CAP_APP_STORAGE (UINT64_C(1) << 17)
 #define METALIO_APP_CAP_UI_CONTROLS (UINT64_C(1) << 18)
 #define METALIO_APP_CAP_AI_ACTIONS (UINT64_C(1) << 19)
+#define METALIO_APP_CAP_AUDIO_SYNTH (UINT64_C(1) << 20)
 
 /*
  * AI actions are declared in manifest.json and bound by their exact id at
@@ -188,6 +189,53 @@ typedef struct {
     uint8_t valid;
     uint8_t reserved[3];
 } metalio_app_magnetic_sample_t;
+
+/* Raw field conversion in nT. sequence advances only for a new chip sample. */
+typedef struct {
+    int32_t x_nanotesla;
+    int32_t y_nanotesla;
+    int32_t z_nanotesla;
+    uint32_t sequence;
+    uint32_t timestamp_ms;
+    uint8_t valid;
+    uint8_t overflow;
+    uint8_t reserved[2];
+} metalio_app_magnetic_sample_ex_t;
+
+typedef enum {
+    METALIO_APP_SYNTH_SINE = 0,
+    METALIO_APP_SYNTH_TRIANGLE = 1,
+    METALIO_APP_SYNTH_SAW = 2,
+    METALIO_APP_SYNTH_SQUARE = 3,
+    METALIO_APP_SYNTH_THEREMIN = 4,
+} metalio_app_synth_waveform_t;
+
+typedef enum {
+    METALIO_APP_SYNTH_IDLE = 0,
+    METALIO_APP_SYNTH_STARTING = 1,
+    METALIO_APP_SYNTH_RUNNING = 2,
+    METALIO_APP_SYNTH_ERROR = 3,
+} metalio_app_synth_state_t;
+
+typedef enum {
+    METALIO_APP_SYNTH_OK = 0,
+    METALIO_APP_SYNTH_ERROR_INVALID = -1,
+    METALIO_APP_SYNTH_ERROR_BUSY = -2,
+    METALIO_APP_SYNTH_ERROR_AUDIO = -3,
+} metalio_app_synth_result_t;
+
+typedef struct {
+    uint32_t frequency_millihz;     /* Clamped to 20000..7500000. */
+    uint16_t level_per_mille;       /* 0..1000, relative to system volume. */
+    uint8_t waveform;              /* metalio_app_synth_waveform_t. */
+    uint8_t reserved0;
+    uint16_t glide_ms;
+    uint16_t level_ramp_ms;         /* At least 5 ms. */
+    uint16_t vibrato_cents;         /* 0..200. */
+    uint16_t vibrato_centihz;
+    uint16_t brightness_per_mille; /* 1000 bypasses the one-pole lowpass. */
+    uint16_t reserved1;
+} metalio_app_synth_params_t;
 
 typedef enum {
     METALIO_APP_SWIPE_LEFT = 0,
@@ -621,6 +669,16 @@ typedef struct metalio_app_host_api {
     int (*ai_release_block)(void* host_context, uint64_t token);
     int (*ai_get_availability)(void* host_context, uint8_t* available,
                                uint64_t* generation);
+
+    /* ABI 1 instrument extensions. Check struct_size and capability bits.
+     * These UI-thread calls only request work or copy a snapshot. */
+    int (*get_magnetic_sample_ex)(void* host_context,
+                                  metalio_app_magnetic_sample_ex_t* sample);
+    int (*synth_start)(void* host_context);
+    int (*synth_set)(void* host_context,
+                      const metalio_app_synth_params_t* params);
+    int (*synth_stop)(void* host_context);
+    int (*synth_get_state)(void* host_context, metalio_app_synth_state_t* state);
 } metalio_app_host_api_t;
 
 typedef struct metalio_app_launch_context {

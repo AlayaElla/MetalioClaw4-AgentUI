@@ -104,6 +104,7 @@ void WifiBoard::StartNetwork() {
     });
     wifi_station.OnConnected([this](const std::string& ssid) {
         auto display = Board::GetInstance().GetDisplay();
+        display->UpdateStatusBar(true);
         std::string notification = Lang::Strings::CONNECTED_TO;
         notification += ssid;
         display->ShowNotification(notification.c_str(), 30000);

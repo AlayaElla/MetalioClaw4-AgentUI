@@ -24,6 +24,67 @@ void BTAudioCodec::Start()
 {
     AudioCodec::Start();
     channels_started_ = true;
+    standby_rx_stopped_ = false;
+    standby_tx_stopped_ = false;
+}
+
+bool BTAudioCodec::SetStandby(bool enabled)
+{
+    // Close the gate before waiting for a blocked writer's mutex. Its timeout
+    // loop must be able to exit even when the external I2S clock is absent.
+    if (enabled) standby_requested_.store(true, std::memory_order_release);
+    std::scoped_lock lock(input_if_mutex_, output_if_mutex_);
+    auto transition = [enabled](i2s_chan_handle_t handle, bool& stopped) {
+        if (handle == nullptr) return false;
+        if (stopped == enabled) return true;
+        const esp_err_t error = enabled ? i2s_channel_disable(handle)
+                                        : i2s_channel_enable(handle);
+        if (error != ESP_OK) {
+            ESP_LOGE(TAG, "I2S standby %s failed: %s",
+                     enabled ? "stop" : "resume", esp_err_to_name(error));
+            return false;
+        }
+        stopped = enabled;
+        return true;
+    };
+    // Track each successful operation so a repeated request can retry only
+    // the channel that failed, without double-disabling/enabling its peer.
+    const bool tx_ok = !channels_started_ || transition(tx_handle_, standby_tx_stopped_);
+    const bool rx_ok = !channels_started_ || transition(rx_handle_, standby_rx_stopped_);
+    bool complete = tx_ok && rx_ok;
+    if (ws_counter_unit_ != nullptr && (enabled || complete)) {
+        // stop() only stops counting. disable() also releases the driver's
+        // power-management lock. Keep both states for partial-failure retry.
+        auto probe_step = [&complete](esp_err_t error, bool& state, bool value) {
+            if (error == ESP_OK) state = value;
+            else {
+                complete = false;
+                ESP_LOGW(TAG, "WS probe standby transition failed: %s",
+                         esp_err_to_name(error));
+            }
+        };
+        if (enabled) {
+            if (!standby_ws_stopped_) {
+                probe_step(pcnt_unit_stop(ws_counter_unit_), standby_ws_stopped_, true);
+            }
+            if (standby_ws_stopped_ && !standby_ws_disabled_) {
+                probe_step(pcnt_unit_disable(ws_counter_unit_), standby_ws_disabled_, true);
+            }
+        } else {
+            if (standby_ws_disabled_) {
+                probe_step(pcnt_unit_enable(ws_counter_unit_), standby_ws_disabled_, false);
+            }
+            if (!standby_ws_disabled_ && standby_ws_stopped_) {
+                probe_step(pcnt_unit_start(ws_counter_unit_), standby_ws_stopped_, false);
+            }
+        }
+    }
+    if (!enabled && complete) {
+        standby_requested_.store(false, std::memory_order_release);
+    }
+    ESP_LOGI(TAG, "Standby DMA: requested=%d tx_stopped=%d rx_stopped=%d probe_disabled=%d",
+             enabled, standby_tx_stopped_, standby_rx_stopped_, standby_ws_disabled_);
+    return complete;
 }
 
 void BTAudioCodec::SetOutputVolume(int volume)
@@ -146,6 +207,8 @@ bool BTAudioCodec::ConfigureI2sChannels(i2s_role_t role,
     }
 
     clock_role_ = role;
+    standby_tx_stopped_ = !start_channels;
+    standby_rx_stopped_ = !start_channels;
     ESP_LOGI(TAG,
              "I2S clock role configured: role=%s sample_rate=%dHz "
              "expected_ws=%dHz expected_bclk=%dHz pins(bclk=%d ws=%d)",
@@ -166,10 +229,11 @@ bool BTAudioCodec::SetI2sClockRole(i2s_role_t role)
 
     const i2s_role_t previous_role = clock_role_;
     DeleteI2sChannels();
-    if (ConfigureI2sChannels(role, channels_started_)) return true;
+    const bool start_channels = channels_started_ && !standby_requested_.load();
+    if (ConfigureI2sChannels(role, start_channels)) return true;
 
     ESP_LOGE(TAG, "Restoring previous I2S clock role after reconfiguration failure");
-    if (!ConfigureI2sChannels(previous_role, channels_started_)) {
+    if (!ConfigureI2sChannels(previous_role, start_channels)) {
         ESP_LOGE(TAG, "Failed to restore previous I2S clock role");
     }
     return false;
@@ -235,6 +299,8 @@ void BTAudioCodec::InitializeWsClockProbe(gpio_num_t ws)
         return;
     }
 
+    standby_ws_stopped_ = false;
+    standby_ws_disabled_ = false;
     ESP_LOGI(TAG,
              "WS clock probe ready on GPIO %d; counting rising edges during "
              "each I2S write window",
@@ -244,8 +310,8 @@ void BTAudioCodec::InitializeWsClockProbe(gpio_num_t ws)
 void BTAudioCodec::DeinitializeWsClockProbe()
 {
     if (ws_counter_unit_ == nullptr) return;
-    pcnt_unit_stop(ws_counter_unit_);
-    pcnt_unit_disable(ws_counter_unit_);
+    if (!standby_ws_stopped_) pcnt_unit_stop(ws_counter_unit_);
+    if (!standby_ws_disabled_) pcnt_unit_disable(ws_counter_unit_);
     if (ws_counter_channel_ != nullptr) {
         pcnt_del_channel(ws_counter_channel_);
         ws_counter_channel_ = nullptr;
@@ -304,7 +370,8 @@ BTAudioCodecDuplex::BTAudioCodecDuplex(int input_sample_rate, int output_sample_
 int BTAudioCodec::Write(const int16_t *data, int samples)
 {
     std::lock_guard<std::mutex> lock(output_if_mutex_);
-    if (!output_transport_requested_.load(std::memory_order_acquire)) {
+    if (standby_requested_.load(std::memory_order_acquire) ||
+        !output_transport_requested_.load(std::memory_order_acquire)) {
         return 0;
     }
     std::vector<int32_t> buffer(samples * 2);
@@ -336,7 +403,8 @@ int BTAudioCodec::Write(const int16_t *data, int samples)
         buffer[i * 2 + 1] = processed_sample;
     }
 
-    while (output_transport_requested_.load(std::memory_order_acquire)) {
+    while (!standby_requested_.load(std::memory_order_acquire) &&
+           output_transport_requested_.load(std::memory_order_acquire)) {
         int64_t probe_started_us = 0;
         const bool probe_active = BeginWsClockProbe(probe_started_us);
         size_t bytes_written = 0;
@@ -411,6 +479,7 @@ int BTAudioCodec::Write(const int16_t *data, int samples)
 int BTAudioCodec::Read(int16_t *dest, int samples)
 {
     std::lock_guard<std::mutex> lock(input_if_mutex_);
+    if (standby_requested_.load(std::memory_order_acquire)) return 0;
     size_t bytes_read;
 
     std::vector<int32_t> bit32_buffer(samples);

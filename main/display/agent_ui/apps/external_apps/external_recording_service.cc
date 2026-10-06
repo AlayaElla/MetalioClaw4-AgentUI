@@ -1,4 +1,5 @@
 #include "external_recording_service.h"
+#include "external_synth_service.h"
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +23,7 @@
 #include "application.h"
 #include "audio/audio_service.h"
 #include "device_state.h"
+#include "SdCardManager.hpp"
 
 namespace agent_ui::external_apps {
 namespace {
@@ -120,8 +122,10 @@ struct RecordingService::Impl {
     void* owner = nullptr;
     FILE* file = nullptr;
     StreamBufferHandle_t stream = nullptr;
+    TaskHandle_t writer_worker = nullptr;
     TaskHandle_t writer_task = nullptr;
     std::atomic<bool> accepting{false};
+    std::atomic<bool> audio_active{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> discard_requested{false};
     std::atomic<uint32_t> dropped_frames{0};
@@ -161,7 +165,30 @@ struct RecordingService::Impl {
     }
 
     static void WriterEntry(void* argument) {
-        static_cast<Impl*>(argument)->WriterMain();
+        auto* self = static_cast<Impl*>(argument);
+        while (true) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            self->WriterMain();
+        }
+    }
+
+    bool EnsureWriterTask() {
+        if (writer_worker != nullptr) return true;
+        // The 4 KB WAV write buffer lives on this stack. Keep it in PSRAM and
+        // reuse the worker so repeated recordings require no new task stack
+        // or self-deletion helper while internal RAM is occupied by the app.
+        if (xTaskCreateWithCaps(WriterEntry, "external_record", 6144, this, 3,
+                                &writer_worker,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            writer_worker = nullptr;
+            ESP_LOGW(kTag,
+                     "recording start failed: stage=writer internal=%u largest=%u psram=%u",
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                     static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                     static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+            return false;
+        }
+        return true;
     }
 
     void DetachCapture() {
@@ -170,6 +197,7 @@ struct RecordingService::Impl {
         audio().SetExternalRecordingActive(false);
         ai::Availability::Get().ReleaseBlock(ai_block);
         ai_block = 0;
+        audio_active.store(false, std::memory_order_release);
     }
 
     void WriterMain() {
@@ -246,7 +274,6 @@ struct RecordingService::Impl {
                  static_cast<unsigned>(written_bytes),
                  static_cast<unsigned>(
                      dropped_frames.load(std::memory_order_relaxed)));
-        vTaskDelete(nullptr);
     }
 
     int RequestStop(void* requested_owner, bool discard) {
@@ -278,13 +305,38 @@ RecordingService* RecordingService::Existing() {
     return s_existing_service;
 }
 
+bool RecordingService::IsActive() const {
+    return impl_ != nullptr && impl_->audio_active.load(std::memory_order_acquire);
+}
+
 int RecordingService::Start(
         void* owner, const metalio_app_recording_config_t* config) {
     if (owner == nullptr) return METALIO_APP_RECORDING_ERROR_INVALID;
-    Application& app = Application::GetInstance();
-    if (app.GetDeviceState() != kDeviceStateIdle ||
-        app.IsCodexVoiceCaptureActive() || !ai::Availability::Get().IsAvailable()) {
+    if (auto* synth = SynthService::Existing(); synth && synth->IsActive()) {
+        ESP_LOGW(kTag, "recording blocked: synthesizer playback active");
         return METALIO_APP_RECORDING_ERROR_BUSY;
+    }
+    Application& app = Application::GetInstance();
+    const auto device_state = app.GetDeviceState();
+    const bool codex_capture = app.IsCodexVoiceCaptureActive();
+    const bool ai_available = ai::Availability::Get().IsAvailable();
+    // Local recording does not require Wi-Fi or XiaoZhi activation. Those
+    // startup phases run after the audio tasks are available and own no input.
+    const bool local_recording_state = device_state == kDeviceStateIdle ||
+        device_state == kDeviceStateWifiConfiguring ||
+        device_state == kDeviceStateActivating;
+    if (!local_recording_state || codex_capture || !ai_available) {
+        ESP_LOGW(kTag, "recording blocked: device_state=%d codex_capture=%d ai_available=%d",
+                 static_cast<int>(device_state), codex_capture, ai_available);
+        if (!ai_available) {
+            for (const auto& reason : ai::Availability::Get().GetSnapshot().reasons)
+                ESP_LOGW(kTag, "recording block reason: %.128s", reason.c_str());
+        }
+        return METALIO_APP_RECORDING_ERROR_BUSY;
+    }
+    if (!app.GetAudioService().IsStarted()) {
+        ESP_LOGW(kTag, "recording blocked: audio service not started");
+        return METALIO_APP_RECORDING_ERROR_AUDIO;
     }
 
     uint32_t duration_ms = config != nullptr ? config->max_duration_ms : 0;
@@ -295,16 +347,37 @@ int RecordingService::Start(
         SanitizeBaseName(config != nullptr ? config->file_name : nullptr);
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->writer_task != nullptr) return METALIO_APP_RECORDING_ERROR_BUSY;
-    if (access("/sdcard", F_OK) != 0 ||
-        (mkdir(kRecordingRoot, 0755) != 0 && errno != EEXIST)) {
+    if (impl_->writer_task != nullptr) {
+        ESP_LOGW(kTag, "recording blocked: writer still active state=%d",
+                 static_cast<int>(impl_->state));
+        return METALIO_APP_RECORDING_ERROR_BUSY;
+    }
+    // FAT access() calls f_stat(), which rejects the volume root even when
+    // mounted. Use the board's mount state before touching the recording path.
+    if (!SdCardManager::GetInstance().IsMounted()) {
+        ESP_LOGW(kTag, "recording storage unavailable: SD card not mounted");
+        return METALIO_APP_RECORDING_ERROR_STORAGE;
+    }
+    if (mkdir(kRecordingRoot, 0755) != 0 && errno != EEXIST) {
+        ESP_LOGW(kTag, "recording directory creation failed: path=%s errno=%d",
+                 kRecordingRoot, errno);
         return METALIO_APP_RECORDING_ERROR_STORAGE;
     }
     const std::string path = UniquePath(requested);
-    if (path.empty()) return METALIO_APP_RECORDING_ERROR_STORAGE;
+    if (path.empty()) {
+        ESP_LOGW(kTag, "recording file creation failed: no unused filename");
+        return METALIO_APP_RECORDING_ERROR_STORAGE;
+    }
     FILE* file = std::fopen(path.c_str(), "wb");
-    if (file == nullptr || !WriteWavHeader(file, 0)) {
-        if (file != nullptr) std::fclose(file);
+    if (file == nullptr) {
+        ESP_LOGW(kTag, "recording file open failed: path=%s errno=%d",
+                 path.c_str(), errno);
+        return METALIO_APP_RECORDING_ERROR_STORAGE;
+    }
+    if (!WriteWavHeader(file, 0)) {
+        ESP_LOGW(kTag, "recording WAV header write failed: path=%s errno=%d",
+                 path.c_str(), errno);
+        std::fclose(file);
         std::remove(path.c_str());
         return METALIO_APP_RECORDING_ERROR_STORAGE;
     }
@@ -316,6 +389,11 @@ int RecordingService::Start(
             kInternalBufferBytes, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
     if (stream == nullptr) {
+        ESP_LOGW(kTag,
+                 "recording start failed: stage=buffer internal=%u largest=%u psram=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
         std::fclose(file);
         std::remove(path.c_str());
         return METALIO_APP_RECORDING_ERROR_AUDIO;
@@ -337,11 +415,12 @@ int RecordingService::Start(
     impl_->accepting.store(false, std::memory_order_release);
 
     impl_->ai_block = ai::Availability::Get().AcquireBlock("external.recording", "应用录音");
-    if (xTaskCreate(Impl::WriterEntry, "external_record", 6144, impl_, 3,
-                    &impl_->writer_task) != pdPASS) {
+    impl_->audio_active.store(true, std::memory_order_release);
+    if (!impl_->EnsureWriterTask()) {
         impl_->writer_task = nullptr;
         ai::Availability::Get().ReleaseBlock(impl_->ai_block);
         impl_->ai_block = 0;
+        impl_->audio_active.store(false, std::memory_order_release);
         vStreamBufferDeleteWithCaps(stream);
         impl_->stream = nullptr;
         std::fclose(file);
@@ -352,6 +431,7 @@ int RecordingService::Start(
         impl_->path.clear();
         return METALIO_APP_RECORDING_ERROR_AUDIO;
     }
+    impl_->writer_task = impl_->writer_worker;
 
     impl_->audio().SetExternalRecordingPcmCallback(
         [recording = impl_](const int16_t* samples, size_t count) {
@@ -360,12 +440,16 @@ int RecordingService::Start(
     impl_->accepting.store(true, std::memory_order_release);
     impl_->audio().SetExternalRecordingActive(true);
     if (!impl_->audio().IsAudioProcessorRunning()) {
+        ESP_LOGW(kTag, "recording start failed: stage=processor audio_started=%d",
+                 impl_->audio().IsStarted());
         impl_->discard_requested.store(true, std::memory_order_release);
         impl_->accepting.store(false, std::memory_order_release);
         impl_->stop_requested.store(true, std::memory_order_release);
         impl_->state = METALIO_APP_RECORDING_STOPPING;
+        xTaskNotifyGive(impl_->writer_worker);
         return METALIO_APP_RECORDING_ERROR_AUDIO;
     }
+    xTaskNotifyGive(impl_->writer_worker);
     ESP_LOGI(kTag, "recording started path=%s max_ms=%u", path.c_str(),
              static_cast<unsigned>(duration_ms));
     return METALIO_APP_RECORDING_OK;

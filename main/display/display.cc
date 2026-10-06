@@ -60,6 +60,12 @@ bool Display::SetPowerSaveModeChecked(bool on) {
     return true;
 }
 
+bool Display::PrepareWakeFromPowerSave() { return true; }
+
+bool Display::IsPowerSaveActive() const { return false; }
+
+bool Display::IsPanelPresent() const { return true; }
+
 bool Display::SetDiagnosticPattern(DisplayDiagnosticPattern pattern) {
     (void)pattern;
     return false;

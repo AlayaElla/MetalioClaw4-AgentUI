@@ -46,6 +46,10 @@ public:
     virtual void UpdateStatusBar(bool update_all = false);
     virtual void SetPowerSaveMode(bool on);
     virtual bool SetPowerSaveModeChecked(bool on);
+    // Prepare hardware from a non-LVGL task before posting UI work.
+    virtual bool PrepareWakeFromPowerSave();
+    virtual bool IsPowerSaveActive() const;
+    virtual bool IsPanelPresent() const;
     virtual bool SetDiagnosticPattern(DisplayDiagnosticPattern pattern);
 
     inline int width() const { return width_; }

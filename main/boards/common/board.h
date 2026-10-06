@@ -6,6 +6,7 @@
 #include <mqtt.h>
 #include <udp.h>
 #include <string>
+#include <functional>
 #include <network_interface.h>
 
 #include "led/led.h"
@@ -36,6 +37,18 @@ enum class PowerSaveLevel {
     LOW_POWER,    // Maximum power saving (lowest power consumption)
     BALANCED,     // Medium power saving (balanced)
     PERFORMANCE,  // No power saving (maximum power consumption / full performance)
+};
+
+struct BatteryPowerReading {
+    int voltage_mv = 0;
+    int current_ma = 0;  // Signed gauge reading: positive charging, negative discharging.
+    bool external_power = false;
+};
+
+struct StandbySleepStats {
+    uint64_t slept_us = 0; // Successful light-sleep calls, including transition overhead.
+    uint32_t entries = 0;
+    uint32_t rejected = 0;
 };
 
 // Network event callback type (event, data)
@@ -78,9 +91,25 @@ public:
     virtual bool IsNetworkConnected() const;
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+    virtual bool ReadBatteryPower(BatteryPowerReading& reading) {
+        (void)reading;
+        return false;
+    }
     virtual std::string GetSystemInfoJson();
     virtual void SetPowerSaveMode(bool enabled) = 0;
     virtual void SetLowPowerStandby(bool enabled) { (void)enabled; }
+    virtual void TickLowPowerStandby() {}
+    // Start peripheral power-on delays without opening audio/network access.
+    virtual bool PrepareLowPowerWake() { return false; }
+    virtual void CancelLowPowerWake() {}
+    virtual bool ResumeLowPowerStandby() { SetLowPowerStandby(false); return true; }
+    virtual bool ResumeLowPowerStandby(const std::function<void()>& audio_ready) {
+        const bool ready = ResumeLowPowerStandby();
+        if (ready && audio_ready) audio_ready();
+        return ready;
+    }
+    virtual void CompleteLowPowerWake() {}
+    virtual StandbySleepStats GetStandbySleepStats() { return {}; }
     virtual void SetPerformanceMaxMhz(int max_freq_mhz) {
         (void)max_freq_mhz;
     }
