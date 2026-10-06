@@ -9,6 +9,7 @@ namespace agent_ui::home {
 enum class IntentType {
     OpenApp,
     ToggleListening,
+    PlayCarouselTick,
 };
 
 struct Intent {
@@ -22,11 +23,16 @@ struct Intent {
     static Intent ToggleListening() {
         return {.type = IntentType::ToggleListening, .target = ScreenId::Home};
     }
+
+    static Intent PlayCarouselTick() {
+        return {.type = IntentType::PlayCarouselTick, .target = ScreenId::Home};
+    }
 };
 
 enum class CommandType {
     OpenApp,
     ToggleListening,
+    PlayCarouselTick,
 };
 
 struct Command {

@@ -1,0 +1,310 @@
+--- a/src/display/bridge/v9/lvgl_bridge_v9.c
++++ b/src/display/bridge/v9/lvgl_bridge_v9.c
+@@ -34,6 +34,7 @@
+ #endif
+ #include "lvgl_port_alignment.h"
+ #include "common/display_bridge_common.h"
++#include "display_cache_sync_plan.h"
+ 
+ #if SOC_MIPI_DSI_SUPPORTED
+ #include "esp_lcd_mipi_dsi.h"
+@@ -147,6 +148,14 @@
+     /* --- Pipeline buffer management (owned by bridge, inited by display_bridge_pipeline_init_from_cfg) --- */
+     esp_lv_adapter_display_pipeline_t pipeline;
+     display_bridge_v9_diff_tracker_t diff_tracker;
++    int64_t repair_sync_log_window_us;
++    uint64_t repair_sync_range_bytes;
++    uint64_t repair_sync_range_calls;
++    uint64_t repair_sync_full_bytes;
++    uint64_t repair_sync_full_calls;
++    uint64_t repair_sync_policy_full_frames;
++    uint64_t repair_sync_fallbacks;
++    uint64_t repair_sync_planner_steps;
+ } esp_lv_adapter_display_bridge_v9_t;
+ 
+ #if CONFIG_SOC_PPA_SUPPORTED || CONFIG_SOC_DMA2D_SUPPORTED
+@@ -3006,6 +3015,131 @@
+  *   HELPER FUNCTIONS
+  **********************/
+ 
++static bool repair_rect_is_valid(const lv_area_t *rect,
++                                 uint16_t hor_res,
++                                 uint16_t ver_res)
++{
++    return rect != NULL && display_cache_sync_rect_valid(
++                               hor_res, ver_res, rect->x1, rect->y1,
++                               rect->x2, rect->y2);
++}
++
++#if SOC_DMA2D_SUPPORTED
++static void repair_sync_record_full_frame(
++    esp_lv_adapter_display_bridge_v9_t *impl)
++{
++    if (impl->disp_fb == NULL || impl->runtime.frame_buffer_size == 0) {
++        return;
++    }
++    display_cache_msync_framebuffer(impl->disp_fb,
++                                    impl->runtime.frame_buffer_size);
++    impl->repair_sync_full_bytes += impl->runtime.frame_buffer_size;
++    impl->repair_sync_full_calls++;
++}
++
++static bool repair_rect_plan_get(const void *source,
++                                size_t index,
++                                display_cache_sync_rect_t *rect)
++{
++    if (source == NULL || rect == NULL) {
++        return false;
++    }
++    const lv_area_t *areas = (const lv_area_t *)source;
++    rect->x1 = areas[index].x1;
++    rect->y1 = areas[index].y1;
++    rect->x2 = areas[index].x2;
++    rect->y2 = areas[index].y2;
++    return true;
++}
++
++static display_cache_sync_plan_result_t repair_sync_front_ranges(
++    esp_lv_adapter_display_bridge_v9_t *impl,
++    const lv_area_t *repair,
++    uint16_t repair_count,
++    uint16_t hor_res,
++    uint16_t ver_res,
++    uint8_t color_bytes)
++{
++    const uintptr_t framebuffer = (uintptr_t)impl->disp_fb;
++    const size_t frame_capacity = impl->runtime.frame_buffer_size;
++    const size_t cache_line_size =
++        display_bridge_get_cache_line_size_by_addr(impl->disp_fb);
++    size_t planned_bytes = 0;
++    size_t planned_calls = 0;
++    size_t planner_steps = 0;
++    display_cache_sync_iterator_t iterator;
++    const display_cache_sync_plan_result_t plan =
++        display_cache_sync_choose_plan(
++            framebuffer, frame_capacity, hor_res, ver_res, color_bytes,
++            cache_line_size, repair, repair_count, repair_rect_plan_get,
++            &planned_bytes, &planned_calls, &planner_steps, &iterator);
++    impl->repair_sync_planner_steps += planner_steps;
++    if (plan == DISPLAY_CACHE_SYNC_PLAN_INVALID) {
++        return plan;
++    }
++    if (plan == DISPLAY_CACHE_SYNC_PLAN_FULL_FRAME) {
++        repair_sync_record_full_frame(impl);
++        impl->repair_sync_policy_full_frames++;
++        return plan;
++    }
++
++    size_t actual_bytes = 0;
++    size_t actual_calls = 0;
++    display_cache_sync_range_t range = {0};
++    while (display_cache_sync_iterator_next(&iterator, &range)) {
++        const esp_err_t err = esp_cache_msync(
++            (void *)range.address, range.size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
++        if (err != ESP_OK) {
++            return DISPLAY_CACHE_SYNC_PLAN_INVALID;
++        }
++        impl->repair_sync_range_bytes += range.size;
++        impl->repair_sync_range_calls++;
++        actual_bytes += range.size;
++        actual_calls++;
++    }
++    if (iterator.failed || iterator.planner_steps != planner_steps ||
++        actual_bytes != planned_bytes || actual_calls != planned_calls) {
++        return DISPLAY_CACHE_SYNC_PLAN_INVALID;
++    }
++    return plan;
++}
++
++static void repair_sync_log_if_due(esp_lv_adapter_display_bridge_v9_t *impl)
++{
++    const int64_t now_us = esp_timer_get_time();
++    if (impl->repair_sync_log_window_us == 0) {
++        impl->repair_sync_log_window_us = now_us;
++        return;
++    }
++    if (now_us - impl->repair_sync_log_window_us < 10000000) {
++        return;
++    }
++    if (impl->repair_sync_range_calls != 0 ||
++        impl->repair_sync_full_calls != 0 ||
++        impl->repair_sync_policy_full_frames != 0 ||
++        impl->repair_sync_fallbacks != 0 ||
++        impl->repair_sync_planner_steps != 0) {
++        ESP_LOGI(TAG, "diff repair cache sync: range=%" PRIu64 " B/%" PRIu64
++                      " calls full=%" PRIu64 " B/%" PRIu64
++                      " calls policy_full=%" PRIu64
++                      " fallback=%" PRIu64 " plan_steps=%" PRIu64,
++                 impl->repair_sync_range_bytes, impl->repair_sync_range_calls,
++                 impl->repair_sync_full_bytes, impl->repair_sync_full_calls,
++                 impl->repair_sync_policy_full_frames,
++                 impl->repair_sync_fallbacks,
++                 impl->repair_sync_planner_steps);
++    }
++    impl->repair_sync_log_window_us = now_us;
++    impl->repair_sync_range_bytes = 0;
++    impl->repair_sync_range_calls = 0;
++    impl->repair_sync_full_bytes = 0;
++    impl->repair_sync_full_calls = 0;
++    impl->repair_sync_policy_full_frames = 0;
++    impl->repair_sync_fallbacks = 0;
++    impl->repair_sync_planner_steps = 0;
++}
++#endif
++
+ static void copy_diff_repair_from_front_to_back(
+     esp_lv_adapter_display_bridge_v9_t *impl,
+     const lv_area_t *repair,
+@@ -3013,17 +3147,51 @@
+ {
+     const uint16_t hor_res = bridge_h_res(impl);
+     const uint8_t color_bytes = bridge_color_bytes(impl);
+-
++    const uint16_t ver_res = bridge_v_res(impl);
++
++    if (repair_count == 0) {
++        return;
++    }
++    if (repair == NULL || repair_count > DISPLAY_BRIDGE_V9_REPAIR_CAPACITY ||
++            impl->disp_fb == NULL || impl->draw_fb == NULL ||
++            !display_cache_sync_frame_valid(
++                (uintptr_t)impl->disp_fb, impl->runtime.frame_buffer_size,
++                hor_res, ver_res, color_bytes) ||
++            !display_cache_sync_frame_valid(
++                (uintptr_t)impl->draw_fb, impl->runtime.frame_buffer_size,
++                hor_res, ver_res, color_bytes)) {
+ #if SOC_DMA2D_SUPPORTED
+-    const uint16_t ver_res = bridge_v_res(impl);
+-    if (repair_count != 0) {
+-        display_cache_msync_framebuffer(impl->disp_fb,
+-                                        impl->runtime.frame_buffer_size);
+-    }
++        repair_sync_record_full_frame(impl);
++        impl->repair_sync_fallbacks++;
++        repair_sync_log_if_due(impl);
++#endif
++        return;
++    }
++
++    bool all_rects_valid = true;
++    for (uint16_t index = 0; index < repair_count; ++index) {
++        all_rects_valid = all_rects_valid &&
++                          repair_rect_is_valid(&repair[index], hor_res, ver_res);
++    }
++
++#if SOC_DMA2D_SUPPORTED
++    const display_cache_sync_plan_result_t sync_plan =
++        all_rects_valid
++            ? repair_sync_front_ranges(impl, repair, repair_count, hor_res,
++                                       ver_res, color_bytes)
++            : DISPLAY_CACHE_SYNC_PLAN_INVALID;
++    if (sync_plan == DISPLAY_CACHE_SYNC_PLAN_INVALID) {
++        repair_sync_record_full_frame(impl);
++        impl->repair_sync_fallbacks++;
++    }
++    repair_sync_log_if_due(impl);
+ #endif
+ 
+     for (uint16_t index = 0; index < repair_count; ++index) {
+         lv_area_t rect = repair[index];
++        if (!repair_rect_is_valid(&rect, hor_res, ver_res)) {
++            continue;
++        }
+         size_t copy_w_px = (size_t)(rect.x2 - rect.x1 + 1);
+         size_t copy_h_px = (size_t)(rect.y2 - rect.y1 + 1);
+ 
+--- a/src/adapter/adapter_internal.h
++++ b/src/adapter/adapter_internal.h
+@@ -233,6 +233,8 @@
+     SemaphoreHandle_t dummy_draw_mutex;     /*!< Recursive mutex for dummy draw operations */
+     SemaphoreHandle_t pause_done_sem;       /*!< Semaphore to synchronize pause acknowledgement */
+     TaskHandle_t task;                      /*!< LVGL task handle */
++    void (*before_handler_callback)(void *ctx); /*!< Optional owner-task work before LVGL timers */
++    void *before_handler_ctx;               /*!< User context for before-handler callback */
+     void *tick_timer;                       /*!< LVGL tick timer handle (esp_timer_handle_t) */
+     esp_lv_adapter_config_t config;       /*!< Adapter configuration */
+     esp_lv_adapter_display_node_t *display_list;  /*!< Linked list of registered displays */
+--- a/include/esp_lv_adapter.h
++++ b/include/esp_lv_adapter.h
+@@ -230,6 +230,34 @@
+  *      - ESP_ERR_INVALID_STATE: Adapter not initialized
+  */
+ esp_err_t esp_lv_adapter_request_wake(void);
++
++/**
++ * @brief Install owner-task work to run immediately before each LVGL timer pass
++ *
++ * The callback executes on the existing LVGL worker task while its recursive
++ * display lock is held. Install it after adapter initialization and before
++ * esp_lv_adapter_start(); it is never invoked while the worker is paused.
++ *
++ * @param callback Callback to invoke before lv_timer_handler()
++ * @param ctx Opaque callback context
++ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the adapter is not
++ *         initialized or its worker has already started, or ESP_ERR_INVALID_ARG
++ *         for a null callback
++ */
++esp_err_t esp_lv_adapter_set_before_handler_callback(
++    void (*callback)(void *ctx), void *ctx);
++
++/**
++ * @brief Notify the existing LVGL worker that non-activity work is queued
++ *
++ * This only interrupts the worker's timer wait. It does not report user
++ * activity, alter automatic-sleep state, or request a paused-worker wake.
++ * Work remains queued while the worker is paused and is handled after resume.
++ *
++ * @return ESP_OK on success, ESP_ERR_INVALID_STATE if the adapter is not
++ *         initialized
++ */
++esp_err_t esp_lv_adapter_notify_work(void);
+ 
+ /**
+  * @brief ISR-safe variant of esp_lv_adapter_request_wake()
+--- a/src/adapter/esp_lv_adapter.c
++++ b/src/adapter/esp_lv_adapter.c
+@@ -787,6 +787,34 @@
+         adapter_auto_sleep_notify_task();
+     }
+ 
++    return ESP_OK;
++}
++
++esp_err_t esp_lv_adapter_notify_work(void)
++{
++    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG,
++                        "Adapter not initialized");
++    /* Notify the existing worker without treating background work as user
++     * activity or latching an automatic-sleep wake request. */
++    adapter_auto_sleep_notify_task();
++    return ESP_OK;
++}
++
++esp_err_t esp_lv_adapter_set_before_handler_callback(
++    void (*callback)(void *ctx), void *ctx)
++{
++    ESP_RETURN_ON_FALSE(s_ctx.inited, ESP_ERR_INVALID_STATE, TAG,
++                        "Adapter not initialized");
++    ESP_RETURN_ON_FALSE(callback != NULL, ESP_ERR_INVALID_ARG, TAG,
++                        "Before-handler callback is null");
++    ESP_RETURN_ON_FALSE(s_ctx.task == NULL, ESP_ERR_INVALID_STATE, TAG,
++                        "Install callback before starting the LVGL worker");
++    ESP_RETURN_ON_FALSE(s_ctx.before_handler_callback == NULL,
++                        ESP_ERR_INVALID_STATE, TAG,
++                        "Before-handler callback is already installed");
++
++    s_ctx.before_handler_ctx = ctx;
++    s_ctx.before_handler_callback = callback;
+     return ESP_OK;
+ }
+ 
+@@ -1662,6 +1690,9 @@
+         /* Process LVGL timers */
+         uint32_t next_delay_ms_raw = s_ctx.config.task_max_delay_ms;
+         if (esp_lv_adapter_lock(-1) == ESP_OK) {
++            if (s_ctx.before_handler_callback != NULL) {
++                s_ctx.before_handler_callback(s_ctx.before_handler_ctx);
++            }
+             next_delay_ms_raw = lv_timer_handler();
+             esp_lv_adapter_unlock();
+         }

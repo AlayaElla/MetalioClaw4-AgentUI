@@ -1,6 +1,7 @@
 #include "codex_menu_state.h"
 
 #include <cstring>
+#include <memory>
 
 #include "cJSON.h"
 
@@ -22,8 +23,11 @@ std::string Escape(const std::string& value) {
 }
 void SetError(std::string* error, const char* text) { if (error) *error = text; }
 std::string BoundedString(const cJSON* object, const char* key, size_t max_bytes) {
-    const std::string value = String(cJSON_GetObjectItemCaseSensitive(object, key));
-    return value.size() <= max_bytes ? value : std::string{};
+    const cJSON* value = cJSON_GetObjectItemCaseSensitive(object, key);
+    if (!cJSON_IsString(value) || !value->valuestring) return {};
+    size_t length = 0;
+    while (length <= max_bytes && value->valuestring[length] != '\0') ++length;
+    return length <= max_bytes ? std::string(value->valuestring, length) : std::string{};
 }
 std::vector<InteractionOption> ParseOptions(const cJSON* values, size_t maximum) {
     std::vector<InteractionOption> out;
@@ -56,16 +60,15 @@ void ParseSlot(const cJSON* entry, Slot* slot) {
     const cJSON* updated = cJSON_GetObjectItemCaseSensitive(entry, "updatedAt");
     slot->updated_at = cJSON_IsNumber(updated) ? static_cast<int64_t>(updated->valuedouble) : 0;
 }
-bool ParseRoot(const std::string& json, State* out, std::string* error) {
-    cJSON* root = cJSON_Parse(json.c_str());
+bool ParseRoot(const cJSON* root, State* out, std::string* error) {
     if (!root) { SetError(error, "invalid JSON"); return false; }
     const cJSON* type = cJSON_GetObjectItemCaseSensitive(root, "type");
     if (!cJSON_IsString(type) || std::strcmp(type->valuestring, "codex_state") != 0) {
-        cJSON_Delete(root); SetError(error, "not codex_state"); return false;
+        SetError(error, "not codex_state"); return false;
     }
     const cJSON* version = cJSON_GetObjectItemCaseSensitive(root, "version");
     if (!cJSON_IsNumber(version) || version->valueint != 1) {
-        cJSON_Delete(root); SetError(error, "unsupported state version"); return false;
+        SetError(error, "unsupported state version"); return false;
     }
     State parsed{};
     parsed.version = version->valueint;
@@ -199,11 +202,16 @@ bool ParseRoot(const std::string& json, State* out, std::string* error) {
         }
         if (!model.id.empty()) parsed.models.push_back(std::move(model));
     }
-    cJSON_Delete(root); *out = std::move(parsed); return true;
+    *out = std::move(parsed); return true;
 }
 }  // namespace
+bool ParseStateRoot(const cJSON* root, State* out, std::string* error) {
+    return out != nullptr && ParseRoot(root, out, error);
+}
 bool ParseStateJson(const std::string& json, State* out, std::string* error) {
-    return out != nullptr && ParseRoot(json, out, error);
+    if (!out) return false;
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(json.c_str()), cJSON_Delete);
+    return ParseStateRoot(root.get(), out, error);
 }
 const Slot* SelectedTask(const State& state) {
     if (state.selected_slot >= 0 && state.selected_slot < 6) {
@@ -242,45 +250,50 @@ const Slot* TaskEntrySelection::Resolve(const State& state) const {
     }
     return nullptr;
 }
-bool ApplyStateJson(const std::string& json, State* state, std::string* error) {
+bool ApplyStateRoot(const cJSON* root, State* state, std::string* error) {
     if (!state) return false;
     State next;
-    if (!ParseStateJson(json, &next, error)) return false;
+    if (!ParseStateRoot(root, &next, error)) return false;
     if (!next.stream_id.empty() && next.stream_id == state->stream_id && next.revision < state->revision) return false;
     *state = std::move(next); return true;
 }
-bool ApplyActionResultJson(const std::string& json, State* state, std::string* error) {
+bool ApplyStateJson(const std::string& json, State* state, std::string* error) {
     if (!state) return false;
-    cJSON* root = cJSON_Parse(json.c_str()); if (!root) return false;
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(json.c_str()), cJSON_Delete);
+    return ApplyStateRoot(root.get(), state, error);
+}
+bool ApplyActionResultRoot(const cJSON* root, State* state, std::string* error) {
+    if (!state || !root) return false;
     const bool valid = std::strcmp(String(cJSON_GetObjectItemCaseSensitive(root, "type")), "codex_action_result") == 0;
     const bool success = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "success"));
-    const std::string remote_error = String(cJSON_GetObjectItemCaseSensitive(root, "error"));
-    cJSON* payload = cJSON_GetObjectItemCaseSensitive(root, "state");
-    char* printed = payload ? cJSON_PrintUnformatted(payload) : nullptr;
-    cJSON_Delete(root);
+    const std::string remote_error = BoundedString(root, "error", 512);
+    const cJSON* payload = cJSON_GetObjectItemCaseSensitive(root, "state");
     if (!valid || !success) {
         // Rejections may include an authoritative snapshot.  This is
         // particularly important for a rejected optimistic new_task: restore
         // the previous selected task instead of leaving a local placeholder.
-        if (printed) {
+        if (payload) {
             State next;
-            if (ParseStateJson(printed, &next, nullptr) &&
+            if (ParseStateRoot(payload, &next, nullptr) &&
                 (next.stream_id.empty() || next.stream_id != state->stream_id || next.revision >= state->revision)) {
                 *state = std::move(next);
             }
-            cJSON_free(printed);
         }
         SetError(error, remote_error.empty() ? "action rejected" : remote_error.c_str());
         return false;
     }
-    if (!printed) return true;
+    if (!payload) return true;
     // A successful result may arrive after a fresher stream snapshot. Finish
     // the request without rolling the selected conversation back.
     State next;
-    const bool parsed = ParseStateJson(printed, &next, error);
-    cJSON_free(printed);
+    const bool parsed = ParseStateRoot(payload, &next, error);
     if (parsed && (next.stream_id.empty() || next.stream_id != state->stream_id || next.revision >= state->revision)) *state = std::move(next);
     return parsed;
+}
+bool ApplyActionResultJson(const std::string& json, State* state, std::string* error) {
+    if (!state) return false;
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(json.c_str()), cJSON_Delete);
+    return ApplyActionResultRoot(root.get(), state, error);
 }
 void BeginDraft(State* state, const std::string& request_id) {
     if (!state || request_id.empty()) return;

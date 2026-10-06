@@ -4,8 +4,12 @@ list(APPEND AGENT_UI_SOURCES
     "display/agent_ui/apps/codex/codex_conversation_ui.cc"
     "display/agent_ui/apps/codex/codex_media_cache.cc"
     "display/agent_ui/apps/codex/codex_menu_ui.cc"
+    "display/agent_ui/apps/codex/codex_menu_render_cache.cc"
     "display/agent_ui/apps/codex/codex_notification_service.cc"
+    "display/agent_ui/apps/codex/codex_protocol_client_adapter.cc"
+    "display/agent_ui/apps/codex/codex_protocol_service.cc"
     "display/agent_ui/apps/codex/codex_status_ring.cc"
+    "display/agent_ui/apps/codex/codex_voice_footer.cc"
     "display/agent_ui/apps/codex/codex_view.cc"
 )
 

@@ -82,18 +82,3 @@ Codex 文本发送流程：读取 `list/state` → 必要时 `select/new` → �
 - `metalio_app_json.h` 提供示例 App 的严格 JSON 读取，支持 Unicode，拒绝嵌入 NUL、非法代理项和超深嵌套。
 
 示例已接入：收音机选台/播放/暂停/恢复、计算器计算、图片查看器切图、宠物互动。每个 manifest 给出具体 schema。新 App 接同一套声明与回调即可扩展。
-
-## 5. 验证入口与边界
-
-```powershell
-node scripts/check-ai-availability-runtime.cjs
-node scripts/check-ai-capabilities-runtime.cjs
-node scripts/check-ai-ui-operations.cjs
-node scripts/check-codex-ai-provider.cjs
-node scripts/check-external-ai-json.cjs
-python -m unittest discover -s external_apps/tests
-```
-
-宿主检查直接编译生产 C/C++ 实现，要求 Windows MSVC；registry/provider 检查依赖已获取的 cJSON 组件。registry 检查还编译完整计算器示例，验证计算、清空、模式与错误回执。PC 目标绑定测试位于 CodexRemote 的 `scripts/tests/codex-targeted-text.test.js`。
-
-宿主测试和固件编译无法替代真机验证：顶部动画、音频互斥与恢复、Wi-Fi/SIM/蓝牙、拍照、电话、外部 ELF 生命周期以及 Codex 桌面真实发送，仍需设备联调。根目录 `sdkconfig` 已修正为 C5/SDIO，并通过标准 `scripts/package-esp32.cmd` 入口完成构建和打包；产物位于 `build/esp32/`。

@@ -3,6 +3,7 @@
 #include <functional>
 #include <string>
 
+#include "cJSON.h"
 #include "ai/ai_capabilities.h"
 
 namespace agent_ui::codex_ai {
@@ -26,7 +27,12 @@ struct Hooks {
 // supplies real transport/UI operations; this class owns pending operation and
 // acknowledgement correlation rather than treating a WebSocket write as success.
 bool Register(const Hooks& hooks, std::string* error = nullptr);
+void ObserveMessage(const cJSON* root);
 void ObserveMessage(const std::string& json);
+// Marks local send completion only; it must be called after the transport
+// confirms the send, and does not mean the remote task has finished.
+void CompletePendingRequest(const std::string& request_id, const std::string& result_json = "{}");
+void FailPendingRequest(const std::string& request_id, const std::string& error);
 void Invalidate(const std::string& reason);
 
 }  // namespace agent_ui::codex_ai

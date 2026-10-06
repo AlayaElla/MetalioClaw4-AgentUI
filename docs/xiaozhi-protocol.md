@@ -35,15 +35,3 @@
 没有旧键时不重复提交，失败时在后续启动重试。固件中保留这些旧键名仅用于配置迁移。
 
 公共音频服务继续支持 Codex 语音采集、通知声音和外部应用录音、播放。
-
-服务器设置的主机端回归用例位于 `tests/xiaozhi_server`，覆盖地址校验、旧配置兼容、
-草稿与生效地址隔离、官方/自建切换、缓存清理和 NVS 失败恢复。
-可在具有 C++ 编译器的终端单独运行：
-
-```powershell
-rtk proxy cmake -S tests/xiaozhi_server -B .tmp/xiaozhi-server-config-test
-rtk proxy cmake --build .tmp/xiaozhi-server-config-test --config Debug
-rtk proxy ctest --test-dir .tmp/xiaozhi-server-config-test -C Debug --output-on-failure
-```
-
-完整 ESP-IDF 编译通过后，仍需在设备上验收唤醒、连续对话、打断、断网重连和 MCP 执行。

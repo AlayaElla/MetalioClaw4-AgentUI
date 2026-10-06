@@ -106,6 +106,30 @@ AT commands, or protocol clients directly. App-specific rendering helpers stay
 under their app directory; only behavior that has no app ownership belongs in
 `components/`.
 
+Files uses a Controller/Adapter/Module boundary. The existing `FilesView::Create` and
+lifecycle entry points remain compatibility facades; the Controller owns
+directory and preview policy, the Adapter owns storage/USB/worker access, and
+the Module wires their lifecycle. Shared capacity tickets can be consumed by
+their owner across Files suspend and unload.
+
+The shared StatusBar keeps LVGL widgets, animation, and asset selection in
+`core/status_bar.*`. `status_bar_data_provider.*` gathers a value snapshot and
+preserves the network dirty-cache and battery callback cadence;
+`status_bar_state.*` returns semantic icon and visibility/battery policy values
+without owning LVGL objects or theme assets. The system data source reads the
+existing AI, Bluetooth, time, activation, network, and battery services.
+
+`CodexCaptureCoordinator` coordinates voice capture and realtime audio-uplink
+lifecycle through an Application-owned service port. It does not extract the
+whole Codex screen or every protocol path. `apps/codex/codex_protocol_service.*`
+owns Codex command admission, transport context checks, and value-event delivery;
+the View still owns Codex-specific presentation. Its `on_sent` callback runs on
+the transport worker only after a complete local WebSocket write succeeds, so
+callers must keep it thread-safe and free of LVGL work. Send-failure UI events
+are retried through the main loop up to three times; exhaustion is logged.
+Application owns Xiaozhi protocol integration,
+activation, and special interaction services.
+
 ## Runtime integration
 
 `agent_ui::Runtime` owns top-level app registration and lifecycle dispatch. The
@@ -118,6 +142,13 @@ is owned by Settings and is consumed through the Network module's
 Camera is registered through its Module mount factory
 and receives lifecycle events through the same runtime boundary.
 
+Home presentation operations from the status bar, idle power, Application, and
+Standby are routed through Runtime and Home Module/View. Core services receive
+runtime-owned callbacks rather than including the Home renderer. Home's tick
+sound follows the existing intent/command/adapter path and keeps the device's
+speaking-state guard. Battery sampling intervals and power state transitions
+remain owned by the existing services.
+
 Each top-level app is registered by `agent_ui::Runtime`; embedded apps are
 owned by their host module. Every app keeps its source manifest in
 `apps/<app>/sources.cmake`. A View-only app may remain a View-only slice until
@@ -125,24 +156,39 @@ its business behavior needs a Controller or Adapter; it must still obey the
 same dependency directions. Add new sources to the app manifest and include
 that manifest from `display/agent_ui/sources.cmake`.
 
-## Source and validation rules
+## Shared render resources
+
+`components/render_snapshot_buffer.*` owns reusable snapshot memory, the stable
+LVGL descriptor, image-cache invalidation, and acceleration registration. Home,
+the Codex menu, and the keyboard keep their own capture timing, source-state
+checks, asynchronous work, native-widget fallback, and statistics. The owner is
+noncopyable and nonmovable because acceleration registration uses descriptor
+identity. Home replaces snapshots using an unregistered candidate and `Adopt`.
+Release unregisters the buffer before freeing it. Use these operations on the
+LVGL owner thread or under the existing display lock.
+
+`components/opaque_render_acceleration.*` owns RGB565/RGB888 PPA SRM copies,
+registration, bounds/cache checks, and copy telemetry. The public functions in
+`expression_acceleration.h` remain the compatibility facade;
+`expression_acceleration.cc` retains A8 blending and its dispatch policy. Every
+unsupported or failed copy continues through the software rendering path.
+
+`display/display_render_telemetry.*` owns refresh/dirty-area/flush accounting.
+The display adapter selects the mode and its log name together, then attaches
+the collector once. LVGL callbacks retain the collector's address, so its owner
+must outlive callback delivery. The existing adapter FPS statistics are retained
+because they report different information.
+
+## Source integration
 
 - Edit `expression-spec.json` in the Demo and regenerate
   `components/expression_spec.generated.h` when expression timing changes.
 - Keep hardware, storage, networking, and protocol work in app integrations or
-  the existing device services; shared components must remain device-agnostic.
-- Run a source-manifest check before a firmware build:
+  the existing device services. Shared widget policy must remain app-independent;
+  platform render helpers may use ESP-specific acceleration behind explicit
+  capability checks and software fallback.
+- Register firmware sources in the owning app manifest and build from the
+  repository root with `npm run package`.
 
-  ```powershell
-  # Run from the repository root.
-  node --test design\agent\tests\agent-ui-architecture.test.cjs
-  ```
-
-- Camera UI changes also require the architecture and visual-parity contracts:
-
-  ```powershell
-  node --test design\agent\tests\camera-ui-architecture.test.cjs design\agent\tests\camera-ui-visual-parity.test.cjs
-  ```
-
-  A full ESP32 build is required when a firmware source changes, but this
-  contract check does not replace it.
+The module guide, resource contracts, and development commands are described in
+[`docs/esp32-ui-engineering.md`](../../../docs/esp32-ui-engineering.md).

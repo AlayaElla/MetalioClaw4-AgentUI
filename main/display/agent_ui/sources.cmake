@@ -3,20 +3,28 @@
 set(AGENT_UI_SOURCES
     "display/agent_ui/agent_ui_runtime.cc"
     "display/agent_ui/core/app_shell.cc"
+    "display/agent_ui/core/app_mcp_tools.cc"
     "display/agent_ui/core/fonts.cc"
     "display/agent_ui/core/idle_power.cc"
     "display/agent_ui/core/navigation.cc"
     "display/agent_ui/core/power_key.cc"
+    "display/agent_ui/core/performance_manager.cc"
     "display/agent_ui/core/status_bar.cc"
+    "display/agent_ui/core/status_bar_data_provider.cc"
+    "display/agent_ui/core/status_bar_state.cc"
+    "display/agent_ui/core/status_bar_system_data_source.cc"
     "display/agent_ui/core/status_signal_assets.cc"
     "display/agent_ui/core/theme.cc"
     "display/agent_ui/core/ui_utils.cc"
     "display/agent_ui/components/expression_acceleration.cc"
+    "display/agent_ui/components/opaque_render_acceleration.cc"
+    "display/agent_ui/components/render_snapshot_buffer.cc"
     "display/agent_ui/components/expression_player.cc"
     "display/agent_ui/components/haptic_feedback.cc"
     "display/agent_ui/components/pet_animation.cc"
     "display/agent_ui/components/pet_renderer.cc"
     "display/agent_ui/components/system_keyboard.cc"
+    "display/agent_ui/components/ui_components.cc"
 )
 
 set(AGENT_UI_INCLUDE_DIRS

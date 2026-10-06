@@ -1,4 +1,6 @@
 #include "expression_acceleration.h"
+#include "opaque_render_acceleration.h"
+#include "small_a8_blend_policy.h"
 
 #include <array>
 #include <cinttypes>
@@ -13,6 +15,12 @@
 #include "esp_timer.h"
 #include "esp_private/esp_cache_private.h"
 #include "soc/soc_caps.h"
+#if __has_include("esp_private/esp_clk.h")
+#include "esp_private/esp_clk.h"
+#define AGENT_UI_HAS_CPU_CLOCK 1
+#else
+#define AGENT_UI_HAS_CPU_CLOCK 0
+#endif
 
 #include "lvgl_private.h"
 #include "src/draw/sw/blend/lv_draw_sw_blend_private.h"
@@ -40,17 +48,30 @@ uint32_t s_ppa_hits = 0;
 uint32_t s_ppa_fallbacks = 0;
 uint32_t s_ppa_failures = 0;
 uint32_t s_expression_ppa_hits = 0;
+SmallA8BlendPolicy s_small_expression_policy;
+uint32_t s_small_expression_draws = 0;
 
-ppa_client_handle_t s_keyboard_copy_handle = nullptr;
-const lv_draw_buf_t* s_keyboard_buffer = nullptr;
-struct KeyboardCopyStats {
-    uint32_t hits = 0;
-    uint32_t fallbacks = 0;
-    uint32_t failures = 0;
-    uint64_t total_us = 0;
-    uint64_t max_us = 0;
-} s_keyboard_stats;
-constexpr char kKeyboardTag[] = "KeyboardPPA";
+uint32_t BlendCpuFrequency() {
+#if AGENT_UI_HAS_CPU_CLOCK
+    return static_cast<uint32_t>(esp_clk_cpu_freq());
+#else
+    return 0;
+#endif
+}
+
+void RecordSmallExpressionDraw(uint32_t pixels, bool rgb888, bool ppa, int64_t started_us) {
+    s_small_expression_policy.Record(pixels, rgb888, ppa,
+        static_cast<uint64_t>(esp_timer_get_time() - started_us));
+    if (++s_small_expression_draws == 16 || s_small_expression_draws % 128 == 0) {
+        const auto& sample = s_small_expression_policy.Get(pixels, rgb888);
+        ESP_LOGI(kTag, "small A8 pixels=%" PRIu32 " format=%s cpu=%" PRIu32
+                      " path=%s PPA=%lluus/%" PRIu32 " software=%lluus/%" PRIu32,
+                 pixels, rgb888 ? "RGB888" : "RGB565", BlendCpuFrequency(),
+                 ppa ? "PPA" : "software",
+                 static_cast<unsigned long long>(sample.ppa_us), sample.ppa_count,
+                 static_cast<unsigned long long>(sample.software_us), sample.software_count);
+    }
+}
 
 struct ExpressionBufferRange {
     uintptr_t begin = 0;
@@ -89,144 +110,6 @@ bool IsCacheAligned(const void* address) {
 size_t AlignSize(const void* address, size_t size) {
     const size_t alignment = CacheAlignment(address);
     return alignment == 0 ? size : ((size + alignment - 1) & ~(alignment - 1));
-}
-
-void LogKeyboardStats() {
-    ESP_LOGI(kKeyboardTag, "copy hits=%" PRIu32 " fallback=%" PRIu32
-                          " failed=%" PRIu32 " avg=%lluus max=%lluus",
-             s_keyboard_stats.hits, s_keyboard_stats.fallbacks, s_keyboard_stats.failures,
-             static_cast<unsigned long long>(s_keyboard_stats.hits == 0 ? 0 :
-                 s_keyboard_stats.total_us / s_keyboard_stats.hits),
-             static_cast<unsigned long long>(s_keyboard_stats.max_us));
-}
-
-bool KeyboardCopyFallback(const char* reason) {
-    ++s_keyboard_stats.fallbacks;
-    if (s_keyboard_stats.fallbacks == 1 || s_keyboard_stats.fallbacks % 100 == 0) {
-        ESP_LOGW(kKeyboardTag, "copy fallback: %s", reason);
-        LogKeyboardStats();
-    }
-    return false;
-}
-
-bool CopyKeyboardCache(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
-                       lv_color_format_t format) {
-    // No general image fast path: private keyboard ownership guarantees this
-    // source is never tiled or transformed. All other images use the adapter.
-    const auto* source = s_keyboard_buffer;
-    if (source == nullptr || descriptor->src_buf != source->data) return false;
-    if (s_keyboard_copy_handle == nullptr) return KeyboardCopyFallback("no-client");
-    auto* layer = task->target_layer;
-    if (layer == nullptr || layer->draw_buf == nullptr || layer->color_format != format ||
-        descriptor->src_color_format != format || source->header.cf != format ||
-        descriptor->opa != LV_OPA_COVER || descriptor->mask_buf != nullptr ||
-        descriptor->blend_mode != LV_BLEND_MODE_NORMAL || descriptor->src_area == nullptr ||
-        descriptor->blend_area == nullptr) return KeyboardCopyFallback("unsupported-draw");
-
-    const uint32_t pixel_bytes = format == LV_COLOR_FORMAT_RGB888 ? 3 : 2;
-    const uint32_t source_stride = descriptor->src_stride != 0 ? descriptor->src_stride :
-        lv_area_get_width(descriptor->src_area) * pixel_bytes;
-    const uint32_t destination_stride = layer->draw_buf->header.stride;
-    if (source_stride != source->header.stride || source_stride != source->header.w * pixel_bytes ||
-        lv_area_get_width(descriptor->src_area) != source->header.w ||
-        lv_area_get_height(descriptor->src_area) != source->header.h ||
-        destination_stride % pixel_bytes != 0 ||
-        destination_stride < lv_area_get_width(&layer->buf_area) * pixel_bytes) {
-        return KeyboardCopyFallback("stride-or-source-shape");
-    }
-    lv_area_t area;
-    if (!lv_area_intersect(&area, descriptor->blend_area, &task->clip_area)) return true;
-    const int32_t source_x = area.x1 - descriptor->src_area->x1;
-    const int32_t source_y = area.y1 - descriptor->src_area->y1;
-    const int32_t destination_x = area.x1 - layer->buf_area.x1;
-    const int32_t destination_y = area.y1 - layer->buf_area.y1;
-    const uint32_t width = lv_area_get_width(&area);
-    const uint32_t height = lv_area_get_height(&area);
-    if (source_x < 0 || source_y < 0 || destination_x < 0 || destination_y < 0 ||
-        source_x + width > source->header.w || source_y + height > source->header.h ||
-        area.x2 > layer->buf_area.x2 || area.y2 > layer->buf_area.y2 ||
-        static_cast<size_t>(source_stride) * source->header.h > source->data_size) {
-        return KeyboardCopyFallback("bounds");
-    }
-    auto* destination = layer->draw_buf->data;
-    const size_t destination_bytes = static_cast<size_t>(destination_stride) *
-                                     lv_area_get_height(&layer->buf_area);
-    // Match the driver's platform alignment even if a future draw layer uses
-    // internal RAM, whose own cache line can be smaller than the PPA's line.
-    size_t alignment = 0;
-    if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &alignment) != ESP_OK ||
-        alignment == 0) return KeyboardCopyFallback("cache-alignment-query");
-    const size_t output_size = (destination_bytes + alignment - 1) & ~(alignment - 1);
-    if (destination == source->data || destination == nullptr ||
-        reinterpret_cast<uintptr_t>(destination) % alignment != 0 ||
-        output_size > layer->draw_buf->data_size) {
-        return KeyboardCopyFallback("output-allocation");
-    }
-
-    const int64_t started_us = esp_timer_get_time();
-    // The IDF SRM driver invalidates whole destination rows before DMA. For
-    // clipped copies, write back those rows first to preserve CPU-drawn pixels
-    // outside the copied rectangle, including neighbouring cache-line bytes.
-    // Full-width copies overwrite every row byte, so only their unaligned
-    // boundary lines need preserving; avoid writing back the entire keyboard.
-    const uintptr_t row_start = reinterpret_cast<uintptr_t>(destination) +
-                                static_cast<size_t>(destination_y) * destination_stride;
-    const size_t row_bytes = static_cast<size_t>(height) * destination_stride;
-    const size_t prefix = row_start % alignment;
-    const size_t sync_bytes = (row_bytes + prefix + alignment - 1) & ~(alignment - 1);
-    if (destination_x != 0 || width * pixel_bytes != destination_stride) {
-        if (esp_cache_msync(reinterpret_cast<void*>(row_start - prefix), sync_bytes,
-                            ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
-            return KeyboardCopyFallback("cache-writeback");
-        }
-    } else {
-        const uintptr_t first_line = row_start - prefix;
-        const uintptr_t row_end = row_start + row_bytes;
-        const uintptr_t last_line = row_end - row_end % alignment;
-        if (prefix != 0 &&
-            esp_cache_msync(reinterpret_cast<void*>(first_line), alignment,
-                            ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
-            return KeyboardCopyFallback("cache-writeback");
-        }
-        if (row_end % alignment != 0 && (prefix == 0 || last_line != first_line) &&
-            esp_cache_msync(reinterpret_cast<void*>(last_line), alignment,
-                            ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
-            return KeyboardCopyFallback("cache-writeback");
-        }
-    }
-    const auto color_mode = format == LV_COLOR_FORMAT_RGB888 ?
-        PPA_SRM_COLOR_MODE_RGB888 : PPA_SRM_COLOR_MODE_RGB565;
-    ppa_srm_oper_config_t config = {
-        .in = {
-            .buffer = source->data,
-            .pic_w = source->header.w, .pic_h = source->header.h,
-            .block_w = width, .block_h = height,
-            .block_offset_x = static_cast<uint32_t>(source_x),
-            .block_offset_y = static_cast<uint32_t>(source_y), .srm_cm = color_mode,
-        },
-        .out = {
-            .buffer = destination,
-            .buffer_size = static_cast<uint32_t>(output_size),
-            .pic_w = destination_stride / pixel_bytes,
-            .pic_h = static_cast<uint32_t>(lv_area_get_height(&layer->buf_area)),
-            .block_offset_x = static_cast<uint32_t>(destination_x),
-            .block_offset_y = static_cast<uint32_t>(destination_y), .srm_cm = color_mode,
-        },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = 1.0f, .scale_y = 1.0f,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-    };
-    const esp_err_t result = ppa_do_scale_rotate_mirror(s_keyboard_copy_handle, &config);
-    if (result != ESP_OK) {
-        ++s_keyboard_stats.failures;
-        return KeyboardCopyFallback(esp_err_to_name(result));
-    }
-    ++s_keyboard_stats.hits;
-    const auto elapsed_us = static_cast<uint64_t>(esp_timer_get_time() - started_us);
-    s_keyboard_stats.total_us += elapsed_us;
-    if (elapsed_us > s_keyboard_stats.max_us) s_keyboard_stats.max_us = elapsed_us;
-    if (s_keyboard_stats.hits == 1 || s_keyboard_stats.hits % 300 == 0) LogKeyboardStats();
-    return true;
 }
 
 void DelegateBlend(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
@@ -269,7 +152,25 @@ void BlendA8Mask(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
                  ppa_blend_color_mode_t ppa_color_mode,
                  uint32_t bytes_per_pixel,
                  lv_draw_sw_blend_handler_t fallback_handler) {
-    if (CopyKeyboardCache(task, descriptor, destination_format)) return;
+    if (opaque_render_acceleration::TryCopyRenderBuffer(task, descriptor, destination_format)) return;
+
+    // The RGB888 adapter's hardware image path is only useful for ARGB8888
+    // input; opaque RGB565/RGB888 images and other source formats use LVGL's
+    // software path. Bypass the adapter here so those cases perform no cache
+    // sync. RGB565 image blending remains delegated to the adapter.
+    const bool rgb888_software_image = destination_format == LV_COLOR_FORMAT_RGB888 &&
+        descriptor->src_buf != nullptr &&
+        descriptor->src_color_format != LV_COLOR_FORMAT_ARGB8888;
+    const bool unmasked_semitransparent_fill = descriptor->src_buf == nullptr &&
+        descriptor->mask_buf == nullptr && descriptor->opa < LV_OPA_COVER;
+    if (rgb888_software_image ||
+        (unmasked_semitransparent_fill &&
+         (destination_format == LV_COLOR_FORMAT_RGB565 ||
+          destination_format == LV_COLOR_FORMAT_RGB888))) {
+        DelegateBlend(task, descriptor, destination_format, nullptr);
+        return;
+    }
+
     lv_layer_t* layer = task->target_layer;
     if (layer == nullptr || layer->draw_buf == nullptr ||
         layer->color_format != destination_format ||
@@ -287,17 +188,29 @@ void BlendA8Mask(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
     if (block_width <= 0 || block_height <= 0) return;
 
     const bool expression_mask = IsExpressionA8Buffer(descriptor->mask_buf);
-    // PPA setup and cache synchronization cost more than software blending for
-    // small masks such as font glyphs. Programmatic expression buffers are
-    // explicitly registered and always use PPA, including very small dirty
-    // regions; unrelated A8 masks retain the threshold.
-    if (static_cast<uint32_t>(block_width) * static_cast<uint32_t>(block_height) <
-            kMinPpaA8Pixels &&
+    const uint32_t pixels = static_cast<uint32_t>(block_width) *
+                            static_cast<uint32_t>(block_height);
+    // Ordinary glyphs keep their existing cutoff. Small registered expression
+    // regions compare measured hardware/software draws on the current CPU tier.
+    if (pixels < kMinPpaA8Pixels &&
         !expression_mask) {
         DelegateBlend(task, descriptor, destination_format, fallback_handler);
         return;
     }
 
+    const bool small_expression = expression_mask && pixels < kMinPpaA8Pixels;
+    const bool rgb888 = destination_format == LV_COLOR_FORMAT_RGB888;
+    if (small_expression &&
+        !s_small_expression_policy.SelectPpa(pixels, rgb888, BlendCpuFrequency())) {
+        const int64_t started_us = esp_timer_get_time();
+        // Bypass the adapter as well: this sample must measure LVGL software,
+        // including dispatch cost, rather than a second hardware blend route.
+        DelegateBlend(task, descriptor, destination_format, nullptr);
+        RecordSmallExpressionDraw(pixels, rgb888, false, started_us);
+        return;
+    }
+
+    const int64_t started_us = small_expression ? esp_timer_get_time() : 0;
     const int32_t mask_offset_x = block_area.x1 - descriptor->mask_area->x1;
     const int32_t mask_offset_y = block_area.y1 - descriptor->mask_area->y1;
     const int32_t destination_offset_x = block_area.x1 - layer->buf_area.x1;
@@ -378,6 +291,7 @@ void BlendA8Mask(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
 
     const esp_err_t result = ppa_do_blend(s_blend_handle, &config);
     if (result != ESP_OK) {
+        if (small_expression) s_small_expression_policy.PpaFailed(pixels, rgb888);
         ++s_ppa_failures;
         LogFallback("ppa-error");
         ESP_LOGW(kTag, "PPA A8 blend failed: %s", esp_err_to_name(result));
@@ -385,6 +299,9 @@ void BlendA8Mask(lv_draw_task_t* task, const lv_draw_sw_blend_dsc_t* descriptor,
         return;
     }
     ++s_ppa_hits;
+    if (small_expression) {
+        RecordSmallExpressionDraw(pixels, rgb888, true, started_us);
+    }
     if (expression_mask) ++s_expression_ppa_hits;
     if ((s_ppa_hits % kPpaHitLogInterval) == 0U) {
         ESP_LOGI(kTag, "PPA A8 hits=%" PRIu32 " fallback=%" PRIu32
@@ -446,20 +363,10 @@ void InitializeExpressionAcceleration() {
 
 void RegisterKeyboardRenderBuffer(const lv_draw_buf_t* buffer) {
 #if CONFIG_SOC_PPA_SUPPORTED
-    if (buffer == nullptr || buffer->data == nullptr || buffer->header.w == 0 ||
-        buffer->header.h == 0 ||
-        (buffer->header.cf != LV_COLOR_FORMAT_RGB565 && buffer->header.cf != LV_COLOR_FORMAT_RGB888)) return;
+    if (!opaque_render_acceleration::IsRegistrationBufferSupported(buffer)) return;
     InitializeExpressionAcceleration();
     if (!s_registered) return;
-    s_keyboard_buffer = buffer;
-    if (s_keyboard_copy_handle == nullptr) {
-        const ppa_client_config_t config = {.oper_type = PPA_OPERATION_SRM};
-        const esp_err_t result = ppa_register_client(&config, &s_keyboard_copy_handle);
-        if (result != ESP_OK) {
-            s_keyboard_copy_handle = nullptr;
-            ESP_LOGW(kKeyboardTag, "copy client registration failed: %s", esp_err_to_name(result));
-        }
-    }
+    opaque_render_acceleration::RegisterKeyboardBuffer(buffer);
 #else
     (void)buffer;
 #endif
@@ -467,16 +374,27 @@ void RegisterKeyboardRenderBuffer(const lv_draw_buf_t* buffer) {
 
 void UnregisterKeyboardRenderBuffer(const lv_draw_buf_t* buffer) {
 #if CONFIG_SOC_PPA_SUPPORTED
-    if (s_keyboard_buffer != buffer) return;
-    s_keyboard_buffer = nullptr;
-    if (s_keyboard_stats.hits != 0 || s_keyboard_stats.fallbacks != 0) LogKeyboardStats();
-    s_keyboard_stats = {};
-    if (s_keyboard_copy_handle != nullptr) {
-        // SRM is blocking, so no copy can still reference the old cache here.
-        const esp_err_t result = ppa_unregister_client(s_keyboard_copy_handle);
-        if (result == ESP_OK) s_keyboard_copy_handle = nullptr;
-        else ESP_LOGW(kKeyboardTag, "copy client release failed: %s", esp_err_to_name(result));
-    }
+    opaque_render_acceleration::UnregisterKeyboardBuffer(buffer);
+#else
+    (void)buffer;
+#endif
+}
+
+void RegisterOpaqueRenderBuffer(const lv_draw_buf_t* buffer, const char* log_tag) {
+#if CONFIG_SOC_PPA_SUPPORTED
+    if (!opaque_render_acceleration::IsRegistrationBufferSupported(buffer)) return;
+    InitializeExpressionAcceleration();
+    if (!s_registered) return;
+    opaque_render_acceleration::RegisterBuffer(buffer, log_tag);
+#else
+    (void)buffer;
+    (void)log_tag;
+#endif
+}
+
+void UnregisterOpaqueRenderBuffer(const lv_draw_buf_t* buffer) {
+#if CONFIG_SOC_PPA_SUPPORTED
+    opaque_render_acceleration::UnregisterBuffer(buffer);
 #else
     (void)buffer;
 #endif

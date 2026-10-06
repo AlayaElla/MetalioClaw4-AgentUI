@@ -40,11 +40,14 @@ void View::Render(const ViewState& next) {
         next.connection == ConnectionState::Connected,
         next.audio_profile != AudioProfile::None,
         next.audio_profile == AudioProfile::Call);
-    if (next.has_current_device) {
-        settings_ui_.SetCurrentDevice(next.current_device.address.c_str(),
-                                      next.current_device.name.c_str());
-    } else {
-        settings_ui_.SetCurrentDevice(nullptr, nullptr);
+    if (next.has_current_device != state_.has_current_device ||
+        next.current_device != state_.current_device) {
+        if (next.has_current_device) {
+            settings_ui_.SetCurrentDevice(next.current_device.address.c_str(),
+                                          next.current_device.name.c_str());
+        } else {
+            settings_ui_.SetCurrentDevice(nullptr, nullptr);
+        }
     }
     if (next.nearby_devices != state_.nearby_devices) {
         RenderDevices(next);
@@ -57,12 +60,11 @@ void View::Render(const ViewState& next) {
 
 void View::RenderDevices(const ViewState& state) {
     settings_ui_.ClearDevices();
-    for (std::size_t index = 0; index < state.nearby_devices.size(); ++index) {
-        const Device& device = state.nearby_devices[index];
+    for (const Device& device : state.nearby_devices) {
         settings_ui_.AddDevice(
-            device.address.c_str(), device.name.c_str(), OnDevice,
-            reinterpret_cast<void*>(static_cast<uintptr_t>(index + 1)));
+            device.address.c_str(), device.name.c_str(), OnDevice, nullptr);
     }
+    settings_ui_.FinishDeviceUpdate();
 }
 
 void View::Reset() {
@@ -121,11 +123,11 @@ void View::OnCallProfile(lv_event_t* event) {
 void View::OnDevice(lv_event_t* event) {
     View* self = OwnerFromEvent(event);
     if (self == nullptr) return;
-    const std::size_t encoded = reinterpret_cast<uintptr_t>(
-        lv_event_get_user_data(event));
-    if (encoded == 0 || encoded > self->state_.nearby_devices.size()) return;
-    self->settings_ui_.SetConnectingDevice(encoded - 1);
-    self->Emit(Intent::Connect(encoded - 1));
+    const std::size_t index = self->settings_ui_.DeviceIndex(
+        lv_event_get_current_target_obj(event));
+    if (index >= self->state_.nearby_devices.size()) return;
+    self->settings_ui_.SetConnectingDevice(index);
+    self->Emit(Intent::Connect(index));
 }
 
 }  // namespace agent_ui::bluetooth

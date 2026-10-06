@@ -23,6 +23,9 @@ public:
 
     // Returns true only for a syntactically valid codex_notification event.
     // The caller retains ownership of root.
+    bool HandleMessage(const cJSON* root, uint32_t app_generation);
+    bool HandleMessage(const cJSON* root, uint32_t app_generation,
+                       uint32_t connection_generation, uint32_t connection_epoch);
     bool HandleMessage(const cJSON* root);
     void SetRecording(bool recording);
 

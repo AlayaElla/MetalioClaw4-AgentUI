@@ -1,6 +1,7 @@
 #include "bluetooth_settings_ui.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <font_awesome.h>
 
 #include "components/ui_components.h"
@@ -107,6 +108,8 @@ void View::Reset() {
     speaker_panel_ = nullptr;
     current_count_ = nullptr;
     current_list_ = nullptr;
+    current_row_ = nullptr;
+    current_title_ = nullptr;
     profile_buttons_[0] = nullptr;
     profile_buttons_[1] = nullptr;
     nearby_count_ = nullptr;
@@ -116,6 +119,13 @@ void View::Reset() {
     scan_label_ = nullptr;
     device_rows_.clear();
     device_actions_.clear();
+    device_titles_.clear();
+    all_device_rows_.clear();
+    all_device_actions_.clear();
+    all_device_titles_.clear();
+    device_addresses_.clear();
+    device_seen_.clear();
+    device_update_order_.clear();
     nearby_device_count_ = 0;
 }
 
@@ -209,61 +219,121 @@ void View::ClearConnectingDevice() {
 
 void View::ClearDevices() {
     nearby_device_count_ = 0;
-    device_rows_.clear();
-    device_actions_.clear();
+    device_update_order_.clear();
+    std::fill(device_seen_.begin(), device_seen_.end(), false);
     if (nearby_count_ != nullptr) {
         lv_label_set_text(nearby_count_, I18n::T("附近音响 · 0"));
     }
-    if (device_list_ == nullptr) return;
-    for (int32_t index =
-             static_cast<int32_t>(lv_obj_get_child_count(device_list_)) - 1;
-         index >= 0; --index) {
-        lv_obj_t* child = lv_obj_get_child(device_list_, index);
-        if (child != nullptr && child != nearby_spinner_) lv_obj_delete(child);
+}
+
+void View::FinishDeviceUpdate() {
+    for (std::size_t index = device_addresses_.size(); index > 0; --index) {
+        if (device_seen_[index - 1]) continue;
+        if (all_device_rows_[index - 1] != nullptr) lv_obj_delete(all_device_rows_[index - 1]);
+        device_addresses_.erase(device_addresses_.begin() + index - 1);
+        device_seen_.erase(device_seen_.begin() + index - 1);
+        // The all-row handles are maintained parallel to the address vectors.
+        all_device_rows_.erase(all_device_rows_.begin() + index - 1);
+        all_device_actions_.erase(all_device_actions_.begin() + index - 1);
+        all_device_titles_.erase(all_device_titles_.begin() + index - 1);
     }
+
+    std::vector<lv_obj_t*> ordered_rows;
+    std::vector<lv_obj_t*> ordered_actions;
+    std::vector<lv_obj_t*> ordered_titles;
+    ordered_rows.reserve(device_update_order_.size());
+    ordered_actions.reserve(device_update_order_.size());
+    ordered_titles.reserve(device_update_order_.size());
+    for (std::size_t index = 0; index < device_update_order_.size(); ++index) {
+        auto found = std::find(device_addresses_.begin(), device_addresses_.end(),
+                               device_update_order_[index]);
+        if (found == device_addresses_.end()) continue;
+        const std::size_t row_index = static_cast<std::size_t>(found - device_addresses_.begin());
+        lv_obj_t* row = all_device_rows_[row_index];
+        ordered_rows.push_back(row);
+        ordered_actions.push_back(all_device_actions_[row_index]);
+        ordered_titles.push_back(all_device_titles_[row_index]);
+        if (device_list_ != nullptr) lv_obj_move_to_index(row, index + 1);
+    }
+    device_rows_.swap(ordered_rows);
+    device_actions_.swap(ordered_actions);
+    device_titles_.swap(ordered_titles);
+    nearby_device_count_ = device_rows_.size();
+    if (nearby_count_ != nullptr) {
+        char count_text[64];
+        std::snprintf(count_text, sizeof(count_text), I18n::T("附近音响 · %u"),
+                      static_cast<unsigned>(nearby_device_count_));
+        ui::SetLabelTextIfChanged(nearby_count_, count_text);
+    }
+    if (nearby_spinner_ != nullptr &&
+        !lv_obj_has_flag(nearby_spinner_, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_move_foreground(nearby_spinner_);
+    }
+}
+
+std::size_t View::DeviceIndex(lv_obj_t* row) const {
+    const auto found = std::find(device_rows_.begin(), device_rows_.end(), row);
+    return found == device_rows_.end()
+               ? static_cast<std::size_t>(-1)
+               : static_cast<std::size_t>(found - device_rows_.begin());
 }
 
 void View::SetCurrentDevice(const char* address, const char* name) {
     if (current_list_ == nullptr) return;
-    lv_obj_clean(current_list_);
     const bool connected =
         (address != nullptr && address[0] != '\0') ||
         (name != nullptr && name[0] != '\0');
     if (current_count_ != nullptr) {
-        lv_label_set_text(current_count_, connected
-                                            ? I18n::T("当前连接设备 · 1")
-                                            : I18n::T("当前连接设备 · 0"));
+        ui::SetLabelTextIfChanged(current_count_, connected
+                                                       ? I18n::T("当前连接设备 · 1")
+                                                       : I18n::T("当前连接设备 · 0"));
     }
     if (!connected) {
         lv_obj_add_flag(current_list_, LV_OBJ_FLAG_HIDDEN);
         return;
     }
     lv_obj_remove_flag(current_list_, LV_OBJ_FLAG_HIDDEN);
-    ui::CreateCompactRow(
-        current_list_, FONT_AWESOME_BLUETOOTH,
-        name != nullptr && name[0] != '\0' ? name : address,
-        nullptr, I18n::T("当前"), 72, true, false);
+    const char* title = name != nullptr && name[0] != '\0' ? name : address;
+    if (current_row_ == nullptr) {
+        const auto row = ui::CreateCompactRow(
+            current_list_, FONT_AWESOME_BLUETOOTH, title, nullptr,
+            I18n::T("当前"), 72, true, false);
+        current_row_ = row.root;
+        current_title_ = row.title;
+    } else {
+        ui::SetLabelTextIfChanged(current_title_, title);
+    }
 }
 
 lv_obj_t* View::AddDevice(const char* address, const char* name,
                           lv_event_cb_t callback, void* user_data) {
     if (device_list_ == nullptr) return nullptr;
-    auto row = ui::CreateCompactRow(
-        device_list_, FONT_AWESOME_BLUETOOTH,
-        name != nullptr && name[0] != '\0' ? name : address,
-        nullptr,
-        I18n::T("连接"), 72, false, true, callback, user_data);
-    device_rows_.push_back(row.root);
-    device_actions_.push_back(row.trailing);
-    ++nearby_device_count_;
-    if (nearby_count_ != nullptr) {
-        char count_text[64];
-        std::snprintf(count_text, sizeof(count_text),
-                      I18n::T("附近音响 · %u"),
-                      static_cast<unsigned>(nearby_device_count_));
-        lv_label_set_text(nearby_count_, count_text);
+    const std::string key = address != nullptr ? address : "";
+    std::size_t index = device_addresses_.size();
+    if (!key.empty()) {
+        const auto found = std::find(device_addresses_.begin(), device_addresses_.end(), key);
+        if (found != device_addresses_.end()) index = static_cast<std::size_t>(found - device_addresses_.begin());
     }
-    return row.root;
+    if (index == device_addresses_.size()) {
+        auto row = ui::CreateCompactRow(
+            device_list_, FONT_AWESOME_BLUETOOTH,
+            name != nullptr && name[0] != '\0' ? name : address,
+            nullptr, I18n::T("连接"), 72, false, true, callback, user_data);
+        all_device_rows_.push_back(row.root);
+        all_device_actions_.push_back(row.trailing);
+        all_device_titles_.push_back(row.title);
+        device_addresses_.push_back(key.empty() ? "#" + std::to_string(device_addresses_.size()) : key);
+        device_seen_.push_back(true);
+        index = device_addresses_.size() - 1;
+    } else {
+        device_seen_[index] = true;
+        ui::SetLabelTextIfChanged(all_device_titles_[index],
+                                  name != nullptr && name[0] != '\0' ? name : address);
+        ui::SetLabelTextIfChanged(all_device_actions_[index], I18n::T("连接"));
+        lv_obj_remove_state(all_device_rows_[index], LV_STATE_DISABLED);
+    }
+    device_update_order_.push_back(device_addresses_[index]);
+    return all_device_rows_[index];
 }
 
 }  // namespace agent_ui::bluetooth_settings_ui

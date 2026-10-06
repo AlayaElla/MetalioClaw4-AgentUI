@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "lvgl.h"
 
 namespace agent_ui {
@@ -16,6 +18,7 @@ public:
     static void CompletePeripheralWake(bool ready);
     static bool IsActive();
     static bool IsScreenOff();
+    static uint32_t ScreenOffGeneration();
 };
 
 }  // namespace agent_ui

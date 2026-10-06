@@ -1,12 +1,12 @@
 #include "idle_power.h"
 
 #include <esp_log.h>
+#include <utility>
 
 #include "application.h"
 #include "board.h"
 #include "backlight.h"
 #include "settings.h"
-#include "apps/home/home_renderer.h"
 #include "apps/standby/standby_view.h"
 #include "core/navigation.h"
 #include "core/performance_manager.h"
@@ -31,6 +31,10 @@ void IdlePower::Initialize(Board& board) {
     timer_ = lv_timer_create(TimerCallback, 1000, this);
 }
 
+void IdlePower::SetHomeCallbacks(HomeCallbacks callbacks) {
+    home_callbacks_ = std::move(callbacks);
+}
+
 void IdlePower::NotifyActivity() {
     if (StandbyView::IsActive()) return;
     last_activity_tick_ = lv_tick_get();
@@ -38,12 +42,14 @@ void IdlePower::NotifyActivity() {
     if (micro_display_.active()) UpdateMicroBacklight();
     expression_sleep_triggered_ = false;
     PerformanceManager::Get().NotifyActivity();
-    home::Renderer::NotifyUserActivity();
+    if (home_callbacks_.notify_user_activity) {
+        home_callbacks_.notify_user_activity();
+    }
 }
 
 void IdlePower::RestoreExpressionSleep() {
     expression_sleep_triggered_ = true;
-    home::Renderer::SleepExpression();
+    if (home_callbacks_.sleep_expression) home_callbacks_.sleep_expression();
 }
 
 void IdlePower::SetStandbyActive(bool active) {
@@ -136,16 +142,34 @@ void IdlePower::Tick() {
     performance.SetDemand(PerformanceDemand::Camera, camera_busy);
     performance.Tick();
 
-    if (home::Renderer::IsMounted() &&
+    if (home_callbacks_.is_mounted && home_callbacks_.is_mounted() &&
         (last_battery_refresh_tick_ == 0 ||
          lv_tick_elaps(last_battery_refresh_tick_) >= kBatteryRefreshMs)) {
         last_battery_refresh_tick_ = now;
+        auto& board = Board::GetInstance();
+        BatterySnapshot battery{};
         int battery_level = 0;
         bool charging = false;
-        bool discharging = false;
-        const bool has_battery = Board::GetInstance().GetBatteryLevel(
-            battery_level, charging, discharging);
-        home::Renderer::UpdateBattery(has_battery, battery_level, charging);
+        bool has_battery = false;
+        if (board.SupportsCachedBatterySnapshot()) {
+            const bool has_snapshot = board.GetBatterySnapshot(battery);
+            has_battery = has_snapshot && battery.fresh;
+            if (has_battery) {
+                battery_level = battery.level;
+                charging = battery.charging;
+            } else if (battery.has_data) {
+                charging = battery.charging;
+            }
+        } else {
+            bool discharging = false;
+            has_battery = board.GetBatteryLevel(
+                battery_level, charging, discharging);
+        }
+        if (home_callbacks_.update_battery) {
+            home_callbacks_.update_battery(has_battery,
+                                           has_battery ? battery_level : 0,
+                                           charging);
+        }
     }
 
     for (lv_indev_t* indev = lv_indev_get_next(nullptr); indev != nullptr;
@@ -187,7 +211,9 @@ void IdlePower::Tick() {
         !expression_sleep_triggered_ &&
         Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
         expression_sleep_triggered_ = true;
-        home::Renderer::SleepExpression();
+        if (home_callbacks_.sleep_expression) {
+            home_callbacks_.sleep_expression();
+        }
         return;
     }
 }

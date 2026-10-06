@@ -9,6 +9,7 @@
 #include <mutex>
 
 #include "SdCardManager.hpp"
+#include "sd_local_access_gate.h"
 
 #include "driver/gpio.h"
 #include "esp_check.h"
@@ -56,6 +57,7 @@ std::atomic<bool> s_op_in_progress{false};
 std::atomic<bool> s_usb_switching{false};
 std::atomic<bool> s_inited{false};
 std::atomic<int> s_ui_hint{static_cast<int>(UsbVirtualDisk::UiHint::Idle)};
+SdLocalAccessGate s_sd_local_access_gate;
 
 std::mutex s_notify_mu;
 UsbVirtualDisk::UiNotifyFn s_ui_notify;
@@ -179,6 +181,14 @@ void SyncUiFromState() {
     }
     SyncSdCardManagerFlags();
     NotifyUi();
+}
+
+SdLocalAccessGate::State ReadSdLocalAccessState(void*) {
+    return {
+        .mounted = SdCardManager::GetInstance().IsMounted(),
+        .busy = s_op_in_progress.load(std::memory_order_acquire),
+        .exported = s_sd_to_usb.load(std::memory_order_acquire),
+    };
 }
 
 esp_err_t MountToApp() {
@@ -501,6 +511,10 @@ void UsbWorkerTask(void* /*arg*/) {
         SetHint(UsbVirtualDisk::UiHint::Switching);
         NotifyUi();
 
+        // Mark busy before taking the gate: new Files jobs are rejected, then
+        // this background worker waits for any already-leased FatFs operation
+        // to finish before mount ownership or the USB stack can change.
+        std::lock_guard<SdLocalAccessGate> sd_transition(s_sd_local_access_gate);
         switch (req) {
             case kReqEnableGadget:
                 SetHint(UsbVirtualDisk::UiHint::Enabling);
@@ -602,6 +616,14 @@ bool UsbVirtualDisk::IsBusy() const {
 
 bool UsbVirtualDisk::IsSdExportedToHost() const {
     return s_sd_to_usb.load(std::memory_order_relaxed);
+}
+
+bool UsbVirtualDisk::TryBeginSdLocalAccess() {
+    return s_sd_local_access_gate.TryBegin(&ReadSdLocalAccessState, nullptr);
+}
+
+void UsbVirtualDisk::EndSdLocalAccess() {
+    s_sd_local_access_gate.End();
 }
 
 UsbVirtualDisk::UiHint UsbVirtualDisk::GetUiHint() const {
@@ -711,6 +733,12 @@ bool UsbVirtualDisk::IsBusy() const {
 bool UsbVirtualDisk::IsSdExportedToHost() const {
     return false;
 }
+
+bool UsbVirtualDisk::TryBeginSdLocalAccess() {
+    return true;
+}
+
+void UsbVirtualDisk::EndSdLocalAccess() {}
 
 UsbVirtualDisk::UiHint UsbVirtualDisk::GetUiHint() const {
     return UiHint::Idle;

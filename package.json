@@ -1,0 +1,14 @@
+{
+  "name": "metalio-claw4-agent-ui",
+  "private": true,
+  "description": "Development tasks for the Metalio Claw4 firmware",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node scripts/run.cjs build",
+    "package": "node scripts/run.cjs package",
+    "flash": "node scripts/run.cjs flash",
+    "flash:preserve": "node scripts/run.cjs flash:preserve",
+    "monitor": "node scripts/run.cjs monitor",
+    "build:apps": "node scripts/run.cjs build:apps"
+  }
+}

@@ -21,9 +21,9 @@
 #include "agent_ui/apps/external_apps/external_apps_view.h"
 #include "agent_ui/apps/external_apps/external_app_manager.h"
 #include "agent_ui/apps/files/files_view.h"
+#include "agent_ui/apps/network/network_module.h"
 #include "agent_ui/apps/phone/phone_view.h"
 #include "agent_ui/apps/settings/settings_view.h"
-#include "agent_ui/apps/home/home_renderer.h"
 #include "ai/ai_availability.h"
 #include "ai/system_connectivity.h"
 #include "agent_ui/core/app_mcp_tools.h"
@@ -70,6 +70,14 @@ void Runtime::Initialize() {
     home_module_.Initialize(
         initial_message,
         [](ScreenId target) { Navigation::Get().Open(target); });
+    IdlePower::Get().SetHomeCallbacks({
+        .notify_user_activity = [this]() { home_module_.NotifyUserActivity(); },
+        .sleep_expression = [this]() { home_module_.SleepExpression(); },
+        .is_mounted = [this]() { return home_module_.IsMounted(); },
+        .update_battery = [this](bool has_battery, int level, bool charging) {
+            home_module_.UpdateBattery(has_battery, level, charging);
+        },
+    });
 
     Theme::Get().Initialize();
     Navigation::Get().Register(ScreenId::Home, CreateHomeView);
@@ -82,12 +90,19 @@ void Runtime::Initialize() {
                                external_apps::HostView::Create);
     Navigation::Get().Register(ScreenId::DisplayDebug, DisplayDebugView::Create);
     UiDispatcher::Init();
+    SettingsView::NetworkModule().SetConfigChangedCallback([]() {
+        StatusBar::Get().InvalidateNetworkModeCache();
+    });
     ai::system_connectivity::RegisterProviders();
     RegisterAppMcpTools();
     camera::RegisterAiProvider();
     StatusBar::Get().Initialize();
     StatusBar::Get().SetAgentTapCallback(
         []() { Runtime::Get().ToggleListeningFromStatusBar(); });
+    StatusBar::Get().SetBatteryUpdateCallback(
+        [this](bool has_battery, int level, bool charging) {
+            home_module_.UpdateBattery(has_battery, level, charging);
+        });
     StatusBar::Get().SetAgentState(home_module_.state().agent_state);
     StatusBar::Get().SetVisible(false);
     Keyboard::Get().Initialize();
@@ -205,7 +220,27 @@ void Runtime::SetSystemStatus(const char* status) {
 }
 
 void Runtime::PlayDizzyExpression() {
-    home::Renderer::PlayDizzy();
+    home_module_.PlayDizzy();
+}
+
+void Runtime::HoldHomeChargingExpression() {
+    home_module_.HoldChargingExpression();
+}
+
+void Runtime::HoldHomeDizzyExpression() {
+    home_module_.HoldDizzyExpression();
+}
+
+void Runtime::ReleaseHomeSpecialExpression() {
+    home_module_.ReleaseSpecialExpression();
+}
+
+bool Runtime::IsHomeScreen(lv_obj_t* screen) const {
+    return home_module_.OwnsScreen(screen);
+}
+
+void Runtime::SetHomeRenderingPaused(bool paused) {
+    home_module_.SetRenderingPaused(paused);
 }
 
 lv_obj_t* Runtime::CreateHomeView() {

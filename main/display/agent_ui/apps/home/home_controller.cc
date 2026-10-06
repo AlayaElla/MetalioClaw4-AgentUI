@@ -30,6 +30,12 @@ void Controller::HandleIntent(const Intent& intent) {
         return;
     }
 
+    if (intent.type == IntentType::PlayCarouselTick) {
+        command_sink_({.type = CommandType::PlayCarouselTick,
+                       .target = ScreenId::Home});
+        return;
+    }
+
     if (state_.agent_state == AgentState::Idle) {
         state_.agent_state = AgentState::Connecting;
         PublishState();

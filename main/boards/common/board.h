@@ -13,6 +13,7 @@
 #include "backlight.h"
 #include "camera.h"
 #include "assets.h"
+#include "battery_snapshot.h"
 
 /**
  * Network events for unified callback
@@ -91,6 +92,20 @@ public:
     virtual bool IsNetworkConnected() const;
     virtual const char* GetNetworkStateIcon() = 0;
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging);
+    // Copy the board's most recent coherent sample. Implementations must not
+    // perform hardware reads here; stale data is returned with fresh=false.
+    virtual bool GetBatterySnapshot(BatterySnapshot& snapshot) {
+        (void)snapshot;
+        return false;
+    }
+    virtual bool SupportsCachedBatterySnapshot() const { return false; }
+    // Called from the power-key background worker before standby rails move.
+    virtual bool PauseBatterySampling(uint32_t timeout_ms) {
+        (void)timeout_ms;
+        return true;
+    }
+    // Nonblocking; consumers may request a fresh sample after wake settling.
+    virtual void ResumeBatterySamplingSoon() {}
     virtual bool ReadBatteryPower(BatteryPowerReading& reading) {
         (void)reading;
         return false;

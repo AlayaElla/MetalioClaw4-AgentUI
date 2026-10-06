@@ -8,6 +8,8 @@
 
 #include <string>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <deque>
@@ -18,6 +20,8 @@
 #include "audio_service.h"
 #include "device_state_event.h"
 #include "codex_battery_reporter.h"
+#include "codex_ws_client.h"
+#include "ai/codex_capture_coordinator.h"
 #include "ai/ai_availability.h"
 
 
@@ -42,7 +46,7 @@ enum class SpecialInteraction {
     Dizzy,
 };
 
-class Application {
+class Application : private ai::CodexCaptureCoordinator::Port {
 public:
     static Application& GetInstance() {
         static Application instance;
@@ -67,16 +71,17 @@ public:
     void ToggleChatState();
     void StartListening();
     void StopListening();
-    void StartCodexVoiceCapture();
+    void StartCodexVoiceCapture(const CodexWsClient::SendContext& transport_context);
     void StopCodexVoiceCapture(std::function<void()> on_stopped = {});
     // Realtime capture uses the same 16 kHz / 60 ms encoder, but every
     // packet is envelope-bound to this request instead of the legacy binary
     // WebSocket path.
-    void StartCodexRealtimeCapture(const std::string& request_id);
+    void StartCodexRealtimeCapture(const std::string& request_id,
+                                   const CodexWsClient::SendContext& transport_context);
     // Pause only microphone uplink; playback and the request sequence survive
     // a half-duplex speaking/thinking transition.
     void StopCodexRealtimeCapture();
-    void EndCodexRealtimeSession();
+    void EndCodexRealtimeSession(std::function<void()> on_stopped = {});
     bool PushCodexRealtimeAudio(std::unique_ptr<AudioStreamPacket> packet);
     void ClearCodexRealtimeAudio();
     void Reboot();
@@ -105,7 +110,7 @@ public:
     void SetLowPowerStandby(bool enabled);
     bool IsLowPowerStandby() const { return low_power_standby_.load(); }
     bool IsCodexVoiceCaptureActive() const {
-        return codex_voice_capture_active_.load();
+        return codex_capture_coordinator_.IsCaptureActive();
     }
     bool IsCodexRealtimePlaybackActive() const {
         return codex_realtime_playback_active_.load();
@@ -124,24 +129,14 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+    ai::CodexCaptureCoordinator codex_capture_coordinator_;
     std::string pending_activation_code_;
     volatile bool activation_suspended_ = false;
-    bool codex_voice_start_pending_ = false;
-    int64_t codex_voice_start_wait_started_at_us_ = 0;
-    std::atomic<bool> codex_voice_capture_active_{false};
-    bool codex_voice_stop_pending_ = false;
-    int64_t codex_voice_stop_wait_started_at_us_ = 0;
-    bool codex_voice_restore_wake_word_ = false;
-    std::function<void()> codex_voice_stopped_callback_;
-    std::string codex_realtime_request_id_;
-    uint32_t codex_realtime_audio_sequence_ = 0;
     std::atomic<bool> codex_realtime_playback_active_{false};
-    bool codex_realtime_restore_wake_word_ = false;
     std::atomic<bool> low_power_standby_{false};
     bool standby_restore_wake_word_ = false;
     std::atomic<bool> ai_wake_enabled_{true};
     ai::Availability::Token standby_ai_block_ = 0;
-    ai::Availability::Token codex_voice_ai_block_ = 0;
     bool audio_initialized_ = false;
     std::atomic<bool> assistant_listen_pending_{false};
     void ApplyAiAvailability();
@@ -161,9 +156,34 @@ private:
     void SetListeningMode(ListeningMode mode);
     void FinishSpecialInteraction(bool restore_sleep);
     void CancelSpecialInteraction();
-    void TryStartCodexVoiceCapture();
-    void TryFinishCodexVoiceCapture();
-    void FailCodexVoiceCaptureTransport();
+
+    // CodexCaptureCoordinator ports. Coordinator state changes are driven on
+    // the main event loop; these methods adapt existing services and transport.
+    int64_t NowUs() const override;
+    bool IsStandby() const override;
+    bool IsDeviceIdle() const override;
+    bool IsAiAvailable() const override;
+    bool IsTransportCurrent(const ai::CodexCaptureCoordinator::TransportContext& context) const override;
+    bool IsWakeWordRunning() const override;
+    bool InterruptActiveSynth() override;
+    bool HasPendingSendAudio() const override;
+    void EnableWakeWordDetection(bool enabled) override;
+    void EnableVoiceProcessing(bool enabled) override;
+    void CancelPendingSendAudio() override;
+    uint64_t AcquireAiBlock() override;
+    void ReleaseAiBlock(uint64_t token) override;
+    void ClearRealtimePlayback() override;
+    void RequestReconnect(const ai::CodexCaptureCoordinator::TransportContext& context) override;
+    void PostToMain(std::function<void()> callback) override;
+    ai::CodexCaptureCoordinator::Admission QueueVoiceFrame(
+        const uint8_t* data, size_t size,
+        const ai::CodexCaptureCoordinator::TransportContext& context,
+        ai::CodexCaptureCoordinator::Port::SendCompletion completion) override;
+    ai::CodexCaptureCoordinator::Admission QueueRealtimeFrame(
+        const std::string& request_id, uint32_t sequence,
+        const uint8_t* data, size_t size,
+        const ai::CodexCaptureCoordinator::TransportContext& context,
+        ai::CodexCaptureCoordinator::Port::SendCompletion completion) override;
 };
 
 

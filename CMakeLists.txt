@@ -209,15 +209,17 @@ if(GIT_FOUND AND
    EXISTS "${ESP_VIDEO_SENSOR_FORMAT_PATCH}")
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" apply --check
+                --directory=managed_components/espressif__esp_video
                 "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-        WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         RESULT_VARIABLE ESP_VIDEO_PATCH_NEEDED
         OUTPUT_QUIET ERROR_QUIET)
     if(ESP_VIDEO_PATCH_NEEDED EQUAL 0)
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" apply
+                    --directory=managed_components/espressif__esp_video
                     "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-            WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             RESULT_VARIABLE ESP_VIDEO_PATCH_RESULT)
         if(NOT ESP_VIDEO_PATCH_RESULT EQUAL 0)
             message(FATAL_ERROR
@@ -226,8 +228,9 @@ if(GIT_FOUND AND
     else()
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+                    --directory=managed_components/espressif__esp_video
                     "${ESP_VIDEO_SENSOR_FORMAT_PATCH}"
-            WORKING_DIRECTORY "${ESP_VIDEO_DIR}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             RESULT_VARIABLE ESP_VIDEO_PATCH_ALREADY_APPLIED
             OUTPUT_QUIET ERROR_QUIET)
         if(NOT ESP_VIDEO_PATCH_ALREADY_APPLIED EQUAL 0)
@@ -246,15 +249,17 @@ if(GIT_FOUND AND
    EXISTS "${ESP_CAM_SENSOR_OV2710_720_PATCH}")
     execute_process(
         COMMAND "${GIT_EXECUTABLE}" apply --check
+                --directory=managed_components/espressif__esp_cam_sensor
                 "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-        WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_NEEDED
         OUTPUT_QUIET ERROR_QUIET)
     if(ESP_CAM_SENSOR_PATCH_NEEDED EQUAL 0)
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" apply
+                    --directory=managed_components/espressif__esp_cam_sensor
                     "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-            WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_RESULT)
         if(NOT ESP_CAM_SENSOR_PATCH_RESULT EQUAL 0)
             message(FATAL_ERROR
@@ -263,8 +268,9 @@ if(GIT_FOUND AND
     else()
         execute_process(
             COMMAND "${GIT_EXECUTABLE}" apply --reverse --check
+                    --directory=managed_components/espressif__esp_cam_sensor
                     "${ESP_CAM_SENSOR_OV2710_720_PATCH}"
-            WORKING_DIRECTORY "${ESP_CAM_SENSOR_DIR}"
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             RESULT_VARIABLE ESP_CAM_SENSOR_PATCH_ALREADY_APPLIED
             OUTPUT_QUIET ERROR_QUIET)
         if(NOT ESP_CAM_SENSOR_PATCH_ALREADY_APPLIED EQUAL 0)

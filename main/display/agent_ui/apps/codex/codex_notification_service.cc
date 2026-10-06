@@ -15,6 +15,7 @@
 #include "application.h"
 #include "assets/common_sounds.h"
 #include "cJSON.h"
+#include "codex_ws_client.h"
 #include "settings.h"
 
 namespace agent_ui::codex_notification {
@@ -130,6 +131,19 @@ void Service::EnsureLoaded() {
 }
 
 bool Service::HandleMessage(const cJSON* root) {
+    const auto& client = CodexWsClient::GetInstance();
+    return HandleMessage(root, client.GetAppSessionGeneration(),
+                         client.GetConnectionGeneration(), client.GetConnectionEpoch());
+}
+
+bool Service::HandleMessage(const cJSON* root, uint32_t app_generation) {
+    const auto& client = CodexWsClient::GetInstance();
+    return HandleMessage(root, app_generation, client.GetConnectionGeneration(),
+                         client.GetConnectionEpoch());
+}
+
+bool Service::HandleMessage(const cJSON* root, uint32_t app_generation,
+                            uint32_t connection_generation, uint32_t connection_epoch) {
     if (root == nullptr) return false;
     const auto* type = cJSON_GetObjectItemCaseSensitive(root, "type");
     const auto* id = cJSON_GetObjectItemCaseSensitive(root, "id");
@@ -138,13 +152,19 @@ bool Service::HandleMessage(const cJSON* root) {
     if (!cJSON_IsString(type) || std::string_view(type->valuestring) != "codex_notification" ||
         !cJSON_IsString(id) || id->valuestring == nullptr ||
         !cJSON_IsString(kind) || kind->valuestring == nullptr) return false;
-    const std::string event_id(id->valuestring);
-    if (event_id.empty() || event_id.size() > kMaxIdLength) return false;
+    const size_t id_length = strnlen(id->valuestring, kMaxIdLength + 1);
+    if (id_length == 0 || id_length > kMaxIdLength) return false;
+    const std::string event_id(id->valuestring, id_length);
     const std::string_view kind_name(kind->valuestring);
     if (kind_name != "attention" && kind_name != "success") return false;
     const auto event_kind = kind_name == "attention" ? Kind::Attention : Kind::Success;
-    Application::GetInstance().Schedule([event_id, event_kind,
+    Application::GetInstance().Schedule([event_id, event_kind, app_generation,
+        connection_generation, connection_epoch,
         is_historical = cJSON_IsTrue(historical)]() {
+        const auto& client = CodexWsClient::GetInstance();
+        if (!client.IsAppActive() || client.GetAppSessionGeneration() != app_generation ||
+            client.GetConnectionGeneration() != connection_generation ||
+            client.GetConnectionEpoch() != connection_epoch) return;
         Service::GetInstance().OnEvent(event_id, event_kind, is_historical);
     });
     return true;
@@ -256,6 +276,13 @@ void Service::Pump() {
 // cannot include the C++ service header. It only parses this bounded message
 // then queues the real work onto Application's main loop; it never plays or
 // waits for audio on the receive callback.
+extern "C" bool codex_remote_handle_notification_root(const cJSON* root, uint32_t app_generation,
+                                                       uint32_t connection_generation,
+                                                       uint32_t connection_epoch) {
+    return agent_ui::codex_notification::Get().HandleMessage(
+        root, app_generation, connection_generation, connection_epoch);
+}
+
 extern "C" void codex_remote_handle_notification_json(const char* json) {
     if (json == nullptr) return;
     constexpr size_t kMaxIncomingJsonBytes = 2048;
@@ -263,6 +290,9 @@ extern "C" void codex_remote_handle_notification_json(const char* json) {
     if (length == 0 || length > kMaxIncomingJsonBytes) return;
     cJSON* root = cJSON_ParseWithLength(json, length);
     if (root == nullptr) return;
-    agent_ui::codex_notification::Get().HandleMessage(root);
+    const auto& client = CodexWsClient::GetInstance();
+    agent_ui::codex_notification::Get().HandleMessage(
+        root, client.GetAppSessionGeneration(), client.GetConnectionGeneration(),
+        client.GetConnectionEpoch());
     cJSON_Delete(root);
 }

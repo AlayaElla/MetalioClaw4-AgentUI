@@ -6,6 +6,21 @@
 // 非 P4 / 未启用 MSC 时提供空实现，SD 页按钮会隐藏或提示不可用。
 class UsbVirtualDisk {
 public:
+    class SdLocalAccess {
+    public:
+        explicit SdLocalAccess(UsbVirtualDisk& disk);
+        ~SdLocalAccess();
+
+        SdLocalAccess(const SdLocalAccess&) = delete;
+        SdLocalAccess& operator=(const SdLocalAccess&) = delete;
+
+        bool acquired() const { return acquired_; }
+
+    private:
+        UsbVirtualDisk* disk_ = nullptr;
+        bool acquired_ = false;
+    };
+
     enum class UiHint {
         Idle,
         Switching,
@@ -51,4 +66,7 @@ public:
 
 private:
     UsbVirtualDisk() = default;
+    bool TryBeginSdLocalAccess();
+    void EndSdLocalAccess();
+    friend class SdLocalAccess;
 };

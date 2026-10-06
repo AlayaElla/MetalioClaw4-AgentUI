@@ -22,6 +22,18 @@ public:
     void Unmount() override;
 
     const ViewState& state() const { return controller_.state(); }
+    void NotifyUserActivity() { view_.NotifyUserActivity(); }
+    void SleepExpression() { view_.SleepExpression(); }
+    bool IsMounted() const { return view_.IsMounted(); }
+    void UpdateBattery(bool has_battery, int level, bool charging) {
+        view_.UpdateBattery(has_battery, level, charging);
+    }
+    void PlayDizzy() { view_.PlayDizzy(); }
+    void HoldChargingExpression() { view_.HoldChargingExpression(); }
+    void HoldDizzyExpression() { view_.HoldDizzyExpression(); }
+    void ReleaseSpecialExpression() { view_.ReleaseSpecialExpression(); }
+    bool OwnsScreen(lv_obj_t* screen) const { return view_.OwnsScreen(screen); }
+    void SetRenderingPaused(bool paused) { view_.SetRenderingPaused(paused); }
 
 private:
     void HandleCommand(const Command& command);

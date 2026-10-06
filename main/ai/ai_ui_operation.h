@@ -9,8 +9,15 @@ namespace ai {
 class UiOperations {
 public:
     using Step = std::function<OperationResult()>;
+    using CancellableCancel = std::function<bool()>;
+
     static OperationResult Submit(const InvokeRequest& request, Step step,
                                   std::function<void()> cancel = {});
+
+    // The callback must make its cancel-before-start decision atomically with
+    // the operation's start transition. Returning false leaves it pending.
+    static OperationResult SubmitWithCancellableCancel(
+        const InvokeRequest& request, Step step, CancellableCancel cancel);
     static OperationResult GetResult(const std::string& id);
     static bool Cancel(const std::string& id);
 };

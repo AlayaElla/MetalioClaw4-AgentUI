@@ -1,6 +1,7 @@
 #include "codex_conversation_ui.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <set>
 #include <utility>
@@ -10,6 +11,7 @@
 #include "core/fonts.h"
 #include "core/theme.h"
 #include "components/system_keyboard.h"
+#include "misc/cache/instance/lv_image_cache.h"
 
 namespace agent_ui {
 namespace {
@@ -30,6 +32,14 @@ void Text(lv_obj_t* parent, const std::string& text, bool muted = false) {
     lv_obj_set_style_text_font(label, fonts::Medium(), 0);
     lv_obj_set_style_text_color(label, lv_color_hex(muted ? Theme::Get().colors().muted : Theme::Get().colors().text), 0);
     lv_label_set_text(label, text.c_str());
+}
+bool SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
+    if (label != nullptr && text != nullptr &&
+        std::strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+        return true;
+    }
+    return false;
 }
 struct Callback { std::function<void(lv_event_t*)> function; lv_event_code_t code; };
 void OnEvent(lv_event_t* event) {
@@ -98,6 +108,7 @@ struct CodexConversationUi::Impl {
     std::string draft_status;
     std::function<void()> retry_draft;
     std::map<std::string, Row> rows;
+    std::vector<std::string> rendered_order;
     std::map<std::string, Draft> drafts;
     std::map<std::string, uint32_t> image_started;
     codex_media::Cache media;
@@ -105,6 +116,8 @@ struct CodexConversationUi::Impl {
     uint64_t sequence = 0;
     lv_timer_t* timer = nullptr;
     bool render_scheduled = false;
+    int32_t layout_width = -1;
+    int32_t layout_height = -1;
 
     Impl(lv_obj_t* parent, lv_obj_t* root, Send send, Markdown markdown)
         : parent(parent), root(root), send(std::move(send)), markdown(std::move(markdown)) {
@@ -147,7 +160,7 @@ struct CodexConversationUi::Impl {
         for (auto& item : drafts) if (!item.second.request_id.empty() && lv_tick_elaps(item.second.submitted_at) > 15000) {
             item.second.request_id.clear(); item.second.error = "尚未收到处理回执，可重试"; changed = true;
         }
-        if (changed) { Render(); RefreshImages(); }
+        if (changed) Render();
     }
     lv_obj_t* Bubble(Row& row, bool user) {
         row.object = lv_obj_create(parent);
@@ -200,22 +213,40 @@ struct CodexConversationUi::Impl {
         RequestImage(media_id, variant);
         return widget;
     }
-    void RefreshImage(ImageWidget& widget) {
+    bool RefreshImage(ImageWidget& widget) {
         auto entry = media.Get(widget.key);
         if (!entry || !entry->ready) {
-            lv_label_set_text(widget.label, !connected ? "已断开，重连后点击加载" : entry && !entry->error.empty() ? entry->error.c_str() : "正在加载图片…");
-            return;
+            return SetLabelTextIfChanged(
+                widget.label,
+                !connected ? "已断开，重连后点击加载"
+                                 : entry && !entry->error.empty()
+                                       ? entry->error.c_str()
+                                       : "正在加载图片…");
         }
-        if (widget.image) return;
+        if (widget.image) return false;
         auto* source = new ImageSource(entry->image);
         widget.image = lv_image_create(widget.button);
         lv_image_set_src(widget.image, &source->descriptor);
-        Bind(widget.image, LV_EVENT_DELETE, [source](lv_event_t*) { delete source; });
+        Bind(widget.image, LV_EVENT_DELETE, [source](lv_event_t*) {
+            // Stride/post-processing can make LVGL cache a decoded copy under
+            // the descriptor address. Drop it before that address is reused.
+            lv_image_cache_drop(&source->descriptor);
+            delete source;
+        });
         lv_obj_add_flag(widget.label, LV_OBJ_FLAG_HIDDEN);
+        return true;
     }
-    void RefreshImages() {
-        for (auto& row : rows) for (auto& image : row.second.images) RefreshImage(image);
-        for (auto& image : viewer_images) RefreshImage(image);
+    bool RefreshImages() {
+        bool changed = false;
+        for (auto& row : rows) {
+            for (auto& image : row.second.images) {
+                changed = RefreshImage(image) || changed;
+            }
+        }
+        for (auto& image : viewer_images) {
+            changed = RefreshImage(image) || changed;
+        }
+        return changed;
     }
     void CloseImage() { viewer_images.clear(); if (viewer) { lv_obj_delete(viewer); viewer = nullptr; } }
     void OpenImage(const std::string& id) {
@@ -252,7 +283,9 @@ struct CodexConversationUi::Impl {
             // Delete after LVGL finishes dispatching the close-button event.
             if (image_viewer) lv_obj_delete_async(image_viewer);
         });
-        lv_obj_move_foreground(viewer); RefreshImages();
+        lv_obj_move_foreground(viewer);
+        RefreshImages();
+        lv_obj_update_layout(viewer);
     }
     void Submit(const std::string& id, const std::string& decision = {}) {
         const auto* interaction = Find(id);
@@ -350,6 +383,9 @@ struct CodexConversationUi::Impl {
     void Render() {
         const bool bottom = lv_obj_get_scroll_bottom(parent) < 40;
         const int32_t scroll = lv_obj_get_scroll_y(parent);
+        const int32_t width = lv_obj_get_width(parent);
+        const int32_t height = lv_obj_get_height(parent);
+        bool layout_changed = width != layout_width || height != layout_height;
         std::vector<std::string> order;
         auto request = [&](const codex_menu::Interaction& value) {
             const auto key = "request:" + DraftKey(value.id);
@@ -357,6 +393,7 @@ struct CodexConversationUi::Impl {
             const auto signature = value.signature + draft.request_id + draft.error + (connected ? "1" : "0");
             auto& row = rows[key]; order.push_back(key);
             if (row.object && row.signature == signature) return;
+            layout_changed = true;
             if (row.object) lv_obj_delete(row.object);
             row = {}; row.signature = signature; Interaction(row, value);
         };
@@ -369,6 +406,7 @@ struct CodexConversationUi::Impl {
             for (const auto& part : value.content) signature += part.type + part.text + part.media_id;
             auto& row = rows[key]; order.push_back(key);
             if (!row.object || row.signature != signature) {
+                layout_changed = true;
                 if (row.object) lv_obj_delete(row.object);
                 row = {}; row.signature = signature;
                 lv_obj_t* bubble = Bubble(row, value.role == "user");
@@ -390,6 +428,7 @@ struct CodexConversationUi::Impl {
             const std::string signature = conversation.thread_id + placeholder + (retry_draft ? "1" : "0");
             auto& row = rows[key];
             if (!row.object || row.signature != signature) {
+                layout_changed = true;
                 if (row.object) lv_obj_delete(row.object);
                 row = {}; row.signature = signature;
                 auto* bubble = Bubble(row, false);
@@ -399,12 +438,27 @@ struct CodexConversationUi::Impl {
         }
         const std::set<std::string> wanted(order.begin(), order.end());
         for (auto it = rows.begin(); it != rows.end();) {
-            if (!wanted.count(it->first)) { lv_obj_delete(it->second.object); it = rows.erase(it); } else ++it;
+            if (!wanted.count(it->first)) {
+                layout_changed = true;
+                lv_obj_delete(it->second.object);
+                it = rows.erase(it);
+            } else ++it;
         }
-        for (size_t index = 0; index < order.size(); ++index) lv_obj_move_to_index(rows[order[index]].object, index);
-        lv_obj_update_layout(parent);
-        lv_obj_scroll_to_y(parent, bottom ? LV_COORD_MAX : scroll, LV_ANIM_OFF);
-        RefreshImages();
+        if (order != rendered_order) layout_changed = true;
+        // Media may complete independently of message signatures, so image
+        // state is checked on every render even when transcript layout is stable.
+        if (RefreshImages()) layout_changed = true;
+        if (layout_changed) {
+            for (size_t index = 0; index < order.size(); ++index) {
+                lv_obj_move_to_index(rows[order[index]].object, index);
+            }
+            lv_obj_update_layout(parent);
+            lv_obj_scroll_to_y(parent, bottom ? LV_COORD_MAX : scroll,
+                               LV_ANIM_OFF);
+            rendered_order = order;
+            layout_width = width;
+            layout_height = height;
+        }
     }
 };
 
@@ -417,7 +471,11 @@ void CodexConversationUi::Update(const codex_menu::Conversation& conversation, b
     if (impl_->conversation.thread_id != conversation.thread_id || impl_->conversation.host_id != conversation.host_id) {
         Keyboard::Get().Hide(); impl_->CloseImage(); impl_->media.CancelPending();
         for (auto& row : impl_->rows) lv_obj_delete(row.second.object);
-        impl_->rows.clear(); lv_obj_scroll_to_y(impl_->parent, 0, LV_ANIM_OFF);
+        impl_->rows.clear();
+        impl_->rendered_order.clear();
+        impl_->layout_width = -1;
+        impl_->layout_height = -1;
+        lv_obj_scroll_to_y(impl_->parent, 0, LV_ANIM_OFF);
     }
     impl_->conversation = conversation; impl_->connected = connected;
     if (impl_->conversation.messages.size() > 10) {
@@ -435,8 +493,22 @@ void CodexConversationUi::Update(const codex_menu::Conversation& conversation, b
     impl_->Render();
 }
 bool CodexConversationUi::HandleMessage(const std::string& json) {
-    if (impl_->media.Receive(json)) { impl_->RefreshImages(); return true; }
-    cJSON* root = cJSON_Parse(json.c_str()); if (!root) return false;
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(json.c_str()), cJSON_Delete);
+    return HandleMessage(root.get());
+}
+bool CodexConversationUi::HandleMessage(const cJSON* root) {
+    if (impl_->media.Receive(root)) {
+        const bool bottom = lv_obj_get_scroll_bottom(impl_->parent) < 40;
+        const int32_t scroll = lv_obj_get_scroll_y(impl_->parent);
+        if (impl_->RefreshImages()) {
+            lv_obj_update_layout(impl_->parent);
+            lv_obj_scroll_to_y(impl_->parent, bottom ? LV_COORD_MAX : scroll,
+                               LV_ANIM_OFF);
+            if (impl_->viewer != nullptr) lv_obj_update_layout(impl_->viewer);
+        }
+        return true;
+    }
+    if (!root) return false;
     const bool matched = String(root, "type") == "codex_interaction_result" && String(root, "host_id") == impl_->conversation.host_id &&
         String(root, "thread_id") == impl_->conversation.thread_id;
     if (matched) {
@@ -447,7 +519,7 @@ bool CodexConversationUi::HandleMessage(const std::string& json) {
             impl_->Render();
         }
     }
-    cJSON_Delete(root); return matched;
+    return matched;
 }
 void CodexConversationUi::Disconnected() { impl_->connected = false; impl_->media.CancelPending(); impl_->Render(); }
 }  // namespace agent_ui

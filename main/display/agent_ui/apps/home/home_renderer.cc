@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <string>
 #include <string_view>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include <esp_timer.h>
+#include <esp_log.h>
 #include <font_awesome.h>
 #include <wifi_station.h>
 
@@ -19,6 +21,7 @@
 #include "components/expression_player.h"
 #include "components/haptic_feedback.h"
 #include "components/ui_components.h"
+#include "home_render_cache.h"
 #include "external_app_manager.h"
 #include "core/fonts.h"
 #include "core/idle_power.h"
@@ -72,6 +75,7 @@ constexpr float kParallaxResponseMs = 130.0f;
 constexpr float kCarouselParallaxPixels = 8.0f;
 constexpr float kMessageParallaxPixels = 18.0f;
 constexpr float kExpressionParallaxPixels = 32.0f;
+constexpr int kParallaxTelemetryPeriodMs = 3000;
 static_assert(kCarouselParallaxPixels < kMessageParallaxPixels &&
                   kMessageParallaxPixels < kExpressionParallaxPixels,
               "Home parallax layers must increase from carousel to expression");
@@ -258,7 +262,7 @@ struct HomeState {
     lv_obj_t* carousel_cache = nullptr;
     lv_obj_t* left_fade = nullptr;
     lv_obj_t* right_fade = nullptr;
-    lv_draw_buf_t* carousel_snapshot = nullptr;
+    CarouselRenderCache carousel_snapshot;
     lv_draw_buf_t* left_fade_mask = nullptr;
     lv_draw_buf_t* right_fade_mask = nullptr;
     std::vector<AppDefinition> app_definitions;
@@ -278,6 +282,11 @@ struct HomeState {
     float parallax_x = 0.0f;
     float parallax_y = 0.0f;
     int64_t parallax_last_us = 0;
+    int64_t parallax_telemetry_last_us = 0;
+    uint32_t parallax_changed_layers = 0;
+    uint32_t parallax_changed_frames = 0;
+    uint64_t parallax_invalidated_bound_pixels = 0;
+    uint32_t parallax_max_update_us = 0;
     RendererActions actions;
     std::string rendered_message;
     int focused_index = 0;
@@ -301,6 +310,7 @@ struct HomeState {
     uint32_t charging_candidate_since_tick = 0;
     bool conversation_active = false;
     bool standby = false;
+    bool rendering_paused = false;
     ScreenId pending_screen = ScreenId::Home;
 };
 
@@ -309,6 +319,7 @@ int s_saved_focused_index = 0;
 
 void DeleteMotionTimer(HomeState* state);
 void DeleteParallaxTimer(HomeState* state);
+void CacheSettledCarousel(HomeState* state);
 
 ParallaxLayer* FindParallaxLayer(lv_obj_t* object) {
     if (s_state == nullptr || object == nullptr) return nullptr;
@@ -481,7 +492,7 @@ void SetCarouselRenderingHidden(HomeState* state, bool hidden) {
     }
 
     if (!hidden) {
-        if (state->carousel_snapshot != nullptr &&
+        if (state->carousel_snapshot.valid() &&
             state->carousel_cache != nullptr) {
             lv_obj_remove_flag(state->carousel_cache, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_opa(state->carousel, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -500,6 +511,7 @@ void FinishConversationLayout(lv_timer_t* timer) {
     if (state->conversation_active) {
         SetCarouselRenderingHidden(state, true);
     } else {
+        CacheSettledCarousel(state);
         SetCarouselInteractive(state, true);
     }
 }
@@ -556,6 +568,14 @@ void AnimateHomeChrome(HomeState* state, bool visible) {
                       visible ? 0 : kStandbyBottomOffset);
 }
 
+void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
+    if (label == nullptr || text == nullptr) return;
+    const char* current = lv_label_get_text(label);
+    if (current == nullptr || std::strcmp(current, text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
 void UpdateStandbyClock(HomeState* state) {
     if (state == nullptr || state->standby_time == nullptr ||
         state->standby_date == nullptr) {
@@ -564,20 +584,20 @@ void UpdateStandbyClock(HomeState* state) {
     const time_t now = std::time(nullptr);
     struct tm local = {};
     if (localtime_r(&now, &local) == nullptr || local.tm_year < 125) {
-        lv_label_set_text(state->standby_time, "00:00");
-        lv_label_set_text(state->standby_date, "--月--日");
+        SetLabelTextIfChanged(state->standby_time, "00:00");
+        SetLabelTextIfChanged(state->standby_date, "--月--日");
         return;
     }
     char time_text[16];
     std::strftime(time_text, sizeof(time_text), "%H:%M", &local);
-    lv_label_set_text(state->standby_time, time_text);
+    SetLabelTextIfChanged(state->standby_time, time_text);
     static constexpr const char* kWeekdays[] = {
         "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六",
     };
     char date_text[32];
     std::snprintf(date_text, sizeof(date_text), "%d月%d日 %s", local.tm_mon + 1,
                   local.tm_mday, kWeekdays[local.tm_wday]);
-    lv_label_set_text(state->standby_date, date_text);
+    SetLabelTextIfChanged(state->standby_date, date_text);
 }
 
 void OnStandbyClock(lv_timer_t* timer) {
@@ -711,21 +731,16 @@ void CacheSettledCarousel(HomeState* state) {
     }
 #if CONFIG_LV_USE_SNAPSHOT
     ShowLiveCarousel(state);
-    lv_obj_update_layout(state->carousel);
-    lv_draw_buf_t* snapshot =
-        lv_snapshot_take(state->carousel, LV_COLOR_FORMAT_RGB565);
-    if (snapshot == nullptr) return;
-
-    lv_image_set_src(state->carousel_cache, nullptr);
-    if (state->carousel_snapshot != nullptr) {
-        lv_image_cache_drop(state->carousel_snapshot);
-        lv_draw_buf_destroy(state->carousel_snapshot);
+    if (!state->carousel_snapshot.Capture(state->carousel,
+                                          state->carousel_cache)) {
+        // Never reuse a prior snapshot after its source content may have
+        // changed; keep the live carousel as the safe software fallback.
+        state->carousel_snapshot.Release();
+        return;
     }
-    state->carousel_snapshot = snapshot;
-    lv_image_set_src(state->carousel_cache, state->carousel_snapshot);
     lv_obj_remove_flag(state->carousel_cache, LV_OBJ_FLAG_HIDDEN);
     // Keep the real carousel interactive, but skip its children in the idle
-    // draw path. It is restored as soon as a new gesture begins.
+    // draw path. Edge fades remain separate, preserving their current mask.
     lv_obj_set_style_opa(state->carousel, LV_OPA_TRANSP, LV_PART_MAIN);
 #endif
 }
@@ -853,15 +868,24 @@ void DeleteMotionTimer(HomeState* state) {
     lv_timer_delete(timer);
 }
 
-void ApplyParallaxLayer(ParallaxLayer* layer, int target_x, int target_y,
-                        bool include_hidden) {
+uint64_t ClippedAreaPixels(const lv_area_t& area) {
+    const int32_t x1 = std::max<int32_t>(0, area.x1);
+    const int32_t y1 = std::max<int32_t>(0, area.y1);
+    const int32_t x2 = std::min<int32_t>(metrics::kDisplaySize - 1, area.x2);
+    const int32_t y2 = std::min<int32_t>(metrics::kDisplaySize - 1, area.y2);
+    if (x2 < x1 || y2 < y1) return 0;
+    return static_cast<uint64_t>(x2 - x1 + 1) * (y2 - y1 + 1);
+}
+
+bool ApplyParallaxLayer(ParallaxLayer* layer, int target_x, int target_y,
+                        bool include_hidden, uint64_t* invalidated_bound_pixels) {
     if (layer == nullptr || layer->object == nullptr ||
         !lv_obj_is_valid(layer->object)) {
-        return;
+        return false;
     }
     if (!include_hidden &&
         lv_obj_has_flag(layer->object, LV_OBJ_FLAG_HIDDEN)) {
-        return;
+        return false;
     }
 
     // The style translation is also used by the Home conversation/standby
@@ -878,38 +902,59 @@ void ApplyParallaxLayer(ParallaxLayer* layer, int target_x, int target_y,
             lv_obj_get_style_translate_x(layer->object, LV_PART_MAIN) ||
         base_y + target_y !=
             lv_obj_get_style_translate_y(layer->object, LV_PART_MAIN)) {
+        lv_area_t old_area{};
+        lv_obj_get_coords(layer->object, &old_area);
         lv_obj_set_style_translate_x(layer->object, base_x + target_x,
                                       LV_PART_MAIN);
         lv_obj_set_style_translate_y(layer->object, base_y + target_y,
                                       LV_PART_MAIN);
+        lv_area_t new_area{};
+        lv_obj_get_coords(layer->object, &new_area);
+        if (invalidated_bound_pixels != nullptr) {
+            *invalidated_bound_pixels += ClippedAreaPixels(old_area) +
+                                         ClippedAreaPixels(new_area);
+        }
+        layer->last_x = target_x;
+        layer->last_y = target_y;
+        return true;
     }
     layer->last_x = target_x;
     layer->last_y = target_y;
+    return false;
 }
 
 void ApplyParallaxOffsets(HomeState* state, float x, float y,
                           bool include_hidden) {
     if (state == nullptr) return;
-    ApplyParallaxLayer(
+    uint32_t changed_layers = 0;
+    uint64_t invalidated_bound_pixels = 0;
+    changed_layers += ApplyParallaxLayer(
         &state->expression_parallax,
         static_cast<int>(std::lround(x * kExpressionParallaxPixels)),
         static_cast<int>(std::lround(y * kExpressionParallaxPixels)),
-        include_hidden);
+        include_hidden, &invalidated_bound_pixels);
     const int message_x =
         static_cast<int>(std::lround(x * kMessageParallaxPixels));
     const int message_y =
         static_cast<int>(std::lround(y * kMessageParallaxPixels));
-    ApplyParallaxLayer(&state->message_parallax, message_x, message_y,
-                       include_hidden);
-    ApplyParallaxLayer(&state->editorial_parallax, message_x, message_y,
-                       include_hidden);
+    changed_layers += ApplyParallaxLayer(&state->message_parallax, message_x,
+                                         message_y, include_hidden,
+                                         &invalidated_bound_pixels);
+    changed_layers += ApplyParallaxLayer(&state->editorial_parallax, message_x,
+                                         message_y, include_hidden,
+                                         &invalidated_bound_pixels);
     const int carousel_x =
         static_cast<int>(std::lround(x * kCarouselParallaxPixels));
     const int carousel_y =
         static_cast<int>(std::lround(y * kCarouselParallaxPixels));
     for (ParallaxLayer& layer : state->carousel_parallax) {
-        ApplyParallaxLayer(&layer, carousel_x, carousel_y, include_hidden);
+        changed_layers += ApplyParallaxLayer(
+            &layer, carousel_x, carousel_y, include_hidden,
+            &invalidated_bound_pixels);
     }
+    state->parallax_changed_layers += changed_layers;
+    state->parallax_changed_frames += changed_layers != 0;
+    state->parallax_invalidated_bound_pixels += invalidated_bound_pixels;
 }
 
 void ResetParallax(HomeState* state) {
@@ -959,7 +1004,27 @@ void OnParallaxTimer(lv_timer_t* timer) {
         ApproachParallax(state->parallax_x, target_x, elapsed_ms);
     state->parallax_y =
         ApproachParallax(state->parallax_y, target_y, elapsed_ms);
+    const int64_t update_start_us = esp_timer_get_time();
     ApplyParallaxOffsets(state, state->parallax_x, state->parallax_y, false);
+    const uint32_t update_us = static_cast<uint32_t>(std::max<int64_t>(
+        0, esp_timer_get_time() - update_start_us));
+    state->parallax_max_update_us =
+        std::max(state->parallax_max_update_us, update_us);
+    const int64_t telemetry_now_us = esp_timer_get_time();
+    if (telemetry_now_us - state->parallax_telemetry_last_us >=
+        kParallaxTelemetryPeriodMs * 1000LL) {
+        ESP_LOGI("HomeParallax",
+                 "3s changed_frames=%u changed_layers=%u clipped_old_new_bound_px=%llu max_update_us=%u",
+                 state->parallax_changed_frames, state->parallax_changed_layers,
+                 static_cast<unsigned long long>(
+                     state->parallax_invalidated_bound_pixels),
+                 state->parallax_max_update_us);
+        state->parallax_telemetry_last_us = telemetry_now_us;
+        state->parallax_changed_frames = 0;
+        state->parallax_changed_layers = 0;
+        state->parallax_invalidated_bound_pixels = 0;
+        state->parallax_max_update_us = 0;
+    }
 }
 
 void StartParallaxTimer(HomeState* state) {
@@ -968,6 +1033,11 @@ void StartParallaxTimer(HomeState* state) {
         return;
     }
     state->parallax_last_us = esp_timer_get_time();
+    state->parallax_telemetry_last_us = state->parallax_last_us;
+    state->parallax_changed_layers = 0;
+    state->parallax_changed_frames = 0;
+    state->parallax_invalidated_bound_pixels = 0;
+    state->parallax_max_update_us = 0;
     state->parallax_timer =
         lv_timer_create(OnParallaxTimer, kParallaxPeriodMs, state);
 }
@@ -1246,14 +1316,7 @@ void OnDelete(lv_event_t* event) {
         state->standby_hide_timer = nullptr;
     }
     if (state->actions.unmounted) state->actions.unmounted();
-    if (state->carousel_cache != nullptr) {
-        lv_image_set_src(state->carousel_cache, nullptr);
-    }
-    if (state->carousel_snapshot != nullptr) {
-        lv_image_cache_drop(state->carousel_snapshot);
-        lv_draw_buf_destroy(state->carousel_snapshot);
-        state->carousel_snapshot = nullptr;
-    }
+    state->carousel_snapshot.Release();
     if (state->left_fade != nullptr && state->left_fade_mask != nullptr) {
         lv_image_set_src(state->left_fade, nullptr);
     }
@@ -1570,6 +1633,8 @@ void Renderer::EnterStandby() {
     DeleteMotionTimer(s_state);
     DeleteParallaxTimer(s_state);
     ResetParallax(s_state);
+    s_state->carousel_snapshot.Release();
+    ShowLiveCarousel(s_state);
     DeleteMessageTimer(s_state);
     SetCarouselInteractive(s_state, false);
     s_state->expression->ClearLookAt();
@@ -1612,16 +1677,24 @@ void Renderer::ExitStandby(WakeCompletedCallback callback, void* user_data) {
 
 void Renderer::SetRenderingPaused(bool paused) {
     if (s_state == nullptr || s_state->expression == nullptr) return;
+    if (s_state->rendering_paused == paused) return;
+    s_state->rendering_paused = paused;
     s_state->expression->SetRenderingPaused(paused);
     if (paused) {
         DeleteParallaxTimer(s_state);
         ResetParallax(s_state);
         DeleteStandbyClockTimer(s_state);
+        s_state->carousel_snapshot.Release();
+        ShowLiveCarousel(s_state);
     } else {
         if (s_state->standby) {
             StartStandbyClockTimer(s_state);
         } else {
             StartParallaxTimer(s_state);
+            if (!s_state->conversation_active && s_state->carousel != nullptr &&
+                !lv_obj_has_flag(s_state->carousel, LV_OBJ_FLAG_HIDDEN)) {
+                CacheSettledCarousel(s_state);
+            }
         }
     }
 }

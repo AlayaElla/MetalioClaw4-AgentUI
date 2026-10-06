@@ -5,6 +5,7 @@
 #include <font_awesome.h>
 #include "core/fonts.h"
 #include "core/theme.h"
+#include "codex_menu_render_cache.h"
 
 namespace agent_ui::codex_menu_ui {
 namespace {
@@ -69,6 +70,7 @@ Parts Build(lv_obj_t* root, const Callbacks& callbacks) {
     lv_obj_set_style_margin_top(realtime.root, 16, LV_PART_MAIN);
     p.realtime = realtime.root;
     auto* list = controls::CreateContentPanel(tasks, LV_SIZE_CONTENT, 14);
+    p.task_list = list;
     lv_obj_set_style_margin_top(list, 16, LV_PART_MAIN);
     for (int i = 0; i < 6; ++i) {
         char heading[24];
@@ -189,7 +191,17 @@ Parts Build(lv_obj_t* root, const Callbacks& callbacks) {
     for (int i = 0; i < 3; ++i) p.tabs[i] = controls::AddDrawerTab(p.tab_bar, icons[i], labels[i],
         callbacks.tab, reinterpret_cast<void*>(static_cast<uintptr_t>(i))).root;
     SelectTab(p, 0);
+    codex_menu_render_cache::Attach(p.task_list, p.panels[0], p.overlay,
+        {p.tasks[0].root, p.tasks[1].root, p.tasks[2].root,
+         p.tasks[3].root, p.tasks[4].root, p.tasks[5].root});
     return p;
+}
+
+void SetVisible(Parts& p, bool visible) {
+    if (p.overlay == nullptr) return;
+    if (visible) lv_obj_remove_flag(p.overlay, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(p.overlay, LV_OBJ_FLAG_HIDDEN);
+    codex_menu_render_cache::SetVisible(p.task_list, visible);
 }
 
 void SelectTab(Parts& p, int index) {
@@ -203,12 +215,20 @@ void SelectTab(Parts& p, int index) {
     p.selected_tab = index;
     lv_obj_update_layout(p.content);
     if (lv_obj_get_scroll_y(p.content) != 0) lv_obj_scroll_to_y(p.content, 0, LV_ANIM_OFF);
+    codex_menu_render_cache::Invalidate(p.task_list);
 }
 namespace {
 std::string RefreshKey(const codex_menu::State& state, int tab, bool pending, bool voice_busy) {
     std::string key;
     const auto add = [&](const std::string& value) { key += std::to_string(value.size()) + ":" + value; };
     const auto number = [&](int value) { add(std::to_string(value)); };
+    const auto& colors = Theme::Get().colors();
+    number(static_cast<int>(colors.background)); number(static_cast<int>(colors.surface));
+    number(static_cast<int>(colors.raised)); number(static_cast<int>(colors.border));
+    number(static_cast<int>(colors.text)); number(static_cast<int>(colors.muted));
+    number(static_cast<int>(colors.accent)); number(static_cast<int>(colors.accent_pressed));
+    number(static_cast<int>(colors.accent_ink)); number(static_cast<int>(colors.danger));
+    number(static_cast<int>(colors.warning));
     number(pending); number(voice_busy); number(state.connected); number(state.selected_slot);
     if (tab == 0) {
         number(state.can_new_task); number(state.can_select_task);
@@ -250,6 +270,17 @@ void Refresh(Parts& p, const codex_menu::State& state, bool pending, bool voice_
             if (p.tasks[i].root == nullptr) continue;
             const auto& slot = state.slots[i];
             const bool selected = state.selected_slot == i;
+            std::string row_key;
+            const auto add_row = [&](const std::string& value) { row_key += std::to_string(value.size()) + ":" + value; };
+            const auto add_row_num = [&](int value) { add_row(std::to_string(value)); };
+            add_row(slot.title); add_row_num(static_cast<int>(slot.state));
+            add_row_num(codex_menu::IsBound(slot)); add_row_num(selected); add_row_num(pending);
+            add_row_num(state.can_select_task); add_row_num(voice_busy);
+            for (const auto color : {colors.background, colors.surface, colors.raised, colors.border,
+                                     colors.text, colors.muted, colors.accent, colors.accent_pressed,
+                                     colors.accent_ink, colors.danger, colors.warning}) add_row_num(static_cast<int>(color));
+            if (p.rendered_task_rows[i] == row_key) continue;
+            p.rendered_task_rows[i] = std::move(row_key);
             controls::StyleSettingsCard(p.tasks[i].root, selected, false);
             if (!state.can_select_task || pending || voice_busy || !codex_menu::IsBound(slot)) lv_obj_add_state(p.tasks[i].root, LV_STATE_DISABLED);
             else lv_obj_remove_state(p.tasks[i].root, LV_STATE_DISABLED);
@@ -263,6 +294,7 @@ void Refresh(Parts& p, const codex_menu::State& state, bool pending, bool voice_
             lv_obj_set_style_bg_color(card.dot, lv_color_hex(color), LV_PART_MAIN);
             if (selected) lv_obj_remove_flag(card.check, LV_OBJ_FLAG_HIDDEN);
             else lv_obj_add_flag(card.check, LV_OBJ_FLAG_HIDDEN);
+            codex_menu_render_cache::InvalidateRow(p.task_list, i);
         }
         return;
     }
@@ -337,8 +369,9 @@ void SetConnectionStatus(Parts& p, bool connected, const char* text) {
     }
     if (p.connection_status_dot) {
         const auto& colors = Theme::Get().colors();
-        lv_obj_set_style_bg_color(p.connection_status_dot,
-            lv_color_hex(connected ? colors.accent : colors.danger), LV_PART_MAIN);
+        const lv_color_t desired = lv_color_hex(connected ? colors.accent : colors.danger);
+        if (lv_color_to_u32(lv_obj_get_style_bg_color(p.connection_status_dot, LV_PART_MAIN)) != lv_color_to_u32(desired))
+            lv_obj_set_style_bg_color(p.connection_status_dot, desired, LV_PART_MAIN);
     }
 }
 

@@ -17,6 +17,7 @@
 #include "ai/ai_availability.h"
 #include "ai/ai_ui_operation.h"
 #include "application.h"
+#include "apps/files/files_io_worker.h"
 #include "audio_codec.h"
 #include "backlight.h"
 #include "board.h"
@@ -124,29 +125,153 @@ ai::OperationResult InvokeFiles(const ai::InvokeRequest& request) {
     if (!sd.IsMounted()) return Error("SD storage unavailable");
     if (disk.IsSdExportedToHost() || disk.IsBusy()) return Error("SD storage is in use by USB");
     if (action == "delete") {
-        return ai::UiOperations::Submit(request, [path] {
-            return FilesView::DeletePath(path.c_str()) ? Done("{\"deleted\":true}") : Error("delete failed or storage is busy");
-        });
+        // Create the ticket before exposing cancellation to the caller. The
+        // ticket's NotAdmitted -> Cancelled / Queued -> Started transitions
+        // arbitrate cancellation against the worker's first filesystem call.
+        auto ticket = files_io_worker::CreateTicket();
+        return ai::UiOperations::SubmitWithCancellableCancel(
+            request,
+            [path, ticket, submitted = false]() mutable {
+                if (ticket->phase() == files_io_worker::Ticket::Phase::Cancelled) {
+                    ai::OperationResult cancelled;
+                    cancelled.status = ai::OperationStatus::Cancelled;
+                    return cancelled;
+                }
+                if (!submitted) {
+                    auto& current_sd = SdCardManager::GetInstance();
+                    auto& current_disk = UsbVirtualDisk::GetInstance();
+                    if (!current_sd.IsMounted() || current_disk.IsSdExportedToHost() ||
+                        current_disk.IsBusy()) {
+                        return Error("SD storage is in use by USB or unavailable");
+                    }
+                    if (!FilesView::RequestDeletePath(path.c_str(), ticket)) {
+                        return Error("delete could not be queued");
+                    }
+                    submitted = true;
+                }
+                if (!ticket->IsDone()) {
+                    ai::OperationResult pending;
+                    pending.status = ai::OperationStatus::Pending;
+                    return pending;
+                }
+                FilesView::ApplyPendingIoResults();
+                return ticket->Succeeded()
+                    ? Done("{\"deleted\":true}")
+                    : Error("delete failed or storage is busy");
+            },
+            [ticket] { return ticket->CancelBeforeStart(); });
     }
     if (action == "preview") {
-        return ai::UiOperations::Submit(request, [path, opened = false]() mutable {
-            if (!opened) {
-                Navigation::Get().Open(ScreenId::Files);
-                opened = true;
+        auto ticket = files_io_worker::CreateTicket();
+        return ai::UiOperations::SubmitWithCancellableCancel(
+            request,
+            [path, ticket, requested = false]() mutable {
+                if (ticket->phase() == files_io_worker::Ticket::Phase::Cancelled) {
+                    ai::OperationResult cancelled;
+                    cancelled.status = ai::OperationStatus::Cancelled;
+                    return cancelled;
+                }
+                if (!requested) {
+                    auto& current_sd = SdCardManager::GetInstance();
+                    auto& current_disk = UsbVirtualDisk::GetInstance();
+                    if (!current_sd.IsMounted() || current_disk.IsSdExportedToHost() ||
+                        current_disk.IsBusy()) {
+                        return Error("SD storage is in use by USB or unavailable");
+                    }
+                    Navigation::Get().Open(ScreenId::Files);
+                    if (!FilesView::PreviewPath(path.c_str(), ticket))
+                        return Error("file is not previewable or storage is busy");
+                    requested = true;
+                }
+                if (!ticket->IsDone()) {
+                    ai::OperationResult pending;
+                    pending.status = ai::OperationStatus::Pending;
+                    return pending;
+                }
+                FilesView::ApplyPendingIoResults();
+                return ticket->Succeeded() && FilesView::IsPreviewFor(path.c_str())
+                    ? Done("{\"previewing\":true}")
+                    : Error("file preview failed or was closed");
+            },
+            [ticket] { return ticket->CancelBeforeStart(); });
+    }
+    if (action == "read") {
+        UsbVirtualDisk::SdLocalAccess access(disk);
+        if (!access.acquired() || !sd.IsMounted() || disk.IsSdExportedToHost() ||
+            disk.IsBusy()) return Error("SD storage is in use by USB");
+        FILE* file = fopen(path.c_str(), "rb");
+        if (!file) return Error("file cannot be opened");
+        char buffer[1025] = {};
+        fread(buffer, 1, 1024, file);
+        fclose(file);
+        cJSON* o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "content", buffer);
+        return {.status=ai::OperationStatus::Succeeded, .result_json=[](cJSON* x){char* p=cJSON_PrintUnformatted(x);std::string s=p?p:"{}";cJSON_free(p);cJSON_Delete(x);return s;}(o)};
+    }
+    if (action == "list") {
+        UsbVirtualDisk::SdLocalAccess access(disk);
+        if (!access.acquired() || !sd.IsMounted() || disk.IsSdExportedToHost() ||
+            disk.IsBusy()) return Error("SD storage is in use by USB");
+        DIR* dir = opendir(path.c_str());
+        if (!dir) return Error("directory cannot be opened");
+        cJSON* o = cJSON_CreateObject();
+        cJSON* list = cJSON_AddArrayToObject(o, "entries");
+        for (dirent* entry = readdir(dir);
+             entry && cJSON_GetArraySize(list) < 64; entry = readdir(dir)) {
+            if (std::string(entry->d_name) != "." &&
+                std::string(entry->d_name) != "..")
+                cJSON_AddItemToArray(list, cJSON_CreateString(entry->d_name));
+        }
+        closedir(dir);
+        char* encoded = cJSON_PrintUnformatted(o);
+        std::string json = encoded ? encoded : "{}";
+        cJSON_free(encoded);
+        cJSON_Delete(o);
+        return Done(json);
+    }
+    if (action == "storage") {
+        auto admission_ticket = files_io_worker::CreateTicket();
+        return ai::UiOperations::SubmitWithCancellableCancel(
+            request,
+            [ticket = files_io_worker::TicketPtr{}, admission_ticket]() mutable {
+            if (admission_ticket->phase() ==
+                files_io_worker::Ticket::Phase::Cancelled) {
                 ai::OperationResult pending;
                 pending.status = ai::OperationStatus::Pending;
                 return pending;
             }
-            return FilesView::PreviewPath(path.c_str()) ? Done("{\"previewing\":true}") : Error("file is not previewable or storage is busy");
+            if (ticket == nullptr) {
+                auto& current_sd = SdCardManager::GetInstance();
+                auto& current_disk = UsbVirtualDisk::GetInstance();
+                if (!current_sd.IsMounted() || current_disk.IsSdExportedToHost() ||
+                    current_disk.IsBusy()) {
+                    return Error("SD storage is unavailable");
+                }
+                ticket = files_io_worker::RequestCapacity(0, admission_ticket);
+            }
+            if (ticket == nullptr) return Error("SD capacity query could not be queued");
+            if (admission_ticket->phase() ==
+                files_io_worker::Ticket::Phase::Cancelled) {
+                ai::OperationResult pending;
+                pending.status = ai::OperationStatus::Pending;
+                return pending;
+            }
+            if (!ticket->IsDone()) {
+                ai::OperationResult pending;
+                pending.status = ai::OperationStatus::Pending;
+                return pending;
+            }
+            uint64_t total = 0, free = 0;
+            if (!ticket->GetCapacity(&total, &free)) {
+                admission_ticket->Finish(false);
+                return Error("SD storage unavailable");
+            }
+            if (ticket != admission_ticket) admission_ticket->Finish(true);
+            return Done("{\"mounted\":true,\"totalBytes\":" + std::to_string(total) +
+                        ",\"freeBytes\":" + std::to_string(free) + "}");
+        }, [admission_ticket] {
+            return admission_ticket->CancelBeforeStart();
         });
-    }
-    if (action == "read") { FILE* file = fopen(path.c_str(), "rb"); if (!file) return Error("file cannot be opened"); char buffer[1025] = {}; fread(buffer, 1, 1024, file); fclose(file); cJSON* o = cJSON_CreateObject(); cJSON_AddStringToObject(o, "content", buffer); return {.status=ai::OperationStatus::Succeeded, .result_json=[](cJSON* x){char* p=cJSON_PrintUnformatted(x);std::string s=p?p:"{}";cJSON_free(p);cJSON_Delete(x);return s;}(o)}; }
-    if (action == "list") { DIR* dir = opendir(path.c_str()); if (!dir) return Error("directory cannot be opened"); cJSON* o=cJSON_CreateObject(); cJSON* list=cJSON_AddArrayToObject(o,"entries"); for (dirent* e=readdir(dir); e && cJSON_GetArraySize(list)<64; e=readdir(dir)) if (std::string(e->d_name)!="." && std::string(e->d_name)!="..") cJSON_AddItemToArray(list,cJSON_CreateString(e->d_name)); closedir(dir); char* p=cJSON_PrintUnformatted(o); std::string json=p?p:"{}"; cJSON_free(p); cJSON_Delete(o); return Done(json); }
-    if (action == "storage") {
-        uint64_t total = 0, free = 0;
-        if (!FilesView::GetStorageBytes(&total, &free)) return Error("SD storage unavailable");
-        return Done("{\"mounted\":true,\"totalBytes\":" + std::to_string(total) +
-                    ",\"freeBytes\":" + std::to_string(free) + "}");
     }
     return Error("action must be list, read, preview, delete, or storage");
 }

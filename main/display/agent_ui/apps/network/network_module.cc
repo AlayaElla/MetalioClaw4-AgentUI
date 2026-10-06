@@ -57,6 +57,10 @@ void Module::ResetUi() {
     view_.Reset();
 }
 
+void Module::SetConfigChangedCallback(Adapter::ConfigChangedSink callback) {
+    adapter_.SetConfigChangedSink(std::move(callback));
+}
+
 void Module::LifecycleCallback(AppLifecycleEvent event) {
     ++session_;
     const Lifecycle lifecycle = ToLifecycle(event);

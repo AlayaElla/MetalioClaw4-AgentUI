@@ -61,6 +61,8 @@
 #include "SdCardManager.hpp"
 #include "usb_virtual_disk.h"
 #include "bq27220_gauge.h"
+#include "battery_sampling_service.h"
+#include "battery_input_debouncer.h"
 #include "cx25601n.h"
 #include "sc7a20_motion.h"
 #include "display/agent_ui/apps/external_apps/external_magnetic_service.h"
@@ -158,6 +160,8 @@ class METALIO_CLAW_4 : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
 
+    BatterySamplingService battery_sampler_;
+
     Display* display_;
 
     esp_lcd_touch_handle_t touch_handle = NULL;
@@ -173,6 +177,57 @@ private:
     bool c_is_found_0x60 = false;
     bool l_is_found_0x60 = false;
     bool charge_limit_configured_ = false;
+
+    static bool SampleBattery(void* context, BatteryReading& reading) {
+        auto* board = static_cast<METALIO_CLAW_4*>(context);
+        if (board == nullptr) return false;
+        std::lock_guard<std::mutex> gauge_lock(board->battery_gauge_read_mutex_);
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        uint16_t voltage_mv = 0;
+        int16_t current_ma = 0;
+        bool current_valid = false;
+        auto& gauge = Bq27220Gauge::GetInstance();
+        if (!gauge.GetBatterySample(level, charging, discharging, voltage_mv,
+                                    current_ma, current_valid)) {
+            return false;
+        }
+
+        uint8_t vbus_stat = 0;
+        const bool vbus_valid = cx25601n_get_vbus_stat(&vbus_stat) == ESP_OK;
+        const bool input_present = vbus_valid && vbus_stat != 0 && vbus_stat != 7;
+        const bool input_changed =
+            board->charger_input_debouncer_.Update(vbus_valid, input_present);
+        if (vbus_valid && input_changed) {
+            ESP_LOGI(TAG, "External power: present=%d vbus_stat=%u",
+                     board->charger_input_debouncer_.present(),
+                     static_cast<unsigned>(vbus_stat));
+        }
+
+        reading.level = level;
+        reading.charging = board->charger_input_debouncer_.initialized()
+                               ? board->charger_input_debouncer_.present()
+                               : charging;
+        reading.discharging = discharging;
+        reading.voltage_mv = voltage_mv;
+        reading.current_ma = current_ma;
+        reading.voltage_valid = true;
+        reading.current_valid = current_valid;
+        reading.current_sample_fresh = current_valid;
+        reading.external_power =
+            (board->charger_input_debouncer_.initialized() &&
+             board->charger_input_debouncer_.present()) ||
+            (vbus_valid && usb_serial_jtag_is_connected());
+        reading.external_power_valid = vbus_valid;
+        return true;
+    }
+
+    static bool BatterySamplingAllowed(void* context) {
+        auto* board = static_cast<METALIO_CLAW_4*>(context);
+        if (board == nullptr || board->display_ == nullptr) return true;
+        return !board->display_->IsPowerSaveActive();
+    }
 
     esp_err_t DiscardLcdPanel(esp_lcd_panel_handle_t panel,
                               bool* dma2d_enabled,
@@ -894,6 +949,9 @@ public:
         vTaskDelay(pdMS_TO_TICKS(100));
         InitializeTouch();
         InitializeDisplay();
+        if (!battery_sampler_.Start(this, SampleBattery, BatterySamplingAllowed)) {
+            ESP_LOGE(TAG, "Battery sampling task start failed; cached battery unavailable");
+        }
         // SC7A20 sampling starts only after LVGL exists, so a detected shake
         // can safely schedule the dizzy expression on the application loop.
         (void)Sc7a20MotionService::GetInstance().Start(i2c_bus_);
@@ -908,8 +966,7 @@ public:
 #if METALIO_CLAW_4_ENABLE_SYSTEM_MONITOR
         xTaskCreate(
             [](void* pvParameters) {
-                (void)pvParameters;  // 单例已经在外部 Begin 过，task 不再需要 board 指针
-                auto& gauge = Bq27220Gauge::GetInstance();
+                auto* board = static_cast<METALIO_CLAW_4*>(pvParameters);
 
                 // ---- ESP32-P4 双核 CPU 占用率采样 ----
                 // 依赖 sdkconfig（已在 sdkconfig.defaults / .esp32p4 开启）：
@@ -988,25 +1045,23 @@ public:
                     }
 
                     // ---- 电池电量 ----
-                    int battery_level;
-                    bool charging, discharging;
-                    if (gauge.GetBatteryLevel(battery_level, charging, discharging)) {
-                        uint16_t mv = 0;
-                        const bool mv_ok = gauge.GetVoltageMv(mv);
-                        if (mv_ok) {
+                    BatterySnapshot battery{};
+                    if (board != nullptr && board->GetBatterySnapshot(battery) &&
+                        battery.fresh && battery.voltage_valid) {
+                        if (battery.current_valid) {
                             ESP_LOGI(kMonitorTag,
                                      "@@@电池  | 电量: %3d%% | 电压: %5u mV | "
                                      "充电: %s | 放电: %s",
-                                     battery_level, mv,
-                                     charging ? "是" : "否",
-                                     discharging ? "是" : "否");
+                                     battery.level, battery.voltage_mv,
+                                     battery.charging ? "是" : "否",
+                                     battery.discharging ? "是" : "否");
                         } else {
                             ESP_LOGI(kMonitorTag,
-                                     "@@@电池  | 电量: %3d%% | 电压: 读取失败 | "
+                                     "@@@电池  | 电量: %3d%% | 电流方向: 保留上次有效值 | "
                                      "充电: %s | 放电: %s",
-                                     battery_level,
-                                     charging ? "是" : "否",
-                                     discharging ? "是" : "否");
+                                     battery.level,
+                                     battery.charging ? "是" : "否",
+                                     battery.discharging ? "是" : "否");
                         }
                     }
                     // ---- 板子信息 JSON（OTA / 协议握手用的实时快照） ----
@@ -1225,17 +1280,19 @@ public:
     }
 
     bool ReadBatteryPower(BatteryPowerReading& reading) override {
+        // The existing standby-power diagnostics require fresh readings while
+        // regular sampling pauses with the screen. Serialize them with the
+        // sampler without advancing SOC filtering or charger debounce state.
+        std::lock_guard<std::mutex> gauge_lock(battery_gauge_read_mutex_);
         uint16_t voltage_mv = 0;
         int16_t current_ma = 0;
-        uint8_t vbus_stat = 0;
         auto& gauge = Bq27220Gauge::GetInstance();
         if (!gauge.ReadVoltageMv(voltage_mv) ||
-            !gauge.ReadCurrentMa(current_ma) ||
-            cx25601n_get_vbus_stat(&vbus_stat) != ESP_OK) return false;
-        // Native debug USB can power the board while the charger reports no
-        // VBUS. Such a sample is not evidence of battery-only standby draw.
-        const bool external_power = (vbus_stat != 0 && vbus_stat != 7) ||
-                                    usb_serial_jtag_is_connected();
+            !gauge.ReadCurrentMa(current_ma)) return false;
+        uint8_t vbus_stat = 0;
+        if (cx25601n_get_vbus_stat(&vbus_stat) != ESP_OK) return false;
+        const bool external_power =
+            (vbus_stat != 0 && vbus_stat != 7) || usb_serial_jtag_is_connected();
         reading = {voltage_mv, current_ma, external_power};
         return true;
     }
@@ -1247,45 +1304,28 @@ public:
         return &backlight;
     }
 
-    // 电量来自 BQ27220；是否连接外部电源来自充电芯片的 VBUS 状态。不能用
-    // BQ27220 的瞬时电流当成插拔状态：接近满电时 top-off 会周期性启停，
-    // 从而制造假的 charging false -> true 边沿。
-    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        if (!Bq27220Gauge::GetInstance().GetBatteryLevel(level, charging, discharging)) {
-            return false;
-        }
+    bool GetBatterySnapshot(BatterySnapshot& snapshot) override {
+        return battery_sampler_.GetSnapshot(snapshot);
+    }
 
-        uint8_t vbus_stat = 0;
-        if (cx25601n_get_vbus_stat(&vbus_stat) == ESP_OK) {
-            // 0 = no input; 7 = OTG output. Values 1..6 represent an
-            // externally powered USB/adapter source.
-            const bool input_present = vbus_stat != 0 && vbus_stat != 7;
-            if (!charger_input_initialized_) {
-                charger_input_present_ = input_present;
-                charger_input_initialized_ = true;
-                charger_input_candidate_samples_ = 0;
-                ESP_LOGI(TAG, "External power: present=%d vbus_stat=%u",
-                         input_present, static_cast<unsigned>(vbus_stat));
-            } else if (input_present == charger_input_present_) {
-                charger_input_candidate_samples_ = 0;
-            } else {
-                // VBUS status can briefly drop while the charger IC is
-                // servicing I2C or switching between CC/CV/top-off. Require
-                // a longer absence confirmation so one physical session
-                // cannot generate repeated charging edges.
-                ++charger_input_candidate_samples_;
-                const uint8_t required_samples = input_present ? 2 : 8;
-                if (charger_input_candidate_samples_ >= required_samples) {
-                    charger_input_present_ = input_present;
-                    charger_input_candidate_samples_ = 0;
-                    ESP_LOGI(TAG, "External power: present=%d vbus_stat=%u",
-                             input_present, static_cast<unsigned>(vbus_stat));
-                }
-            }
-        }
-        if (charger_input_initialized_) {
-            charging = charger_input_present_;
-        }
+    bool SupportsCachedBatterySnapshot() const override { return true; }
+
+    bool PauseBatterySampling(uint32_t timeout_ms) override {
+        return battery_sampler_.PauseAndWait(timeout_ms);
+    }
+
+    void ResumeBatterySamplingSoon() override {
+        battery_sampler_.ResumeAndSampleSoon();
+    }
+
+    // Legacy consumers still receive a bounded-age view. The sampler is the
+    // only runtime I2C owner; stale samples are reported as unavailable.
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        BatterySnapshot sample{};
+        if (!GetBatterySnapshot(sample) || !sample.fresh) return false;
+        level = sample.level;
+        charging = sample.charging;
+        discharging = sample.discharging;
         return true;
     }
 
@@ -1296,9 +1336,8 @@ private:
     bool offline_standby_complete_ = false;
     int64_t standby_deadline_us_ = 0;
     bool offline_standby_pending_ = false;
-    bool charger_input_initialized_ = false;
-    bool charger_input_present_ = false;
-    uint8_t charger_input_candidate_samples_ = 0;
+    BatteryInputDebouncer charger_input_debouncer_;
+    std::mutex battery_gauge_read_mutex_;
 
     // virtual void SetPowerSaveMode(bool enabled) override {
     //     if (!enabled) {

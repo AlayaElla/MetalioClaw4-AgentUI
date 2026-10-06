@@ -52,20 +52,31 @@ void View::Emit(const Intent& intent) {
 void View::RenderLists(const ViewState& state) {
     if (settings_.saved_list == nullptr) return;
 
-    std::vector<network_settings_ui::SavedItem> saved;
-    saved.reserve(state.saved_networks.size());
-    for (const auto& item : state.saved_networks) {
-        saved.push_back({item.ssid, item.is_connected});
+    // The controller may publish status-only updates while these rows remain
+    // unchanged. Avoid clearing and recreating either list in that case.
+    if (!settings_.saved_rendered ||
+        state.saved_networks != state_.saved_networks) {
+        std::vector<network_settings_ui::SavedItem> saved;
+        saved.reserve(state.saved_networks.size());
+        for (const auto& item : state.saved_networks) {
+            saved.push_back({item.ssid, item.is_connected});
+        }
+        network_settings_ui::RenderSaved(settings_, saved, OnSavedItem);
     }
-    network_settings_ui::RenderSaved(settings_, saved, OnSavedItem);
 
-    std::vector<network_settings_ui::NearbyItem> nearby;
-    nearby.reserve(state.nearby_networks.size());
-    for (const auto& item : state.nearby_networks) {
-        nearby.push_back({item.ssid, item.detail});
+    if (!settings_.nearby_rendered ||
+        state.nearby_networks != state_.nearby_networks ||
+        state.scanning != state_.scanning ||
+        state.scan_started != state_.scan_started) {
+        std::vector<network_settings_ui::NearbyItem> nearby;
+        nearby.reserve(state.nearby_networks.size());
+        for (const auto& item : state.nearby_networks) {
+            nearby.push_back({item.ssid, item.detail});
+        }
+        network_settings_ui::RenderNearby(
+            settings_, nearby, state.scanning, state.scan_started,
+            OnNearbyItem);
     }
-    network_settings_ui::RenderNearby(
-        settings_, nearby, state.scanning, state.scan_started, OnNearbyItem);
     network_settings_ui::ShowMode(settings_, state.selected_mode);
     network_settings_ui::SetStatus(
         settings_, state.status.c_str(), state.status_color);
@@ -178,8 +189,9 @@ void View::OnExternalSelected(lv_event_t* event) {
 void View::OnSavedItem(lv_event_t* event) {
     View* self = OwnerFromEvent(event);
     if (self == nullptr) return;
-    const std::size_t encoded = reinterpret_cast<uintptr_t>(
+    const auto* index = static_cast<const std::size_t*>(
         lv_event_get_user_data(event));
+    const std::size_t encoded = index != nullptr ? *index : 0;
     if (encoded == 0) return;
     self->Emit(Intent::ConnectSaved(encoded - 1));
 }
@@ -187,8 +199,9 @@ void View::OnSavedItem(lv_event_t* event) {
 void View::OnNearbyItem(lv_event_t* event) {
     View* self = OwnerFromEvent(event);
     if (self == nullptr) return;
-    const std::size_t encoded = reinterpret_cast<uintptr_t>(
+    const auto* index = static_cast<const std::size_t*>(
         lv_event_get_user_data(event));
+    const std::size_t encoded = index != nullptr ? *index : 0;
     if (encoded == 0 || encoded > self->state_.nearby_networks.size()) return;
     const auto& item = self->state_.nearby_networks[encoded - 1];
     self->Emit(Intent::RequestPassword(encoded - 1, item.ssid));

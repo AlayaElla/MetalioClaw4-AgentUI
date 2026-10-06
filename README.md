@@ -57,4 +57,6 @@
 
 已有固件的设备可以直接使用。自行编译或更新固件，请看 [开发与烧录说明](docs/development.md)。
 
+常用构建、打包、烧录和串口监控命令见 [开发命令](scripts/README.md)。
+
 固件仓库：[CloudZao/MetalioClaw4](https://github.com/CloudZao/MetalioClaw4) · 上游：[小智 AI](https://github.com/78/xiaozhi-esp32) · [许可证](LICENSE)

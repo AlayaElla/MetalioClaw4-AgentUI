@@ -14,6 +14,79 @@ namespace agent_ui::network_settings_ui {
 namespace {
 
 namespace controls = ui_components;
+constexpr lv_opa_t kSelectedRowOpacity = 0x1F;
+
+void DeleteCallbackIndex(lv_event_t* event) {
+    delete static_cast<size_t*>(lv_event_get_user_data(event));
+}
+
+void UpdateRowStyle(ListRow& row, bool connected) {
+    if (row.root == nullptr) return;
+    const auto& colors = Theme::Get().colors();
+    const uint32_t background = connected ? colors.accent : colors.background;
+    const lv_opa_t opacity = connected ? kSelectedRowOpacity : LV_OPA_TRANSP;
+    if (!row.style_ready || row.background_color != background) {
+        lv_obj_set_style_bg_color(row.root, lv_color_hex(background), LV_PART_MAIN);
+        row.background_color = background;
+    }
+    if (!row.style_ready || row.background_opacity != opacity) {
+        lv_obj_set_style_bg_opa(row.root, opacity, LV_PART_MAIN);
+        row.background_opacity = opacity;
+    }
+    row.connected = connected;
+    row.style_ready = true;
+}
+
+ListRow& FindOrCreateRow(Handles& handles, lv_obj_t* parent,
+                         std::vector<ListRow>& rows, const std::string& key,
+                         const char* title, const char* trailing,
+                         bool connected, bool clickable, size_t index,
+                         lv_event_cb_t callback, size_t position) {
+    auto found = std::find_if(rows.begin(), rows.end(), [&](const ListRow& row) {
+        return row.key == key;
+    });
+    if (found == rows.end()) {
+        ListRow row;
+        row.key = key;
+        if (clickable) {
+            row.callback_index = new size_t(index + 1);
+        }
+        const auto parts = controls::CreateCompactRow(
+            parent, key == "\001empty" ? nullptr : FONT_AWESOME_WIFI,
+            title, nullptr, trailing, 68, connected, true, callback,
+            row.callback_index);
+        row.root = parts.root;
+        row.title = parts.title;
+        row.trailing = parts.trailing;
+        row.connected = connected;
+        if (row.callback_index != nullptr) {
+            lv_obj_add_event_cb(row.root, DeleteCallbackIndex, LV_EVENT_DELETE,
+                                row.callback_index);
+        }
+        rows.push_back(std::move(row));
+        found = rows.end() - 1;
+    } else {
+        controls::SetLabelTextIfChanged(found->title, title);
+        controls::SetLabelTextIfChanged(found->trailing, trailing != nullptr ? trailing : "");
+        if (found->callback_index != nullptr) *found->callback_index = index + 1;
+    }
+    UpdateRowStyle(*found, connected);
+    found->seen = true;
+    if (parent != nullptr) lv_obj_move_to_index(found->root, position);
+    (void)handles;
+    return *found;
+}
+
+void RemoveStaleRows(std::vector<ListRow>& rows) {
+    for (size_t index = rows.size(); index > 0; --index) {
+        if (rows[index - 1].seen) {
+            rows[index - 1].seen = false;
+            continue;
+        }
+        if (rows[index - 1].root != nullptr) lv_obj_delete(rows[index - 1].root);
+        rows.erase(rows.begin() + index - 1);
+    }
+}
 
 void StyleList(lv_obj_t* list, int min_height) {
     lv_obj_set_height(list, min_height);
@@ -123,7 +196,6 @@ Handles Build(lv_obj_t* parent, const Model& model,
 void RenderSaved(Handles& handles, const std::vector<SavedItem>& items,
                  lv_event_cb_t callback) {
     if (handles.saved_list == nullptr) return;
-    lv_obj_clean(handles.saved_list);
     lv_obj_set_height(
         handles.saved_list,
         std::max(84, static_cast<int>(std::min<size_t>(items.size(), 3)) * 68));
@@ -135,19 +207,21 @@ void RenderSaved(Handles& handles, const std::vector<SavedItem>& items,
         lv_label_set_text(handles.saved_count, count_text);
     }
     if (items.empty()) {
-        controls::CreateCompactRow(handles.saved_list, nullptr,
-                                   I18n::T("暂无已连接过的 WiFi"), nullptr,
-                                   nullptr, 68, false, false);
+        FindOrCreateRow(handles, handles.saved_list, handles.saved_rows,
+                        "\001empty", I18n::T("暂无已连接过的 WiFi"), nullptr,
+                        false, false, 0, nullptr, 0);
+        RemoveStaleRows(handles.saved_rows);
+        handles.saved_rendered = true;
         return;
     }
     for (size_t i = 0; i < items.size(); ++i) {
-        controls::CreateCompactRow(
-            handles.saved_list, FONT_AWESOME_WIFI, items[i].ssid.c_str(),
-            nullptr,
-            items[i].is_connected ? I18n::T("当前") : I18n::T("连接"), 68,
-            items[i].is_connected, true, callback,
-            reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
+        FindOrCreateRow(handles, handles.saved_list, handles.saved_rows,
+                        items[i].ssid, items[i].ssid.c_str(),
+                        items[i].is_connected ? I18n::T("当前") : I18n::T("连接"),
+                        items[i].is_connected, true, i, callback, i);
     }
+    RemoveStaleRows(handles.saved_rows);
+    handles.saved_rendered = true;
 }
 
 void RenderNearby(Handles& handles, const std::vector<NearbyItem>& items,
@@ -157,14 +231,6 @@ void RenderNearby(Handles& handles, const std::vector<NearbyItem>& items,
         lv_obj_remove_flag(handles.nearby_list, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(handles.nearby_list, LV_OBJ_FLAG_HIDDEN);
-    }
-    for (int32_t i = static_cast<int32_t>(
-                         lv_obj_get_child_count(handles.nearby_list)) - 1;
-         i >= 0; --i) {
-        lv_obj_t* child = lv_obj_get_child(handles.nearby_list, i);
-        if (child != nullptr && child != handles.nearby_spinner) {
-            lv_obj_delete(child);
-        }
     }
     lv_obj_set_height(
         handles.nearby_list,
@@ -178,20 +244,25 @@ void RenderNearby(Handles& handles, const std::vector<NearbyItem>& items,
     }
     if (items.empty()) {
         if (!scanning && scan_started) {
-            controls::CreateCompactRow(
-                handles.nearby_list, nullptr,
-                I18n::T("未发现网络"), nullptr, nullptr,
-                68, false, false);
+            FindOrCreateRow(handles, handles.nearby_list, handles.nearby_rows,
+                            "\001empty", I18n::T("未发现网络"), nullptr,
+                            false, false, 0, nullptr, 0);
         }
+        RemoveStaleRows(handles.nearby_rows);
+        handles.nearby_rendered = true;
         return;
     }
     for (size_t i = 0; i < items.size(); ++i) {
-        controls::CreateCompactRow(
-            handles.nearby_list, FONT_AWESOME_WIFI, items[i].ssid.c_str(),
-            nullptr, I18n::T("连接"), 68, false, true,
-            callback,
-            reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
+        FindOrCreateRow(handles, handles.nearby_list, handles.nearby_rows,
+                        items[i].ssid, items[i].ssid.c_str(), I18n::T("连接"),
+                        false, true, i, callback, i);
     }
+    RemoveStaleRows(handles.nearby_rows);
+    if (handles.nearby_spinner != nullptr &&
+        !lv_obj_has_flag(handles.nearby_spinner, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_move_foreground(handles.nearby_spinner);
+    }
+    handles.nearby_rendered = true;
 }
 
 void SetStatus(Handles& handles, const char*, uint32_t) {

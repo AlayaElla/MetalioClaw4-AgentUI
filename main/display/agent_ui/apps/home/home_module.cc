@@ -34,6 +34,10 @@ void Module::HandleCommand(const Command& command) {
         if (navigation_sink_) navigation_sink_(command.target);
         return;
     }
+    if (command.type == CommandType::PlayCarouselTick) {
+        adapter_.Execute(command);
+        return;
+    }
     StatusBar::Get().SetAgentState(controller_.state().agent_state);
     adapter_.Execute(command);
 }

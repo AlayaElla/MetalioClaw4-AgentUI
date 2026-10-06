@@ -31,7 +31,6 @@
 
 #ifdef HAVE_LVGL
 #include "agent_ui/agent_ui_runtime.h"
-#include "agent_ui/apps/home/home_renderer.h"
 #include "agent_ui/core/idle_power.h"
 #include "agent_ui/core/navigation.h"
 #include "agent_ui/core/status_bar.h"
@@ -43,7 +42,13 @@
 #define TAG "Application"
 
 namespace {
-constexpr int64_t kCodexVoiceQueueDrainTimeoutUs = 2 * 1000 * 1000;
+bool IsCurrentCodexSendContext(const CodexWsClient::SendContext& context) {
+    const auto& client = CodexWsClient::GetInstance();
+    return context.valid && client.IsAppActive() && client.IsConnected() &&
+        client.GetAppSessionGeneration() == context.app_generation &&
+        client.GetConnectionGeneration() == context.connection_generation &&
+        client.GetConnectionEpoch() == context.connection_epoch;
+}
 }
 
 static const char* const STATE_STRINGS[] = {
@@ -94,7 +99,7 @@ std::string SpecialInteractionPrompt(SpecialInteraction interaction, int detail)
 
 }  // namespace
 
-Application::Application() {
+Application::Application() : codex_capture_coordinator_(*this) {
     event_group_ = xEventGroupCreate();
     ai::Availability::Get().SetObserver([this](const auto&) {
         Schedule([this]() { ApplyAiAvailability(); });
@@ -402,7 +407,7 @@ void Application::ApplyAiAvailability() {
             device_state_ == kDeviceStateConnecting) {
             // The old device-AI audio may be discarded only before a new owner
             // starts using the decoder. Codex capture is scheduled after this.
-            if (!codex_voice_capture_active_ && !codex_realtime_playback_active_)
+            if (!codex_capture_coordinator_.IsCaptureActive() && !codex_realtime_playback_active_)
                 audio_service_.ResetDecoder();
             SetDeviceState(kDeviceStateIdle);
         }
@@ -570,72 +575,41 @@ void Application::StopListening() {
     });
 }
 
-void Application::StartCodexVoiceCapture() {
-    Schedule([this]() {
-        if (low_power_standby_.load()) return;
-        if (codex_voice_capture_active_ || codex_voice_start_pending_) return;
-        if (!ai::Availability::Get().IsAvailable()) return;
-        codex_voice_ai_block_ = ai::Availability::Get().AcquireBlock("codex.dictation", "Codex 听写");
-        ApplyAiAvailability();
-        codex_voice_stop_pending_ = false;
-        codex_voice_stop_wait_started_at_us_ = 0;
-        codex_voice_restore_wake_word_ = false;
-        codex_voice_stopped_callback_ = {};
-        codex_voice_start_pending_ = true;
-        codex_voice_start_wait_started_at_us_ = esp_timer_get_time();
-        TryStartCodexVoiceCapture();
+void Application::StartCodexVoiceCapture(
+    const CodexWsClient::SendContext& transport_context) {
+    Schedule([this, transport_context]() {
+        codex_capture_coordinator_.StartVoice({
+            transport_context.app_generation,
+            transport_context.connection_generation,
+            transport_context.connection_epoch,
+            transport_context.valid,
+        });
     });
 }
 
-void Application::StartCodexRealtimeCapture(const std::string& request_id) {
+void Application::StartCodexRealtimeCapture(
+    const std::string& request_id,
+    const CodexWsClient::SendContext& transport_context) {
     if (request_id.empty()) return;
-    Schedule([this, request_id]() {
-        if (low_power_standby_.load() || codex_voice_capture_active_ ||
-            codex_voice_start_pending_) return;
-        if (codex_realtime_request_id_ != request_id) {
-            codex_realtime_request_id_ = request_id;
-            codex_realtime_audio_sequence_ = 0;
-            codex_realtime_restore_wake_word_ = audio_service_.IsWakeWordRunning();
-            if (codex_realtime_restore_wake_word_) audio_service_.EnableWakeWordDetection(false);
-        }
-        codex_voice_stop_pending_ = false;
-        codex_voice_stop_wait_started_at_us_ = 0;
-        codex_voice_restore_wake_word_ = false;
-        codex_voice_stopped_callback_ = {};
-        codex_voice_start_pending_ = true;
-        codex_voice_start_wait_started_at_us_ = esp_timer_get_time();
-        TryStartCodexVoiceCapture();
+    Schedule([this, request_id, transport_context]() {
+        codex_capture_coordinator_.StartRealtime(request_id, {
+            transport_context.app_generation,
+            transport_context.connection_generation,
+            transport_context.connection_epoch,
+            transport_context.valid,
+        });
     });
 }
 
 void Application::StopCodexRealtimeCapture() {
     Schedule([this]() {
-        codex_voice_start_pending_ = false;
-        codex_voice_start_wait_started_at_us_ = 0;
-        if (codex_voice_capture_active_) {
-            audio_service_.EnableVoiceProcessing(false);
-            audio_service_.CancelPendingSendAudio();
-            codex_voice_capture_active_ = false;
-            if (codex_voice_restore_wake_word_ && device_state_ == kDeviceStateIdle &&
-                !low_power_standby_.load()) {
-                audio_service_.EnableWakeWordDetection(true);
-            }
-        }
-        codex_voice_restore_wake_word_ = false;
-        codex_voice_stop_pending_ = false;
-        codex_voice_stopped_callback_ = {};
+        codex_capture_coordinator_.StopRealtime();
     });
 }
 
-void Application::EndCodexRealtimeSession() {
-    StopCodexRealtimeCapture();
-    Schedule([this]() {
-        codex_realtime_request_id_.clear();
-        codex_realtime_audio_sequence_ = 0;
-        ClearCodexRealtimeAudio();
-        if (codex_realtime_restore_wake_word_ && device_state_ == kDeviceStateIdle && !low_power_standby_.load())
-            audio_service_.EnableWakeWordDetection(true);
-        codex_realtime_restore_wake_word_ = false;
+void Application::EndCodexRealtimeSession(std::function<void()> on_stopped) {
+    Schedule([this, on_stopped = std::move(on_stopped)]() mutable {
+        codex_capture_coordinator_.EndRealtime(std::move(on_stopped));
     });
 }
 
@@ -654,131 +628,116 @@ void Application::ClearCodexRealtimeAudio() {
 
 void Application::StopCodexVoiceCapture(std::function<void()> on_stopped) {
     Schedule([this, on_stopped = std::move(on_stopped)]() mutable {
-        if (codex_voice_start_pending_) {
-            codex_voice_start_pending_ = false;
-            codex_voice_start_wait_started_at_us_ = 0;
-            ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
-            codex_voice_ai_block_ = 0;
-            if (on_stopped) on_stopped();
-            return;
-        }
-        if (!codex_voice_capture_active_) {
-            if (on_stopped) on_stopped();
-            return;
-        }
-
-        audio_service_.EnableVoiceProcessing(false);
-        codex_voice_stop_pending_ = true;
-        codex_voice_stop_wait_started_at_us_ = esp_timer_get_time();
-        codex_voice_stopped_callback_ = std::move(on_stopped);
-        TryFinishCodexVoiceCapture();
+        codex_capture_coordinator_.StopVoice(std::move(on_stopped));
     });
 }
 
-void Application::TryStartCodexVoiceCapture() {
-    if (low_power_standby_.load()) {
-        ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
-        codex_voice_ai_block_ = 0;
-        codex_voice_start_pending_ = false;
-        codex_voice_start_wait_started_at_us_ = 0;
-        return;
-    }
-    if (!codex_voice_start_pending_) return;
+int64_t Application::NowUs() const { return esp_timer_get_time(); }
+
+bool Application::IsStandby() const { return low_power_standby_.load(); }
+
+bool Application::IsDeviceIdle() const { return device_state_ == kDeviceStateIdle; }
+
+bool Application::IsAiAvailable() const { return ai::Availability::Get().IsAvailable(); }
+
+bool Application::IsTransportCurrent(
+    const ai::CodexCaptureCoordinator::TransportContext& context) const {
+    return IsCurrentCodexSendContext({context.app_generation,
+                                      context.connection_generation,
+                                      context.connection_epoch,
+                                      context.valid});
+}
+
+bool Application::IsWakeWordRunning() const { return audio_service_.IsWakeWordRunning(); }
+
+bool Application::InterruptActiveSynth() {
 #ifdef HAVE_LVGL
     if (auto* synth = agent_ui::external_apps::SynthService::Existing();
         synth && synth->IsActive()) {
         synth->Interrupt();
-        return;
+        return true;
     }
 #endif
-    if (audio_service_.HasPendingSendAudio()) {
-        const int64_t now_us = esp_timer_get_time();
-        if (codex_voice_start_wait_started_at_us_ == 0) {
-            codex_voice_start_wait_started_at_us_ = now_us;
-        }
-        if (now_us - codex_voice_start_wait_started_at_us_ >=
-            kCodexVoiceQueueDrainTimeoutUs) {
-            ESP_LOGW(TAG, "Codex voice start timed out waiting for prior audio; closing voice transport");
-            ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
-            codex_voice_ai_block_ = 0;
-            codex_voice_start_pending_ = false;
-            codex_voice_start_wait_started_at_us_ = 0;
-            // The UI has already accepted the recording status.  Closing the
-            // bridge drives its existing disconnected-state cleanup and makes
-            // the PC release the still-held PTT.  Do not clear the shared
-            // audio queue here: this capture never owned it.
-            auto& codex = CodexWsClient::GetInstance();
-            if (codex.IsConnected()) codex.Reconnect();
-        }
-        return;
-    }
-
-    codex_voice_start_pending_ = false;
-    codex_voice_start_wait_started_at_us_ = 0;
-    codex_voice_capture_active_ = true;
-    codex_voice_restore_wake_word_ = audio_service_.IsWakeWordRunning();
-    if (codex_voice_restore_wake_word_) {
-        audio_service_.EnableWakeWordDetection(false);
-    }
-    audio_service_.EnableVoiceProcessing(true);
-    ESP_LOGI(TAG, "Codex voice capture started");
+    return false;
 }
 
-void Application::TryFinishCodexVoiceCapture() {
-    if (!codex_voice_stop_pending_) return;
-    if (audio_service_.HasPendingSendAudio()) {
-        const int64_t now_us = esp_timer_get_time();
-        if (codex_voice_stop_wait_started_at_us_ == 0) {
-            codex_voice_stop_wait_started_at_us_ = now_us;
-        }
-        if (now_us - codex_voice_stop_wait_started_at_us_ <
-            kCodexVoiceQueueDrainTimeoutUs) {
-            return;
-        }
-        ESP_LOGW(TAG, "Codex voice stop timed out; discarding capture audio");
-        audio_service_.CancelPendingSendAudio();
-    }
+bool Application::HasPendingSendAudio() const { return audio_service_.HasPendingSendAudio(); }
 
-    codex_voice_capture_active_ = false;
-    ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
-    codex_voice_ai_block_ = 0;
-    codex_voice_stop_pending_ = false;
-    codex_voice_stop_wait_started_at_us_ = 0;
-    if (codex_voice_restore_wake_word_ &&
-        device_state_ == kDeviceStateIdle && !low_power_standby_.load()) {
-        audio_service_.EnableWakeWordDetection(true);
-    }
-    codex_voice_restore_wake_word_ = false;
-    auto callback = std::move(codex_voice_stopped_callback_);
-    codex_voice_stopped_callback_ = {};
-    ESP_LOGI(TAG, "Codex voice capture stopped");
-    if (callback) callback();
+void Application::EnableWakeWordDetection(bool enabled) {
+    audio_service_.EnableWakeWordDetection(enabled);
 }
 
-void Application::FailCodexVoiceCaptureTransport() {
-    ai::Availability::Get().ReleaseBlock(codex_voice_ai_block_);
-    codex_voice_ai_block_ = 0;
-    // Capture starts only after the shared send queue drains, so while active
-    // every queued network frame belongs to this Codex capture.
-    codex_voice_start_pending_ = false;
-    codex_voice_start_wait_started_at_us_ = 0;
-    if (codex_voice_capture_active_) {
-        // Disable the AFE producer before invalidating its queue.  Stop does
-        // not join an in-flight callback; AudioService rejects that callback
-        // with its producer generation after this point.
-        audio_service_.EnableVoiceProcessing(false);
-        audio_service_.CancelPendingSendAudio();
-        codex_voice_stop_pending_ = true;
-        codex_voice_stop_wait_started_at_us_ = 0;
-        TryFinishCodexVoiceCapture();
-    }
-    if (!codex_realtime_request_id_.empty()) {
-        codex_realtime_request_id_.clear();
-        codex_realtime_audio_sequence_ = 0;
-        ClearCodexRealtimeAudio();
-    }
-    auto& codex = CodexWsClient::GetInstance();
-    if (codex.IsConnected()) codex.Reconnect();
+void Application::EnableVoiceProcessing(bool enabled) {
+    audio_service_.EnableVoiceProcessing(enabled);
+}
+
+void Application::CancelPendingSendAudio() { audio_service_.CancelPendingSendAudio(); }
+
+uint64_t Application::AcquireAiBlock() {
+    const auto token = ai::Availability::Get().AcquireBlock("codex.dictation", "Codex 听写");
+    ApplyAiAvailability();
+    return token;
+}
+
+void Application::ReleaseAiBlock(uint64_t token) {
+    ai::Availability::Get().ReleaseBlock(token);
+}
+
+void Application::ClearRealtimePlayback() { ClearCodexRealtimeAudio(); }
+
+void Application::RequestReconnect(
+    const ai::CodexCaptureCoordinator::TransportContext& context) {
+    CodexWsClient::GetInstance().RequestReconnectAsync({
+        context.app_generation,
+        context.connection_generation,
+        context.connection_epoch,
+        context.valid,
+    });
+}
+
+void Application::PostToMain(std::function<void()> callback) {
+    Schedule(std::move(callback));
+}
+
+ai::CodexCaptureCoordinator::Admission Application::QueueVoiceFrame(
+    const uint8_t* data, size_t size,
+    const ai::CodexCaptureCoordinator::TransportContext& context,
+    ai::CodexCaptureCoordinator::Port::SendCompletion completion) {
+    const CodexWsClient::SendContext transport{
+        context.app_generation, context.connection_generation,
+        context.connection_epoch, context.valid};
+    auto wrapped = [completion = std::move(completion)](
+                       const CodexWsClient::SendResult& result) {
+        completion({result.sent,
+                    {result.app_generation, result.connection_generation,
+                     result.connection_epoch, true}});
+    };
+    const auto admission = CodexWsClient::GetInstance().QueueOpusAudioFrame(
+        data, size, transport, std::move(wrapped));
+    return admission == CodexWsClient::SendAdmission::Accepted
+        ? ai::CodexCaptureCoordinator::Admission::Accepted
+        : ai::CodexCaptureCoordinator::Admission::Rejected;
+}
+
+ai::CodexCaptureCoordinator::Admission Application::QueueRealtimeFrame(
+    const std::string& request_id, uint32_t sequence,
+    const uint8_t* data, size_t size,
+    const ai::CodexCaptureCoordinator::TransportContext& context,
+    ai::CodexCaptureCoordinator::Port::SendCompletion completion) {
+    const CodexWsClient::SendContext transport{
+        context.app_generation, context.connection_generation,
+        context.connection_epoch, context.valid};
+    auto wrapped = [completion = std::move(completion)](
+                       const CodexWsClient::SendResult& result) {
+        completion({result.sent,
+                    {result.app_generation, result.connection_generation,
+                     result.connection_epoch, true}});
+    };
+    const auto admission = CodexWsClient::GetInstance().QueueRealtimeOpusAudioFrame(
+        request_id, sequence, data, size, transport, std::move(wrapped));
+    return admission == CodexWsClient::SendAdmission::Accepted
+        ? ai::CodexCaptureCoordinator::Admission::Accepted
+        : ai::CodexCaptureCoordinator::Admission::Rejected;
 }
 
 void Application::Start() {
@@ -1109,25 +1068,14 @@ void Application::MainEventLoop() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (codex_voice_capture_active_) {
-                    const bool sent = codex_realtime_request_id_.empty()
-                        ? CodexWsClient::GetInstance().SendOpusAudioFrame(
-                              packet->payload.data(), packet->payload.size())
-                        : CodexWsClient::GetInstance().SendRealtimeOpusAudioFrame(
-                              codex_realtime_request_id_, ++codex_realtime_audio_sequence_,
-                              packet->payload.data(), packet->payload.size());
-                    if (!sent) {
-                        ESP_LOGW(TAG, "Failed to send Codex voice audio frame");
-                        FailCodexVoiceCaptureTransport();
-                        break;
-                    }
-                } else if (ai::Availability::Get().IsAvailable() && protocol_ &&
-                           !protocol_->SendAudio(std::move(packet))) {
+                if (!codex_capture_coordinator_.OnSendAudio(
+                        packet->payload.data(), packet->payload.size()) &&
+                    ai::Availability::Get().IsAvailable() && protocol_ &&
+                    !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
-            TryStartCodexVoiceCapture();
-            TryFinishCodexVoiceCapture();
+            codex_capture_coordinator_.OnAudioQueueChanged();
         }
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
@@ -1152,8 +1100,7 @@ void Application::MainEventLoop() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
-            TryStartCodexVoiceCapture();
-            TryFinishCodexVoiceCapture();
+            codex_capture_coordinator_.OnAudioQueueChanged();
             auto& codex_client = CodexWsClient::GetInstance();
             const uint32_t connection = codex_client.GetConnectionGeneration();
             codex_battery_reporter_.Poll(
@@ -1266,7 +1213,7 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            if (!codex_voice_capture_active_ && !codex_voice_start_pending_)
+            if (!codex_capture_coordinator_.IsCapturePendingOrActive())
                 audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(!low_power_standby_.load());
 #ifdef HAVE_LVGL
@@ -1442,7 +1389,7 @@ void Application::PlaySound(const std::string_view& sound) {
 bool Application::PlayCodexNotificationSound(const std::string_view& sound,
                                              uint8_t gain_percent) {
     if (sound.empty() || activation_suspended_ ||
-        codex_voice_capture_active_.load(std::memory_order_acquire) ||
+        codex_capture_coordinator_.IsCaptureActive() ||
         !audio_service_.IsIdle()) {
         return false;
     }
@@ -1480,9 +1427,9 @@ void Application::TriggerSpecialInteraction(SpecialInteraction interaction, int 
 #ifdef HAVE_LVGL
         if (esp_lv_adapter_lock(-1) == ESP_OK) {
             if (interaction == SpecialInteraction::Charging) {
-                agent_ui::home::Renderer::HoldChargingExpression();
+                agent_ui::Runtime::Get().HoldHomeChargingExpression();
             } else if (interaction == SpecialInteraction::Dizzy) {
-                agent_ui::home::Renderer::HoldDizzyExpression();
+                agent_ui::Runtime::Get().HoldHomeDizzyExpression();
             }
             esp_lv_adapter_unlock();
         }
@@ -1551,7 +1498,7 @@ void Application::FinishSpecialInteraction(bool restore_sleep) {
 
 #ifdef HAVE_LVGL
     if (esp_lv_adapter_lock(-1) == ESP_OK) {
-        agent_ui::home::Renderer::ReleaseSpecialExpression();
+        agent_ui::Runtime::Get().ReleaseHomeSpecialExpression();
         if (restore_sleep && completed == SpecialInteraction::Sleep) {
             agent_ui::IdlePower::Get().RestoreExpressionSleep();
         }
@@ -1609,13 +1556,7 @@ void Application::SetLowPowerStandby(bool enabled) {
 
         Schedule([this]() {
 
-            codex_voice_start_pending_ = false;
-            codex_voice_start_wait_started_at_us_ = 0;
-            if (codex_voice_capture_active_) {
-                codex_voice_stop_pending_ = true;
-                codex_voice_stop_wait_started_at_us_ = esp_timer_get_time();
-                TryFinishCodexVoiceCapture();
-            }
+            codex_capture_coordinator_.AbortForStandby();
             CancelSpecialInteraction();
             if (device_state_ == kDeviceStateSpeaking) {
                 AbortSpeaking(kAbortReasonNone);

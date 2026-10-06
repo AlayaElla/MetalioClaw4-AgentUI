@@ -1,5 +1,6 @@
 #pragma once
 
+#include "render_snapshot_buffer.h"
 #include "lvgl.h"
 
 namespace agent_ui {
@@ -29,8 +30,7 @@ private:
 
     lv_obj_t* root_ = nullptr;
     lv_obj_t* keyboard_ = nullptr;
-    lv_draw_buf_t render_cache_{};
-    void* render_cache_memory_ = nullptr;
+    RenderSnapshotBuffer render_snapshot_;
     bool render_cache_ready_ = false;
     bool taking_snapshot_ = false;
     lv_keyboard_mode_t cached_mode_ = LV_KEYBOARD_MODE_TEXT_LOWER;

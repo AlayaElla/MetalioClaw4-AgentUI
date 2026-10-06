@@ -12,6 +12,23 @@
 *.bin
 *.log
 
+# Local tests, fixtures and host-check tools
+/tests/
+/external_apps/tests/
+/scripts/tests/
+/scripts/fixtures/
+/scripts/check-*.cjs
+/scripts/test-*.cjs
+/scripts/common/host-toolchain.cjs
+/scripts/common/msvc-env.cjs
+/scripts/common/run-python-tests.py
+/main/display/agent_ui/apps/standby_test/*_host_test.cc
+/external_apps/build-instrument-probe.ps1
+/external_apps/examples/instrument_probe/
+
+# Generated external App packages and previews
+/external_apps/dist/
+
 # Local/optional binary resources and device images
 /wakeword/
 /sd_images/
@@ -38,22 +55,23 @@
 Thumbs.db
 .DS_Store
 
-# Temporary snapshots and host compilation output
+# Temporary snapshots and generated host compilation output
 /.tmp/
 *.tmp
 *.bak
+*.o
 *.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.ipch
+*.pch
+*.gcda
+*.gcno
 **/build-*/
-
-# Local tests and validation scripts
-/tests/
-!/tests/
-/tests/*
-!/tests/ai_capabilities_host/
-/tests/ai_capabilities_host/*
-!/tests/ai_capabilities_host/CMakeLists.txt
-!/tests/ai_capabilities_host/ai_capabilities_host_test.cc
-/scripts/test-*
-!/scripts/test-bt-audio-duplex.cjs
-!/tests/bt_audio_duplex_test.cc
-/docs/codex-micro-voice.md

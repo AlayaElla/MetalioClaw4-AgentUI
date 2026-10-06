@@ -23,6 +23,11 @@ public:
     void SetConversationMessage(const char* role, const char* content);
     void SetSystemStatus(const char* status);
     void PlayDizzyExpression();
+    void HoldHomeChargingExpression();
+    void HoldHomeDizzyExpression();
+    void ReleaseHomeSpecialExpression();
+    bool IsHomeScreen(lv_obj_t* screen) const;
+    void SetHomeRenderingPaused(bool paused);
 
     const home::ViewState& home_state() const { return home_module_.state(); }
     const GlobalUiState& global_state() const { return global_state_; }

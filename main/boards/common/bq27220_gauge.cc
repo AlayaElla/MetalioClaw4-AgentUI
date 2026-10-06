@@ -86,6 +86,17 @@ bool Bq27220Gauge::ReadCurrentMa(int16_t& current_ma) {
 }
 
 bool Bq27220Gauge::GetBatteryLevel(int& level, bool& charging, bool& discharging) {
+    uint16_t voltage_mv = 0;
+    int16_t current_ma = 0;
+    bool current_valid = false;
+    return GetBatterySample(level, charging, discharging, voltage_mv,
+                            current_ma, current_valid);
+}
+
+bool Bq27220Gauge::GetBatterySample(int& level, bool& charging,
+                                    bool& discharging, uint16_t& voltage_mv,
+                                    int16_t& current_ma,
+                                    bool& current_valid) {
     if (dev_ == nullptr) {
         // 没挂上则节流自愈重试（~10s/次），避免 1Hz 走 i2c_master_probe
         // 的 timeout 拖慢调用方。
@@ -97,11 +108,10 @@ bool Bq27220Gauge::GetBatteryLevel(int& level, bool& charging, bool& discharging
         }
     }
 
-    uint16_t mv = 0;
-    if (!ReadU16(kRegVoltage, &mv)) {
+    if (!ReadU16(kRegVoltage, &voltage_mv)) {
         return false;
     }
-    float bat_v = static_cast<float>(mv) / 1000.0f;
+    float bat_v = static_cast<float>(voltage_mv) / 1000.0f;
 
     float raw_pct;
     if (bat_v >= kBatteryFullV) {
@@ -117,8 +127,8 @@ bool Bq27220Gauge::GetBatteryLevel(int& level, bool& charging, bool& discharging
     if (level < 0) level = 0;
     if (level > 100) level = 100;
 
-    int16_t current_ma = 0;
-    if (ReadCurrentMa(current_ma)) {
+    current_valid = ReadCurrentMa(current_ma);
+    if (current_valid) {
         last_charging_ = current_ma > 5;
         last_discharging_ = current_ma < -5;
         current_direction_initialized_ = true;

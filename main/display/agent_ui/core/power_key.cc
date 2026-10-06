@@ -1,6 +1,8 @@
 #include "power_key.h"
 
 #include <atomic>
+#include <memory>
+#include <new>
 
 #include <esp_lv_adapter.h>
 #include <esp_log.h>
@@ -13,6 +15,7 @@
 #include "apps/power/power_view.h"
 #include "apps/standby/standby_view.h"
 #include "board.h"
+#include "core/power_transition_coordinator.h"
 #include "display.h"
 
 namespace agent_ui {
@@ -21,7 +24,17 @@ constexpr char kTag[] = "AgentPowerKey";
 constexpr uint32_t kLongPressMs = 1500;
 constexpr UBaseType_t kQueueDepth = 4;
 constexpr uint32_t kWorkerStackBytes = 8 * 1024;
-enum class KeyEvent : uint8_t { ShortPress, LongPress, RestorePeripherals, CheckStandby };
+enum class KeyEvent : uint8_t {
+    ShortPress,
+    LongPress,
+    RestorePeripherals,
+    CheckStandby,
+    EnterStandby,
+};
+struct WakeDispatchContext {
+    PowerTransitionCoordinator::Lease transition;
+    uint32_t screen_off_generation = 0;
+};
 struct KeyRequest {
     KeyEvent event;
     bool wake_only;
@@ -37,6 +50,7 @@ std::atomic<bool> s_pending_wake_only{false};
 std::atomic<bool> s_peripheral_resume_pending{false};
 std::atomic<bool> s_peripheral_resume_ready{false};
 std::atomic<bool> s_peripheral_audio_ready{false};
+std::atomic<uint32_t> s_pending_standby_generation{0};
 
 void OnAudioReadyUi(void*) {
     if (s_peripheral_audio_ready.load()) StandbyView::CompleteAudioWake();
@@ -71,7 +85,16 @@ void RestorePeripherals() {
     PostWakeCallback(OnPeripheralsReadyUi);
 }
 
-void OnPowerKeyUi(void*) {
+void OnPowerKeyUi(void* context_data) {
+    std::unique_ptr<WakeDispatchContext> context(
+        static_cast<WakeDispatchContext*>(context_data));
+    if (context != nullptr && context->screen_off_generation != 0 &&
+        StandbyView::ScreenOffGeneration() != context->screen_off_generation) {
+        ESP_LOGI(kTag, "Discarding stale power-key wake generation");
+        s_wake_in_progress.store(false, std::memory_order_release);
+        s_ui_dispatch_pending.store(false, std::memory_order_release);
+        return;
+    }
     const KeyEvent event = s_pending_event.load(std::memory_order_acquire);
     ESP_LOGI(kTag, "Power key dispatched to LVGL (long=%d standby=%d screen_off=%d)",
              event == KeyEvent::LongPress, StandbyView::IsActive(),
@@ -101,6 +124,26 @@ void ProcessKeyEvent(KeyRequest request) {
 
     Display* display = Board::GetInstance().GetDisplay();
     bool wake_only = request.wake_only;
+    const bool needs_transition_gate = wake_only || StandbyView::IsScreenOff() ||
+        (display != nullptr && display->IsPowerSaveActive());
+    const uint32_t screen_off_generation = needs_transition_gate
+        ? StandbyView::ScreenOffGeneration() : 0;
+    PowerTransitionCoordinator::Lease transition;
+    if (needs_transition_gate) {
+        // This is a background worker and may wait while an external power
+        // service keeps a prepared wake transition alive through its UI ack.
+        transition = PowerTransitionCoordinator::Acquire();
+        if (!transition.owns_lock()) {
+            s_ui_dispatch_pending.store(false, std::memory_order_release);
+            return;
+        }
+        if (screen_off_generation != 0 &&
+            StandbyView::ScreenOffGeneration() != screen_off_generation) {
+            s_ui_dispatch_pending.store(false, std::memory_order_release);
+            return;
+        }
+        display = Board::GetInstance().GetDisplay();
+    }
     struct WakePreparation {
         bool cancel = false;
         ~WakePreparation() { if (cancel) Board::GetInstance().CancelLowPowerWake(); }
@@ -130,8 +173,21 @@ void ProcessKeyEvent(KeyRequest request) {
         s_ui_dispatch_pending.store(false, std::memory_order_release);
         return;
     }
-    if (lv_async_call(OnPowerKeyUi, nullptr) != LV_RESULT_OK) {
+    WakeDispatchContext* dispatch_context = nullptr;
+    if (transition.owns_lock()) {
+        dispatch_context = new (std::nothrow) WakeDispatchContext{
+            std::move(transition), screen_off_generation};
+        if (dispatch_context == nullptr) {
+            ESP_LOGE(kTag, "Cannot allocate power-key wake context");
+            esp_lv_adapter_unlock();
+            s_wake_in_progress.store(false, std::memory_order_release);
+            s_ui_dispatch_pending.store(false, std::memory_order_release);
+            return;
+        }
+    }
+    if (lv_async_call(OnPowerKeyUi, dispatch_context) != LV_RESULT_OK) {
         ESP_LOGE(kTag, "LVGL rejected power-key callback");
+        delete dispatch_context;
         esp_lv_adapter_unlock();
         s_wake_in_progress.store(false, std::memory_order_release);
         s_ui_dispatch_pending.store(false, std::memory_order_release);
@@ -139,6 +195,59 @@ void ProcessKeyEvent(KeyRequest request) {
     }
     esp_lv_adapter_unlock();
     preparation.cancel = false;
+}
+
+void ProcessPendingStandbyEntry() {
+    const uint32_t generation =
+        s_pending_standby_generation.load(std::memory_order_acquire);
+    if (generation == 0 || s_wake_in_progress.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!StandbyView::IsScreenOff() ||
+        StandbyView::ScreenOffGeneration() != generation) {
+        uint32_t expected = generation;
+        if (s_pending_standby_generation.compare_exchange_strong(
+                expected, 0, std::memory_order_acq_rel) &&
+            !StandbyView::IsScreenOff()) {
+            Board::GetInstance().ResumeBatterySamplingSoon();
+        }
+        return;
+    }
+
+    auto& board = Board::GetInstance();
+    // This wait runs on PowerKeyWorker, never under the LVGL adapter lock. A
+    // timeout leaves the request pending for the next bounded worker retry.
+    if (!board.PauseBatterySampling(300)) {
+        ESP_LOGW(kTag, "Battery sampler is still draining; defer standby rails");
+        return;
+    }
+    if (s_wake_in_progress.load(std::memory_order_acquire) ||
+        !StandbyView::IsScreenOff() ||
+        StandbyView::ScreenOffGeneration() != generation) {
+        if (!StandbyView::IsScreenOff()) board.ResumeBatterySamplingSoon();
+        uint32_t expected = generation;
+        (void)s_pending_standby_generation.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel);
+        return;
+    }
+
+    auto transition = PowerTransitionCoordinator::Acquire();
+    (void)transition;
+    // Recheck under the shared transition gate: an external power test may
+    // have prepared a display wake while this standby request was queued.
+    if (s_wake_in_progress.load(std::memory_order_acquire) ||
+        !StandbyView::IsScreenOff() ||
+        StandbyView::ScreenOffGeneration() != generation) {
+        if (!StandbyView::IsScreenOff()) board.ResumeBatterySamplingSoon();
+        uint32_t expected = generation;
+        (void)s_pending_standby_generation.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel);
+        return;
+    }
+    board.SetLowPowerStandby(true);
+    uint32_t expected = generation;
+    (void)s_pending_standby_generation.compare_exchange_strong(
+        expected, 0, std::memory_order_acq_rel);
 }
 
 void PowerKeyWorker(void*) {
@@ -149,8 +258,10 @@ void PowerKeyWorker(void*) {
         if (xQueueReceive(s_key_queue, &request, wait) == pdTRUE) {
             if (request.event == KeyEvent::RestorePeripherals) RestorePeripherals();
             else if (request.event == KeyEvent::CheckStandby) Board::GetInstance().TickLowPowerStandby();
+            else if (request.event == KeyEvent::EnterStandby) ProcessPendingStandbyEntry();
             else ProcessKeyEvent(request);
         } else {
+            ProcessPendingStandbyEntry();
             Board::GetInstance().TickLowPowerStandby();
         }
     }
@@ -196,6 +307,17 @@ void PowerKey::NotifyStandbyStarted() {
     const KeyRequest request{KeyEvent::CheckStandby, false};
     // If full, an existing request already wakes the worker; its next wait
     // observes the black-screen snapshot and checks the deadline in one second.
+    (void)xQueueSend(s_key_queue, &request, 0);
+}
+
+void PowerKey::RequestStandbyEntry() {
+    if (s_key_queue == nullptr || !StandbyView::IsScreenOff()) return;
+    const uint32_t generation = StandbyView::ScreenOffGeneration();
+    if (generation == 0) return;
+    s_pending_standby_generation.store(generation, std::memory_order_release);
+    const KeyRequest request{KeyEvent::EnterStandby, false};
+    // A full queue cannot lose the transition: the worker checks the atomic
+    // pending request on its one-second black-screen timeout.
     (void)xQueueSend(s_key_queue, &request, 0);
 }
 

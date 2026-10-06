@@ -1,6 +1,9 @@
 #include "external_power_service.h"
 #include "external_power_model.h"
 
+#include <memory>
+#include <utility>
+
 #ifdef METALIO_POWER_SERVICE_HOST_TEST
 #include "external_power_host_platform.h"
 #else
@@ -17,6 +20,8 @@
 #include "display.h"
 #include "ui_dispatcher.h"
 #endif
+
+#include "core/power_transition_coordinator.h"
 
 namespace agent_ui::external_apps {
 namespace {
@@ -242,19 +247,47 @@ void PowerService::Run(uint32_t generation, uint32_t duration_ms) {
     }
     result.state = METALIO_APP_STANDBY_WAKING;
     Publish(generation, result);
+    PowerTransitionCoordinator::Lease transition;
+    constexpr int kTransitionRetries = 40;
+    for (int attempt = 0; attempt < kTransitionRetries; ++attempt) {
+        if (!Current(generation)) return;
+        if (!StandbyView::IsScreenOff()) {
+            result.state = METALIO_APP_STANDBY_CANCELLED;
+            Publish(generation, result);
+            return;
+        }
+        transition = PowerTransitionCoordinator::TryAcquire();
+        if (transition.owns_lock()) break;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    if (!transition.owns_lock()) {
+        result.state = METALIO_APP_STANDBY_ERROR;
+        result.error = METALIO_APP_POWER_ERROR_WAKE;
+        Publish(generation, result);
+        return;
+    }
+    if (!Current(generation) || !StandbyView::IsScreenOff()) return;
     const bool prepared = Board::GetInstance().PrepareLowPowerWake();
-    if (!Current(generation) || !display->PrepareWakeFromPowerSave()) {
+    if (!Current(generation) || !StandbyView::IsScreenOff() ||
+        !display->PrepareWakeFromPowerSave()) {
         if (prepared) Board::GetInstance().CancelLowPowerWake();
         result.state = METALIO_APP_STANDBY_ERROR;
         result.error = METALIO_APP_POWER_ERROR_WAKE;
         Publish(generation, result);
         return;
     }
+    auto transition_lease = std::make_shared<PowerTransitionCoordinator::Lease>(
+        std::move(transition));
+    const uint32_t screen_off_generation = StandbyView::ScreenOffGeneration();
     // A queued completion contains only host-owned data. App unload or a new
-    // generation invalidates it before it can wake a later screen.
+    // generation invalidates it before it can wake a later screen. The shared
+    // transition lease stays alive until the UI has either applied or discarded
+    // the prepared wake, so standby entry cannot race between prepare and wake.
     while (Current(generation)) {
-        if (UiDispatcher::Post([this, generation, result]() mutable {
-            if (!Current(generation)) return;
+        if (UiDispatcher::Post([this, generation, screen_off_generation,
+                                result, transition_lease]() mutable {
+            if (!Current(generation) || !StandbyView::IsScreenOff() ||
+                StandbyView::ScreenOffGeneration() != screen_off_generation) return;
             StandbyView::WakeScreen();
             auto* restored = Board::GetInstance().GetDisplay();
             result.woke_to_lock_screen = StandbyView::IsActive() && !StandbyView::IsScreenOff() &&

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,19 @@ struct Callbacks {
     lv_event_cb_t external_selected = nullptr;
 };
 
+struct ListRow {
+    std::string key;
+    lv_obj_t* root = nullptr;
+    lv_obj_t* title = nullptr;
+    lv_obj_t* trailing = nullptr;
+    std::size_t* callback_index = nullptr;
+    bool connected = false;
+    bool style_ready = false;
+    uint32_t background_color = 0;
+    lv_opa_t background_opacity = 0;
+    bool seen = false;
+};
+
 struct Handles {
     lv_obj_t* mode_buttons[3] = {};
     lv_obj_t* mode_panels[3] = {};
@@ -41,6 +55,10 @@ struct Handles {
     lv_obj_t* status = nullptr;
     lv_obj_t* scan_button = nullptr;
     lv_obj_t* scan_label = nullptr;
+    bool saved_rendered = false;
+    bool nearby_rendered = false;
+    std::vector<ListRow> saved_rows;
+    std::vector<ListRow> nearby_rows;
 };
 
 Handles Build(lv_obj_t* parent, const Model& model,

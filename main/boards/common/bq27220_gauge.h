@@ -72,6 +72,12 @@ public:
     // 返回 false 表示 device 没挂上、或这一帧总线读失败；调用方应保留上次值
     // 或显示占位。
     bool GetBatteryLevel(int& level, bool& charging, bool& discharging);
+    // One voltage sample and the direction/current metadata derived from the
+    // same sampler turn. Voltage success is the return value; current_valid
+    // independently reports a transient current-register failure.
+    bool GetBatterySample(int& level, bool& charging, bool& discharging,
+                          uint16_t& voltage_mv, int16_t& current_ma,
+                          bool& current_valid);
 
     // 重置内部滑动平均缓存。换电池 / 长时间断开总线后可以调一次，避免老数据
     // 把新电压拉低。一般不需要主动调。

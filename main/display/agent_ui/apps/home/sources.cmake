@@ -2,6 +2,7 @@ list(APPEND AGENT_UI_SOURCES
     "display/agent_ui/apps/home/home_adapter.cc"
     "display/agent_ui/apps/home/home_controller.cc"
     "display/agent_ui/apps/home/home_module.cc"
+    "display/agent_ui/apps/home/home_render_cache.cc"
     "display/agent_ui/apps/home/home_renderer.cc"
     "display/agent_ui/apps/home/home_view.cc"
 )

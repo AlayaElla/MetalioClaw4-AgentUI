@@ -2,14 +2,15 @@
 
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
-#include <esp_timer.h>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <atomic>
+#include <cstdint>
 #include "display.h"
+#include "display_render_telemetry.h"
 #include "esp_lv_adapter.h"
 #include "lvgl_font.h"
 
@@ -62,4 +63,5 @@ private:
     std::atomic<bool> panel_present_{true};
     std::atomic<bool> adapter_sleep_prepared_{false};
     bool panel_io_published_ = true;
+    display_telemetry::DisplayRenderTelemetry display_telemetry_;
 };

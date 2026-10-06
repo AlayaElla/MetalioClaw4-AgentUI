@@ -5,9 +5,13 @@
 #include <memory>
 #include <utility>
 
+#include <esp_heap_caps.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <soc/soc_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #if SOC_MIPI_DSI_SUPPORTED
 #include <esp_lcd_mipi_dsi.h>
@@ -16,9 +20,12 @@
 #include "esp_lv_adapter.h"
 #include "expression_acceleration.h"
 #include "touch_feed.h"   
+#include "ui_dispatcher.h"
 
 #include "agent_ui/agent_ui_runtime.h"
 #include "agent_ui/apps/boot/boot_view.h"
+#include "agent_ui/apps/codex/codex_media_cache.h"
+#include "agent_ui/components/render_snapshot_buffer.h"
 #include "agent_ui/core/status_bar.h"
 #include "device_state.h"
 
@@ -27,7 +34,80 @@
 #include "panel_transport_lifecycle.h"
 #include "panel_sleep_transaction.h"
 
-static const char* TAG = "LVAdapterDisplay";
+namespace {
+
+const char* TAG = "LVAdapterDisplay";
+
+#if AGENT_UI_EXPERIMENTAL_DIRECT_RENDER
+constexpr auto kDisplayTearAvoidMode =
+    ESP_LV_ADAPTER_TEAR_AVOID_MODE_DOUBLE_DIRECT;
+constexpr char kDisplayRenderModeName[] = "DOUBLE_DIRECT";
+#else
+constexpr auto kDisplayTearAvoidMode =
+    ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL;
+constexpr char kDisplayRenderModeName[] = "TRIPLE_FULL";
+#endif
+
+int64_t ReadDisplayTelemetryClock(void*) { return esp_timer_get_time(); }
+
+void RequestUiDispatcherWake() {
+    const esp_err_t err = esp_lv_adapter_notify_work();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "UI dispatcher work notification failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+void DrainUiDispatcherBeforeTimers(void*) {
+    (void)UiDispatcher::DrainPending();
+}
+
+void LogDisplayTelemetryReport(const display_telemetry::WindowReport& stats,
+                               void*) {
+    const auto cache = agent_ui::RenderSnapshotBuffer::GetCacheStats();
+    const auto media = agent_ui::codex_media::Cache::GetImageMemoryStats();
+    constexpr uint32_t kInternal8Bit = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    constexpr uint32_t kPsram8Bit = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    const size_t internal_free = heap_caps_get_free_size(kInternal8Bit);
+    const size_t internal_min = heap_caps_get_minimum_free_size(kInternal8Bit);
+    const size_t internal_largest = heap_caps_get_largest_free_block(kInternal8Bit);
+    const size_t psram_free = heap_caps_get_free_size(kPsram8Bit);
+    const size_t psram_min = heap_caps_get_minimum_free_size(kPsram8Bit);
+    const size_t psram_largest = heap_caps_get_largest_free_block(kPsram8Bit);
+    const size_t owner_stack_hwm_bytes =
+        static_cast<size_t>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+    ESP_LOGI(TAG, "render mode=%s frames=%" PRIu64 " cycles_s=%.2f"
+                  " avg_refresh_ms=%.2f max_refresh_ms=%.2f dirty_px=%" PRIu64
+                  " flush_cb_ms_total=%.2f flush_wait_ms_total=%.2f window_ms=%" PRIu64
+                  " snapshot_cache=%u/%u B rejected=%u alloc_fail=%u reuse=%u"
+                  " media_images=%u/%u B rejected=%u"
+                  " heap8_internal_free/min/largest=%u/%u/%u B"
+                  " heap8_psram_free/min/largest=%u/%u/%u B"
+                  " lvgl_owner_stack_hwm=%u B",
+             stats.render_mode, stats.rendered_frames,
+             static_cast<double>(stats.rendered_frames) * 1000000.0 / stats.window_us,
+             stats.refresh_total_us / (1000.0 * stats.rendered_frames),
+             stats.refresh_max_us / 1000.0, stats.dirty_pixels,
+             stats.flush_callback_total_us / 1000.0,
+             stats.flush_wait_total_us / 1000.0, stats.window_us / 1000,
+             static_cast<unsigned>(cache.current_charge_bytes),
+             static_cast<unsigned>(cache.peak_charge_bytes),
+             static_cast<unsigned>(cache.rejected_allocations),
+             static_cast<unsigned>(cache.allocation_failures),
+             static_cast<unsigned>(cache.reuse_hits),
+             static_cast<unsigned>(media.current_bytes),
+             static_cast<unsigned>(media.peak_bytes),
+             static_cast<unsigned>(media.rejected_allocations),
+             static_cast<unsigned>(internal_free),
+             static_cast<unsigned>(internal_min),
+             static_cast<unsigned>(internal_largest),
+             static_cast<unsigned>(psram_free),
+             static_cast<unsigned>(psram_min),
+             static_cast<unsigned>(psram_largest),
+             static_cast<unsigned>(owner_stack_hwm_bytes));
+}
+
+}  // namespace
 
 LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
                                    const esp_lcd_panel_io_handle_t panel_io,
@@ -47,7 +127,8 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
       delete_panel_(std::move(delete_panel)),
       delete_panel_transport_(std::move(delete_panel_transport)),
       set_panel_power_(std::move(set_panel_power)),
-      publish_panel_io_(std::move(publish_panel_io)) {
+      publish_panel_io_(std::move(publish_panel_io)),
+      display_telemetry_(kDisplayRenderModeName) {
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
     esp_lv_adapter_config_t adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
@@ -57,23 +138,17 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
     adapter_cfg.task_priority = 4;
     adapter_cfg.task_core_id = 1;
 
+    if (!UiDispatcher::ConfigureExecutor(RequestUiDispatcherWake)) {
+        ESP_LOGE(TAG, "UI dispatcher owner-task executor could not be configured");
+    }
     ESP_ERROR_CHECK(esp_lv_adapter_init(&adapter_cfg));
+    ESP_ERROR_CHECK(esp_lv_adapter_set_before_handler_callback(
+        DrainUiDispatcherBeforeTimers, nullptr));
 
-    // 性能调优要点（720x720 RGB565 屏）：
-    //   - enable_ppa_accel: 开启 PPA。半透明/圆角会触发 adapter「先 msync 再
-    //     软件 fallback」；主屏翻页期间由 home_screen 降级为纯不透明直角绘制
-    //     （见 SetPagerSkeletonMode），避免刷 invalid addr。
-    //   - tear_avoid_mode = TRIPLE_FULL：直接把 LCD 驱动里 num_fbs=3 的 3 张
-    //     panel 帧缓冲（PSRAM 上 3×720×720×2 ≈ 3MB）当成 LVGL 的 draw buffer
-    //     用，渲染→DMA 三级流水，无撕裂。
-    //     之前用 DEFAULT_MIPI_DSI（= TRIPLE_PARTIAL）会额外要一块
-    //     720×buffer_height×2 ≈ 280KB 的内部 SRAM partial buffer，而片上 SRAM
-    //     被 FreeRTOS / WiFi / SDIO 吃掉后根本剩不下，导致启动日志里报
-    //     「alloc partial draw buffer failed」+「tear mode 4 setup failed」，
-    //     adapter 还会再 fallback 申请 ~576KB PSRAM 当双缓冲，3MB+576KB 双重
-    //     浪费。TRIPLE_FULL 彻底避开这条 fallback 路径。
-    //   - buffer_height / require_double_buffer 在 TRIPLE_FULL 模式下不再生效
-    //     （buffer 直接用 panel FB），保留是为了将来切回 partial 模式方便。
+    // 720x720 RGB888 uses 3 bytes per pixel. The default TRIPLE_FULL mode
+    // uses the panel's three framebuffers (~4.45 MiB) as LVGL draw buffers;
+    // DOUBLE_DIRECT uses the adapter's two-buffer direct-render mode.
+    // buffer_height and require_double_buffer do not size these full buffers.
     esp_lv_adapter_display_config_t disp_cfg = {
         .panel = panel,
         .panel_io = panel_io,
@@ -87,10 +162,14 @@ LVAdapterDisplay::LVAdapterDisplay(const esp_lcd_panel_handle_t panel,
                 .enable_ppa_accel = true,
                 .require_double_buffer = true,
             },
-        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_FULL,
+        .tear_avoid_mode = kDisplayTearAvoidMode,
     };
 
     display_ = esp_lv_adapter_register_display(&disp_cfg);
+    display_telemetry_.Attach(display_, ReadDisplayTelemetryClock,
+                              LogDisplayTelemetryReport, nullptr);
+    ESP_LOGI(TAG, "Rendering mode=%s",
+             kDisplayRenderModeName);
     ESP_ERROR_CHECK(esp_lv_adapter_fps_stats_enable(display_, true));
     agent_ui::InitializeExpressionAcceleration();
     esp_lv_adapter_touch_config_t touch_cfg =

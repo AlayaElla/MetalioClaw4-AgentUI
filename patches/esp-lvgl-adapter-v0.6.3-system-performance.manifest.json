@@ -1,0 +1,29 @@
+{
+  "component": "espressif/esp_lvgl_adapter",
+  "version": "0.6.3",
+  "component_hash": "74ad06b34ee7aec3f2a4f4fd8ed20852527a780d35d0154488624383d9e72972",
+  "upstream_commit": "db9f2f48527f9a98a87e0ca741c8dacd31814f42",
+  "patch_sha256": "0a241b77303ebfd195cb05f7a345acdcb567f0c625f2255b263cd09cece627b1",
+  "planner_header": {
+    "path": "main/display/display_cache_sync_plan.h",
+    "sha256": "78eaff130948b9c59da8062fbf9acd31ae18664b117c6c6f0ec2d46c49dc703c"
+  },
+  "files": {
+    "src/display/bridge/v9/lvgl_bridge_v9.c": {
+      "pristine_sha256": "424e7ef240aee67da6a42f9f065bcdc1114393ab7ea38e4f7e449edfcb33f2ed",
+      "patched_sha256": "af51c163d2705b3b349ccc8e4406669bdc8d70915989ff03620c608cbcea6e25"
+    },
+    "src/adapter/adapter_internal.h": {
+      "pristine_sha256": "b1d376275ff143aa121eaa7dd1cd72cbf50e18e5aba695e300f498fcbcc44327",
+      "patched_sha256": "44f49246941a4a098769d6b26faa30eec12da87c8a00e5b5380aed5ce7cd08d3"
+    },
+    "include/esp_lv_adapter.h": {
+      "pristine_sha256": "ae5520679cc1614267fdf0bc58685500b4db6816bdf9e747a43e32529ffbe22c",
+      "patched_sha256": "680bcfb5a7117b50897cb8a8d9ad54a0e356625c839d1a0fc1883ec679716376"
+    },
+    "src/adapter/esp_lv_adapter.c": {
+      "pristine_sha256": "3aaf0e1b79c8f89afb1224f5f08957aee3e76e1ae2d9d3ae626d717a6b42b2f5",
+      "patched_sha256": "9d8c049e047cac9c09c699c0ec6c21211bddee060b2419d84d354f8afd100025"
+    }
+  }
+}

@@ -2,9 +2,7 @@
 
 #include <utility>
 
-#include "application.h"
 #include "agent_ui/apps/home/home_renderer.h"
-#include "assets/common_sounds.h"
 
 namespace agent_ui::home {
 
@@ -19,16 +17,8 @@ lv_obj_t* View::Mount(IntentSink intent_sink) {
             [this]() {
                 if (intent_sink_) intent_sink_(Intent::ToggleListening());
             },
-        .play_carousel_tick = []() {
-            Application::GetInstance().Schedule([]() {
-                auto& app = Application::GetInstance();
-                // The detent is only UI feedback. Mixing it into the shared
-                // Opus decode queue while TTS is streaming can reset the
-                // decoder between different frame formats and stall speech.
-                if (app.GetDeviceState() != kDeviceStateSpeaking) {
-                    app.PlaySound(CommonSounds::OGG_RATCHET_DETENT);
-                }
-            });
+        .play_carousel_tick = [this]() {
+            if (intent_sink_) intent_sink_(Intent::PlayCarouselTick());
         },
         .unmounted = [this]() { Unmount(); },
     });
@@ -41,6 +31,32 @@ void View::Render(const ViewState& state) {
 
 void View::Unmount() {
     intent_sink_ = nullptr;
+}
+
+void View::NotifyUserActivity() { Renderer::NotifyUserActivity(); }
+
+void View::SleepExpression() { Renderer::SleepExpression(); }
+
+bool View::IsMounted() const { return Renderer::IsMounted(); }
+
+void View::UpdateBattery(bool has_battery, int level, bool charging) {
+    Renderer::UpdateBattery(has_battery, level, charging);
+}
+
+void View::PlayDizzy() { Renderer::PlayDizzy(); }
+
+void View::HoldChargingExpression() { Renderer::HoldChargingExpression(); }
+
+void View::HoldDizzyExpression() { Renderer::HoldDizzyExpression(); }
+
+void View::ReleaseSpecialExpression() { Renderer::ReleaseSpecialExpression(); }
+
+bool View::OwnsScreen(lv_obj_t* screen) const {
+    return screen != nullptr && Renderer::Screen() == screen;
+}
+
+void View::SetRenderingPaused(bool paused) {
+    Renderer::SetRenderingPaused(paused);
 }
 
 }  // namespace agent_ui::home

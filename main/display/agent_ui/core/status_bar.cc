@@ -1,55 +1,34 @@
 #include "status_bar.h"
 
 #include <algorithm>
-#include <cstring>
 #include <cstdio>
-#include <ctime>
 #include <utility>
 
 #include <font_awesome.h>
 #include <esp_log.h>
 
-#include "application.h"
-#include "ai/ai_availability.h"
-#include "apps/bluetooth/bluetooth_adapter.h"
-#include "apps/home/home_renderer.h"
-#include "board.h"
 #include "fonts.h"
 #include "theme.h"
-#include "dual_network_board.h"
-#include "settings.h"
 #include "status_signal_assets.h"
 
 namespace agent_ui {
 namespace {
 
-const lv_image_dsc_t* SelectNetworkAsset(NetworkMode mode, const char* icon) {
+const lv_image_dsc_t* SelectNetworkAsset(StatusBarNetworkIcon icon) {
     using namespace status_signal_assets;
-    if (mode == NetworkMode::Wifi) {
-        if (icon == nullptr || icon[0] == '\0') return &kWifi0;
-        if (std::strcmp(icon, FONT_AWESOME_WIFI_SLASH) == 0) return &kDisconnected;
-        if (std::strcmp(icon, FONT_AWESOME_WIFI_WEAK) == 0) return &kWifi1;
-        if (std::strcmp(icon, FONT_AWESOME_WIFI_FAIR) == 0) return &kWifi2;
-        if (std::strcmp(icon, FONT_AWESOME_WIFI) == 0) return &kWifi3;
-        return &kWifi0;
+    switch (icon) {
+        case StatusBarNetworkIcon::WifiDisconnected: return &kDisconnected;
+        case StatusBarNetworkIcon::WifiWeak: return &kWifi1;
+        case StatusBarNetworkIcon::WifiFair: return &kWifi2;
+        case StatusBarNetworkIcon::WifiGood: return &kWifi3;
+        case StatusBarNetworkIcon::CellularWeak: return &kCellular1;
+        case StatusBarNetworkIcon::CellularFair: return &kCellular2;
+        case StatusBarNetworkIcon::CellularGood: return &kCellular3;
+        case StatusBarNetworkIcon::CellularStrong: return &kCellular4;
+        case StatusBarNetworkIcon::CellularOff: return &kCellular0;
+        case StatusBarNetworkIcon::WifiDefault:
+        default: return &kWifi0;
     }
-
-    if (icon == nullptr || icon[0] == '\0' ||
-        std::strcmp(icon, FONT_AWESOME_SIGNAL_OFF) == 0) {
-        return &kCellular0;
-    }
-    if (std::strcmp(icon, FONT_AWESOME_SIGNAL_WEAK) == 0) return &kCellular1;
-    if (std::strcmp(icon, FONT_AWESOME_SIGNAL_FAIR) == 0) return &kCellular2;
-    if (std::strcmp(icon, FONT_AWESOME_SIGNAL_GOOD) == 0) return &kCellular3;
-    if (std::strcmp(icon, FONT_AWESOME_SIGNAL_STRONG) == 0) return &kCellular4;
-    return &kCellular0;
-}
-
-int BatteryCellCount(bool has_battery, int level) {
-    if (!has_battery || level < 20) return 0;
-    if (level < 50) return 1;
-    if (level < 80) return 2;
-    return 3;
 }
 
 void SetA8Color(lv_obj_t* image, uint32_t color) {
@@ -61,7 +40,7 @@ void SetA8Color(lv_obj_t* image, uint32_t color) {
 
 void StatusBar::AgentFaceClicked(lv_event_t* event) {
     auto* self = static_cast<StatusBar*>(lv_event_get_user_data(event));
-    if (self == nullptr || !ai::Availability::Get().IsAvailable()) return;
+    if (self == nullptr || !self->data_provider_.IsAiAvailableNow()) return;
     self->SetReplyCaption(nullptr);
     // The callback is runtime-owned, so the shared top control does not
     // depend on whichever application screen is currently mounted.
@@ -249,23 +228,28 @@ void StatusBar::Create() {
     lv_obj_remove_flag(battery_bolt_fill_, LV_OBJ_FLAG_CLICKABLE);
 
     timer_ = lv_timer_create(TimerCallback, 1000, this);
+    if (!visible_) {
+        lv_timer_pause(timer_);
+        lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
+    }
+    UpdateAgentPresentation();
+    SyncAgentExpressionRendering();
     lv_obj_add_event_cb(root_, DeletedCallback, LV_EVENT_DELETE, this);
-}
-
-NetworkMode StatusBar::ReadNetworkMode() const {
-    const NetworkType type = DualNetworkBoard::LoadNetworkTypeFromSettings(1);
-    if (type == NetworkType::WIFI) return NetworkMode::Wifi;
-
-    Settings settings("network", true);
-    return settings.GetInt("sim_slot", 0) == 1 ? NetworkMode::InternalSim
-                                                : NetworkMode::ExternalSim;
 }
 
 void StatusBar::Refresh(bool force) {
     if (root_ == nullptr) return;
 
+    const StatusBarData data = data_provider_.Collect();
     const auto& colors = Theme::Get().colors();
-    const bool available = ai::Availability::Get().IsAvailable();
+    const bool theme_changed = !style_initialized_ ||
+        last_colors_.background != colors.background || last_colors_.text != colors.text ||
+        last_colors_.muted != colors.muted || last_colors_.accent != colors.accent ||
+        last_colors_.danger != colors.danger;
+    const bool repaint_styles = force || theme_changed;
+    last_colors_ = colors;
+    style_initialized_ = true;
+    const bool available = data.ai_available;
     if (force || available != ai_available_) {
         ai_available_ = available;
         if (agent_face_slot_ != nullptr) {
@@ -278,12 +262,11 @@ void StatusBar::Refresh(bool force) {
         if (!available) ClearReplyCaption();
         UpdateAgentPresentation();
     }
-    const bool bluetooth_enabled = bluetooth::Adapter::Get().IsEnabled();
-    const bool bluetooth_connected = bluetooth_enabled &&
-                                     bluetooth::Adapter::Get().IsConnected();
-    lv_obj_set_width(left_cluster_, bluetooth_enabled ? 214 : 174);
+    const bool bluetooth_enabled = data.bluetooth_enabled;
+    const bool bluetooth_connected = data.bluetooth_connected;
     if (force || last_bluetooth_enabled_ != bluetooth_enabled ||
         last_bluetooth_connected_ != bluetooth_connected) {
+        lv_obj_set_width(left_cluster_, bluetooth_enabled ? 214 : 174);
         last_bluetooth_enabled_ = bluetooth_enabled;
         last_bluetooth_connected_ = bluetooth_connected;
         if (bluetooth_enabled) {
@@ -292,13 +275,15 @@ void StatusBar::Refresh(bool force) {
             lv_obj_add_flag(bluetooth_icon_, LV_OBJ_FLAG_HIDDEN);
         }
     }
-    lv_obj_set_style_text_color(bluetooth_icon_, lv_color_hex(colors.text),
-                                LV_PART_MAIN);
-    network_mode_ = ReadNetworkMode();
-    const char* network_icon = Board::GetInstance().GetNetworkStateIcon();
-    const lv_image_dsc_t* network_asset = SelectNetworkAsset(network_mode_, network_icon);
+    if (repaint_styles) {
+        lv_obj_set_style_text_color(bluetooth_icon_, lv_color_hex(colors.text), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(root_, lv_color_hex(colors.background), LV_PART_MAIN);
+        SetA8Color(network_icon_, colors.text);
+        lv_obj_set_style_text_color(time_label_, lv_color_hex(colors.text), LV_PART_MAIN);
+    }
+    const lv_image_dsc_t* network_asset = SelectNetworkAsset(data.network_icon);
     if (force || last_network_asset_ != network_asset) {
-        if (network_mode_ == NetworkMode::Wifi &&
+        if (data.network_mode == NetworkMode::Wifi &&
             last_network_asset_ == &status_signal_assets::kDisconnected &&
             network_asset != &status_signal_assets::kDisconnected) {
             ESP_LOGI("AgentStatusBar", "Wi-Fi icon updated after connection");
@@ -306,78 +291,74 @@ void StatusBar::Refresh(bool force) {
         last_network_asset_ = network_asset;
         lv_image_set_src(network_icon_, network_asset);
     }
-    lv_obj_set_style_bg_color(root_, lv_color_hex(colors.background), LV_PART_MAIN);
-    SetA8Color(network_icon_, colors.text);
 
-    char time_buffer[16] = "--:--";
-    const time_t now = time(nullptr);
-    struct tm local = {};
-    if (localtime_r(&now, &local) != nullptr && local.tm_year >= 125) {
-        strftime(time_buffer, sizeof(time_buffer), "%H:%M", &local);
-    }
-    const auto& app = Application::GetInstance();
     std::string center_text;
-    const bool has_activation = app.HasPendingActivation();
-    if (has_activation) {
-        center_text = "验证码: " + app.GetPendingActivationCode();
+    if (data.activation_pending) {
+        center_text = "验证码: " + data.activation_code;
     }
-    if (force || last_time_text_ != time_buffer) {
-        last_time_text_ = time_buffer;
-        lv_label_set_text(time_label_, time_buffer);
+    if (force || last_time_text_ != data.time_text.data()) {
+        last_time_text_ = data.time_text.data();
+        lv_label_set_text(time_label_, data.time_text.data());
     }
-    lv_obj_set_style_text_color(
-        time_label_, lv_color_hex(colors.text), LV_PART_MAIN);
     // Theme changes must repaint the already-rendered agent state as well as
     // the network, clock, and battery colors refreshed below.
-    if (force) SetAgentState(agent_state_);
+    if (repaint_styles) SetAgentState(agent_state_);
     if (force || last_center_text_ != center_text) {
         last_center_text_ = center_text;
         UpdateAgentPresentation();
     }
 
-    int level = 0;
-    bool charging = false;
-    bool discharging = false;
-    const bool has_battery = Board::GetInstance().GetBatteryLevel(
-        level, charging, discharging);
-    home::Renderer::UpdateBattery(has_battery, level, charging);
+    const bool has_battery = data.battery.has_battery;
+    const int level = data.battery.level;
+    const bool charging = data.battery.charging;
+    if (battery_update_callback_) {
+        battery_update_callback_(has_battery, level, charging);
+    }
+    const StatusBarBatteryPresentation battery_presentation =
+        ResolveStatusBarBatteryPresentation(has_battery, level, charging);
     char battery_text[12] = "--%";
     if (has_battery) {
-        level = std::clamp(level, 0, 100);
-        std::snprintf(battery_text, sizeof(battery_text), "%d%%", level);
+        std::snprintf(battery_text, sizeof(battery_text), "%d%%",
+                      battery_presentation.level);
     }
     if (force || last_battery_text_ != battery_text) {
         last_battery_text_ = battery_text;
         lv_label_set_text(battery_label_, battery_text);
     }
-    const uint32_t battery_color = has_battery && !charging && level < 20
+    const uint32_t battery_color = battery_presentation.low
                                        ? colors.danger
                                        : (charging ? colors.accent : colors.text);
     const uint32_t outline_color = has_battery ? battery_color : colors.muted;
-    lv_obj_set_style_text_color(
-        battery_label_, lv_color_hex(outline_color), LV_PART_MAIN);
-    lv_obj_set_style_border_color(
-        battery_outline_, lv_color_hex(outline_color), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(
-        battery_tip_, lv_color_hex(outline_color), LV_PART_MAIN);
-    const int active_cells = BatteryCellCount(has_battery, level);
-    for (size_t index = 0; index < battery_cells_.size(); ++index) {
+    const int active_cells = battery_presentation.active_cells;
+    if (repaint_styles || outline_color != last_battery_outline_color_ ||
+        active_cells != last_active_cells_ || charging != last_battery_charging_) {
+        last_battery_outline_color_ = outline_color;
+        last_active_cells_ = active_cells;
+        last_battery_charging_ = charging;
+        lv_obj_set_style_text_color(
+            battery_label_, lv_color_hex(outline_color), LV_PART_MAIN);
+        lv_obj_set_style_border_color(
+            battery_outline_, lv_color_hex(outline_color), LV_PART_MAIN);
         lv_obj_set_style_bg_color(
-            battery_cells_[index], lv_color_hex(outline_color), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(
-            battery_cells_[index], static_cast<int>(index) < active_cells
-                                       ? LV_OPA_COVER
-                                       : LV_OPA_20,
-            LV_PART_MAIN);
-    }
-    SetA8Color(battery_bolt_outline_, colors.background);
-    SetA8Color(battery_bolt_fill_, colors.accent);
-    if (charging) {
-        lv_obj_remove_flag(battery_bolt_outline_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(battery_bolt_fill_, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(battery_bolt_outline_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(battery_bolt_fill_, LV_OBJ_FLAG_HIDDEN);
+            battery_tip_, lv_color_hex(outline_color), LV_PART_MAIN);
+        for (size_t index = 0; index < battery_cells_.size(); ++index) {
+            lv_obj_set_style_bg_color(
+                battery_cells_[index], lv_color_hex(outline_color), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(
+                battery_cells_[index], static_cast<int>(index) < active_cells
+                                           ? LV_OPA_COVER
+                                           : LV_OPA_20,
+                LV_PART_MAIN);
+        }
+        SetA8Color(battery_bolt_outline_, colors.background);
+        SetA8Color(battery_bolt_fill_, colors.accent);
+        if (charging) {
+            lv_obj_remove_flag(battery_bolt_outline_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(battery_bolt_fill_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(battery_bolt_outline_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(battery_bolt_fill_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -411,6 +392,10 @@ void StatusBar::SetReplyCaption(const char* caption) {
 
 void StatusBar::SetAgentTapCallback(AgentTapCallback callback) {
     agent_tap_callback_ = std::move(callback);
+}
+
+void StatusBar::SetBatteryUpdateCallback(BatteryUpdateCallback callback) {
+    battery_update_callback_ = std::move(callback);
 }
 
 void StatusBar::ClearReplyCaption() {
@@ -455,20 +440,34 @@ void StatusBar::AnimateAgentFace(int32_t target, uint32_t duration_ms) {
 }
 
 void StatusBar::UpdateAgentPresentation() {
-    if (!agent_face_slot_ || !agent_label_ || !reply_clip_) return;
-    const bool show_activation = !last_center_text_.empty() && !lock_screen_mode_;
-    if (show_activation && !reply_caption_.empty()) ClearReplyCaption();
-    const bool show_caption = !reply_caption_.empty() && !lock_screen_mode_ && ai_available_ && !show_activation;
-    if (home_active_ || lock_screen_mode_ || !ai_available_ || show_activation) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
+    if (!agent_face_slot_ || !agent_label_ || !reply_clip_) {
+        SyncAgentExpressionRendering();
+        return;
+    }
+    StatusBarAgentInput input;
+    input.home_active = home_active_;
+    input.lock_screen = lock_screen_mode_;
+    input.ai_available = ai_available_;
+    input.activation_pending = !last_center_text_.empty();
+    input.reply_caption_present = !reply_caption_.empty();
+    const StatusBarAgentPresentation presentation =
+        ResolveStatusBarAgentPresentation(input);
+    if (presentation.clear_reply_caption && !reply_caption_.empty()) {
+        ClearReplyCaption();
+    }
+    if (presentation.hide_face) lv_obj_add_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN);
-    if (show_caption) {
+    SyncAgentExpressionRendering();
+    if (presentation.show_reply_caption) {
         lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+        SyncAgentExpressionRendering();
         lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
         if (reply_presented_) return;
         reply_presented_ = true;
         if (reply_finish_timer_) { lv_timer_delete(reply_finish_timer_); reply_finish_timer_ = nullptr; }
         lv_anim_delete(agent_label_, SetObjectTranslateX);
         lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);
+        lv_obj_set_style_text_align(agent_label_, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
         std::string single_line = reply_caption_;
         std::replace(single_line.begin(), single_line.end(), '\n', ' ');
         std::replace(single_line.begin(), single_line.end(), '\r', ' ');
@@ -518,23 +517,49 @@ void StatusBar::UpdateAgentPresentation() {
         }, duration, this);
         return;
     }
-    if (show_activation) {
+    if (presentation.show_activation) {
         lv_anim_delete(agent_label_, SetObjectTranslateX);
         lv_obj_remove_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
         lv_label_set_text(agent_label_, last_center_text_.c_str());
         lv_obj_set_style_translate_x(agent_label_, 0, LV_PART_MAIN);
-        lv_obj_set_x(reply_clip_, home_active_ ? 0 : 140);
-        lv_obj_set_width(reply_clip_, home_active_ ? 360 : 220);
-        lv_obj_set_width(agent_label_, home_active_ ? 360 : 220);
+        // The activation code uses the full centered cluster on every page;
+        // reply captions have a separate offset and may scroll beside the face.
+        lv_obj_set_x(reply_clip_, 0);
+        lv_obj_set_width(reply_clip_, 360);
+        lv_obj_set_width(agent_label_, 360);
+        lv_obj_set_style_text_align(agent_label_, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     } else lv_obj_add_flag(agent_label_, LV_OBJ_FLAG_HIDDEN);
     if (battery_group_) {
         lv_anim_delete(battery_group_, SetAgentClusterTranslateY);
         lv_obj_set_style_translate_y(battery_group_, 0, LV_PART_MAIN);
         lv_obj_set_style_opa(battery_group_, LV_OPA_COVER, LV_PART_MAIN);
     }
-    if (lock_screen_mode_ || (home_active_ && !show_activation)) lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    if (presentation.hide_cluster) lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_remove_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    SyncAgentExpressionRendering();
     AnimateAgentFace(0, 420);
+}
+
+void StatusBar::SyncAgentExpressionRendering() {
+    if (!agent_expression_) return;
+    bool should_pause = !visible_ || root_ == nullptr ||
+                        agent_cluster_ == nullptr || agent_face_slot_ == nullptr;
+    if (root_ != nullptr && lv_obj_is_valid(root_) &&
+        lv_obj_has_flag(root_, LV_OBJ_FLAG_HIDDEN)) {
+        should_pause = true;
+    }
+    if (agent_cluster_ != nullptr && lv_obj_is_valid(agent_cluster_) &&
+        lv_obj_has_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN)) {
+        should_pause = true;
+    }
+    if (agent_face_slot_ != nullptr && lv_obj_is_valid(agent_face_slot_) &&
+        lv_obj_has_flag(agent_face_slot_, LV_OBJ_FLAG_HIDDEN)) {
+        should_pause = true;
+    }
+    if (agent_expression_paused_ == should_pause) return;
+    agent_expression_paused_ = should_pause;
+    agent_expression_->SetRenderingPaused(should_pause);
+    if (!should_pause) agent_expression_->SetState(agent_state_);
 }
 
 namespace {
@@ -554,11 +579,18 @@ void StatusBar::SetVisible(bool visible) {
     visible_ = visible;
     if (root_ == nullptr) return;
     if (visible) {
+        if (timer_ != nullptr) {
+            lv_timer_resume(timer_);
+            lv_timer_reset(timer_);
+        }
         lv_obj_remove_flag(root_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(root_);
         Refresh(true);
+        SyncAgentExpressionRendering();
     } else {
+        if (timer_ != nullptr) lv_timer_pause(timer_);
         lv_obj_add_flag(root_, LV_OBJ_FLAG_HIDDEN);
+        SyncAgentExpressionRendering();
     }
 }
 
@@ -578,6 +610,7 @@ void StatusBar::OnAgentClusterExitCompleted(lv_anim_t* animation) {
         return;
     }
     lv_obj_add_flag(self->agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+    self->SyncAgentExpressionRendering();
 }
 
 void StatusBar::AnimateAgentCluster(int32_t target, uint32_t duration_ms) {
@@ -618,6 +651,7 @@ void StatusBar::SetHomeActive(bool active) {
     lv_anim_delete(agent_cluster_, SetAgentClusterTranslateY);
     if (lock_screen_mode_) {
         lv_obj_add_flag(agent_cluster_, LV_OBJ_FLAG_HIDDEN);
+        SyncAgentExpressionRendering();
         return;
     }
     if (active) {
@@ -676,6 +710,7 @@ void StatusBar::DeletedCallback(lv_event_t* event) {
         lv_anim_delete(self->agent_cluster_, SetAgentClusterTranslateY);
     }
     self->agent_expression_.reset();
+    self->agent_expression_paused_ = false;
     self->root_ = nullptr;
     self->left_cluster_ = nullptr;
     self->time_label_ = nullptr;
@@ -697,6 +732,8 @@ void StatusBar::DeletedCallback(lv_event_t* event) {
     self->battery_label_ = nullptr;
     self->last_bluetooth_enabled_ = false;
     self->last_bluetooth_connected_ = false;
+    self->style_initialized_ = false;
+    self->last_active_cells_ = -1;
     self->home_active_ = true;
     self->ai_available_ = true;
     self->reply_caption_.clear();

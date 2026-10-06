@@ -4,12 +4,11 @@
 #include <string_view>
 
 #include "fonts.h"
-#include "expression_acceleration.h"
 #include "haptic_feedback.h"
+#include "render_snapshot_buffer.h"
 #include "theme.h"
 
 #ifdef ESP_PLATFORM
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #endif
@@ -266,35 +265,14 @@ void Keyboard::ApplyTheme() {
 void Keyboard::RefreshRenderCache() {
 #if LV_USE_SNAPSHOT
     render_cache_ready_ = false;
-    UnregisterKeyboardRenderBuffer(&render_cache_);
+    render_snapshot_.Invalidate();
     if (keyboard_ == nullptr || !visible()) return;
     lv_obj_update_layout(keyboard_);
     const auto format = lv_display_get_color_format(lv_obj_get_display(keyboard_));
     const uint32_t width = lv_obj_get_width(keyboard_);
     const uint32_t height = lv_obj_get_height(keyboard_);
-    const uint32_t stride = lv_draw_buf_width_to_stride(width, format);
-    const uint32_t bytes = stride * height;
-    if (render_cache_memory_ != nullptr &&
-        (render_cache_.data_size != bytes || render_cache_.header.cf != format)) {
-        ReleaseRenderCache();
-    }
-    if (render_cache_memory_ == nullptr) {
-        // One active page only. Never consume the internal heap needed by
-        // audio/network tasks if PSRAM cannot accommodate this optional cache.
-#ifdef ESP_PLATFORM
-        render_cache_memory_ = heap_caps_aligned_alloc(
-            128, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#else
-        render_cache_memory_ = lv_malloc(bytes);
-#endif
-        if (render_cache_memory_ == nullptr) return;
-        if (lv_draw_buf_init(&render_cache_, width, height, format, stride,
-                             render_cache_memory_, bytes) != LV_RESULT_OK) {
-            ReleaseRenderCache();
-            return;
-        }
-        lv_draw_buf_set_flag(&render_cache_, LV_IMAGE_FLAGS_MODIFIABLE);
-    }
+    if (!render_snapshot_.Prepare(width, height, format)) return;
+    const size_t bytes = render_snapshot_.bytes();
 
     // Build outside DRAW_MAIN; the snapshot can dispatch draw tasks itself.
     // A mode switch may occur before the user's finger is released, so exclude
@@ -302,23 +280,19 @@ void Keyboard::RefreshRenderCache() {
     taking_snapshot_ = true;
     const bool pressed = lv_obj_has_state(keyboard_, LV_STATE_PRESSED);
     if (pressed) lv_obj_remove_state(keyboard_, LV_STATE_PRESSED);
-    lv_image_cache_drop(&render_cache_);
-    lv_image_header_cache_drop(&render_cache_);
 #ifdef ESP_PLATFORM
     const int64_t started_us = esp_timer_get_time();
 #endif
-    const auto result = lv_snapshot_take_to_draw_buf(keyboard_, format, &render_cache_);
+    const bool captured = render_snapshot_.Capture(keyboard_);
     if (pressed) lv_obj_add_state(keyboard_, LV_STATE_PRESSED);
     taking_snapshot_ = false;
     // The keyboard has an opaque rectangular background and no external
     // effects. If that changes, keep native rendering rather than cache an
     // uninitialised border or crop an effect.
-    render_cache_ready_ = result == LV_RESULT_OK &&
-                          render_cache_.header.w == width && render_cache_.header.h == height;
+    render_cache_ready_ = captured;
     cached_mode_ = lv_keyboard_get_mode(keyboard_);
     if (render_cache_ready_) {
-        lv_draw_buf_flush_cache(&render_cache_, nullptr);
-        RegisterKeyboardRenderBuffer(&render_cache_);
+        render_snapshot_.RegisterKeyboard();
 #ifdef ESP_PLATFORM
         ESP_LOGI("AgentKeyboard", "cache mode=%u bytes=%lu build=%lldus",
                  static_cast<unsigned>(cached_mode_), static_cast<unsigned long>(bytes),
@@ -332,36 +306,28 @@ void Keyboard::RenderCacheCallback(lv_event_t* event) {
     auto* self = static_cast<Keyboard*>(lv_event_get_user_data(event));
     if (self == nullptr || !self->render_cache_ready_ || self->taking_snapshot_) return;
     auto* keyboard = self->keyboard_;
+    const lv_draw_buf_t* snapshot = self->render_snapshot_.buffer();
     // Use the native widget for transient touch and hardware-keyboard focus
     // feedback; its event handling and hit targets are never replaced.
-    if (keyboard == nullptr || lv_obj_has_state(keyboard, LV_STATE_PRESSED) ||
+    if (keyboard == nullptr || snapshot == nullptr ||
+        lv_obj_has_state(keyboard, LV_STATE_PRESSED) ||
         lv_obj_has_state(keyboard, LV_STATE_FOCUS_KEY) ||
         lv_obj_has_state(keyboard, LV_STATE_EDITED) ||
         lv_keyboard_get_mode(keyboard) != self->cached_mode_) return;
     lv_area_t area;
     lv_obj_get_coords(keyboard, &area);
-    if (lv_area_get_width(&area) != self->render_cache_.header.w ||
-        lv_area_get_height(&area) != self->render_cache_.header.h) return;
+    if (lv_area_get_width(&area) != snapshot->header.w ||
+        lv_area_get_height(&area) != snapshot->header.h) return;
     lv_draw_image_dsc_t image;
     lv_draw_image_dsc_init(&image);
-    image.src = &self->render_cache_;
+    image.src = snapshot;
     lv_draw_image(lv_event_get_layer(event), &image, &area);
     lv_event_stop_processing(event);
 }
 
 void Keyboard::ReleaseRenderCache() {
     render_cache_ready_ = false;
-    UnregisterKeyboardRenderBuffer(&render_cache_);
-    if (render_cache_memory_ == nullptr) return;
-    lv_image_cache_drop(&render_cache_);
-    lv_image_header_cache_drop(&render_cache_);
-#ifdef ESP_PLATFORM
-    heap_caps_free(render_cache_memory_);
-#else
-    lv_free(render_cache_memory_);
-#endif
-    render_cache_memory_ = nullptr;
-    render_cache_ = {};
+    render_snapshot_.Release();
 }
 
 void Keyboard::RootDeletedCallback(lv_event_t* event) {

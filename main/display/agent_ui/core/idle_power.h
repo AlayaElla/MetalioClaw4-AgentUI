@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 #include "lvgl.h"
 #include "micro_display_policy.h"
@@ -12,6 +13,13 @@ namespace agent_ui {
 
 class IdlePower {
 public:
+    struct HomeCallbacks {
+        std::function<void()> notify_user_activity;
+        std::function<void()> sleep_expression;
+        std::function<bool()> is_mounted;
+        std::function<void(bool, int, bool)> update_battery;
+    };
+
     static constexpr int kDefaultStandbyMinutes = 5;
     static constexpr std::array<int, 5> kStandbyMinuteOptions = {
         1, 5, 10, 15, 30,
@@ -20,6 +28,7 @@ public:
     static IdlePower& Get();
 
     void Initialize(Board& board);
+    void SetHomeCallbacks(HomeCallbacks callbacks);
     void NotifyActivity();
     void SetMicroDisplay(const MicroDisplayConfig& config);
     void RestoreExpressionSleep();
@@ -35,6 +44,7 @@ private:
     void Tick();
     void UpdateMicroBacklight();
     MicroDisplayPolicy micro_display_;
+    HomeCallbacks home_callbacks_;
     int micro_brightness_ = -1;
 
     lv_timer_t* timer_ = nullptr;

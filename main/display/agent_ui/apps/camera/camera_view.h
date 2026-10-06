@@ -110,6 +110,9 @@ private:
     std::vector<std::shared_ptr<const DecodedImage>> thumbnail_frames_;
     std::vector<GalleryPhoto> rendered_gallery_;
     bool gallery_structure_built_ = false;
+    bool mode_visibility_initialized_ = false;
+    ViewMode visible_mode_ = ViewMode::Camera;
+    bool review_layers_visible_ = false;
     std::shared_ptr<const PreviewFrame> preview_frame_;
     std::shared_ptr<const DecodedImage> review_frame_;
     std::shared_ptr<const DecodedImage> viewer_frame_;

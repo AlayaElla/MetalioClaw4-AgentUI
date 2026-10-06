@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 #include "lvgl.h"
@@ -32,6 +33,8 @@ public:
     void SetConnectingDevice(std::size_t index);
     void ClearConnectingDevice();
     void ClearDevices();
+    void FinishDeviceUpdate();
+    std::size_t DeviceIndex(lv_obj_t* row) const;
     void SetCurrentDevice(const char* address, const char* name);
     lv_obj_t* AddDevice(const char* address, const char* name,
                         lv_event_cb_t callback, void* user_data);
@@ -44,6 +47,8 @@ private:
     lv_obj_t* speaker_panel_ = nullptr;
     lv_obj_t* current_count_ = nullptr;
     lv_obj_t* current_list_ = nullptr;
+    lv_obj_t* current_row_ = nullptr;
+    lv_obj_t* current_title_ = nullptr;
     lv_obj_t* profile_buttons_[2] = {};
     lv_obj_t* nearby_count_ = nullptr;
     lv_obj_t* device_list_ = nullptr;
@@ -52,6 +57,13 @@ private:
     lv_obj_t* scan_label_ = nullptr;
     std::vector<lv_obj_t*> device_rows_;
     std::vector<lv_obj_t*> device_actions_;
+    std::vector<lv_obj_t*> device_titles_;
+    std::vector<lv_obj_t*> all_device_rows_;
+    std::vector<lv_obj_t*> all_device_actions_;
+    std::vector<lv_obj_t*> all_device_titles_;
+    std::vector<std::string> device_addresses_;
+    std::vector<bool> device_seen_;
+    std::vector<std::string> device_update_order_;
     std::size_t nearby_device_count_ = 0;
 };
 

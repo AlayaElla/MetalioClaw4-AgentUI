@@ -1,5 +1,6 @@
 #include "codex_ai_provider.h"
 
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,126 @@ Store& Get() { static Store value; return value; }
 std::string String(const cJSON* root, const char* key) {
     const auto* value = cJSON_GetObjectItemCaseSensitive(root, key);
     return cJSON_IsString(value) && value->valuestring ? value->valuestring : "";
+}
+const char* Text(const cJSON* root, const char* key) {
+    const auto* value = cJSON_GetObjectItemCaseSensitive(root, key);
+    return cJSON_IsString(value) && value->valuestring ? value->valuestring : nullptr;
+}
+bool IsText(const cJSON* root, const char* key, const char* expected) {
+    const char* value = Text(root, key);
+    return value && expected && std::strcmp(value, expected) == 0;
+}
+bool Bool(const cJSON* root, const char* key);
+size_t BoundedLength(const char* value, size_t limit) {
+    size_t length = 0;
+    while (length < limit && value[length] != '\0') ++length;
+    return length;
+}
+std::string BoundedText(const cJSON* root, const char* key, size_t maximum) {
+    const char* value = Text(root, key);
+    if (!value) return {};
+    const size_t length = BoundedLength(value, maximum);
+    return std::string(value, length);
+}
+void AddBoundedText(cJSON* target, const cJSON* source, const char* key, size_t maximum) {
+    const char* value = Text(source, key);
+    if (!value) return;
+    const size_t length = BoundedLength(value, maximum + 1);
+    if (length <= maximum) cJSON_AddStringToObject(target, key, value);
+}
+
+constexpr size_t kMaximumAcknowledgementBytes = 2048;
+
+std::string EscapeJsonText(const char* text, size_t maximum) {
+    std::string escaped;
+    if (!text) return escaped;
+    const size_t length = BoundedLength(text, maximum);
+    escaped.reserve(length);
+    for (size_t i = 0; i < length; ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        switch (c) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    static constexpr char hex[] = "0123456789abcdef";
+                    escaped += "\\u00";
+                    escaped += hex[c >> 4];
+                    escaped += hex[c & 0x0f];
+                } else escaped += static_cast<char>(c);
+        }
+    }
+    return escaped;
+}
+
+std::string MinimalAcknowledgement(const char* type, const char* correlation_key, const char* request) {
+    const std::string escaped_type = EscapeJsonText(type, 32);
+    const std::string escaped_request = EscapeJsonText(request, 128);
+    std::string output = "{\"type\":\"" + escaped_type + "\"";
+    if (correlation_key && request) {
+        output += ",\"";
+        output += correlation_key;
+        output += "\":\"" + escaped_request + "\"";
+    }
+    output += "}";
+    return output;
+}
+
+bool AckFits(cJSON* object) {
+    char* printed = cJSON_PrintUnformatted(object);
+    if (!printed) return false;
+    const size_t length = std::strlen(printed);
+    cJSON_free(printed);
+    return length <= kMaximumAcknowledgementBytes;
+}
+
+void AddOptionalAckText(cJSON* target, const cJSON* source, const char* key, size_t maximum) {
+    AddBoundedText(target, source, key, maximum);
+    if (!AckFits(target)) cJSON_DeleteItemFromObjectCaseSensitive(target, key);
+}
+
+std::string SerializeAcknowledgement(cJSON* result, const char* type,
+                                     const char* correlation_key, const char* request) {
+    char* printed = cJSON_PrintUnformatted(result);
+    if (!printed) return MinimalAcknowledgement(type, correlation_key, request);
+    const size_t length = std::strlen(printed);
+    if (length > kMaximumAcknowledgementBytes) {
+        cJSON_free(printed);
+        return MinimalAcknowledgement(type, correlation_key, request);
+    }
+    std::string output(printed, length);
+    cJSON_free(printed);
+    return output;
+}
+
+std::string Acknowledgement(const cJSON* root, const char* type,
+                            const char* correlation_key, const char* request) {
+    std::unique_ptr<cJSON, decltype(&cJSON_Delete)> result(cJSON_CreateObject(), cJSON_Delete);
+    if (!result) return MinimalAcknowledgement(type, correlation_key, request);
+    const std::string bounded_type = type ? std::string(type, BoundedLength(type, 32)) : std::string();
+    if (!cJSON_AddStringToObject(result.get(), "type", bounded_type.c_str()))
+        return MinimalAcknowledgement(type, correlation_key, request);
+    if (correlation_key && request &&
+        !cJSON_AddStringToObject(result.get(), correlation_key, request))
+        return MinimalAcknowledgement(type, correlation_key, request);
+    AddOptionalAckText(result.get(), root, "action", 32);
+    if (cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "success")))
+        cJSON_AddBoolToObject(result.get(), "success", Bool(root, "success"));
+    for (const char* field : {"host_id", "thread_id", "stream_id", "draft_id", "id", "status", "delivery", "outcome"})
+        AddOptionalAckText(result.get(), root, field, 128);
+    AddOptionalAckText(result.get(), root, "state", 32);
+    AddOptionalAckText(result.get(), root, "error", 512);
+    AddOptionalAckText(result.get(), root, "message", 512);
+    if (cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "acceptsAudio")))
+        cJSON_AddBoolToObject(result.get(), "acceptsAudio", Bool(root, "acceptsAudio"));
+    if (cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "submissionConfirmed")))
+        cJSON_AddBoolToObject(result.get(), "submissionConfirmed", Bool(root, "submissionConfirmed"));
+    return SerializeAcknowledgement(result.get(), type, correlation_key, request);
 }
 bool Bool(const cJSON* root, const char* key) {
     return cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, key));
@@ -174,40 +295,77 @@ bool Register(const Hooks& hooks, std::string* error) {
 
 void ObserveMessage(const std::string& json) {
     std::unique_ptr<cJSON, decltype(&cJSON_Delete)> root(cJSON_Parse(json.c_str()), cJSON_Delete);
+    ObserveMessage(root.get());
+}
+
+void ObserveMessage(const cJSON* root) {
     if (!root) return;
-    const std::string type = String(root.get(), "type");
-    const std::string request = String(root.get(), "request_id").empty()
-        ? String(root.get(), "requestId") : String(root.get(), "request_id");
-    if (request.empty()) return;
+    const char* type = Text(root, "type");
+    const char* request = Text(root, "request_id");
+    const char* correlation_key = "request_id";
+    if (!request || !*request) {
+        request = Text(root, "requestId");
+        correlation_key = "requestId";
+    }
+    if (!request || !*request) return;
+    const size_t request_size = BoundedLength(request, 129);
+    if (request_size == 0 || request_size > 128) return;
+    const std::string request_key(request, request_size);
     auto& store = Get();
     std::lock_guard<std::mutex> lock(store.mutex);
-    auto found = store.pending.find(request);
+    auto found = store.pending.find(request_key);
     if (found == store.pending.end() || found->second.result.status != ai::OperationStatus::Pending) return;
     const auto& action = found->second.action;
-    bool success = Bool(root.get(), "success");
+    bool success = Bool(root, "success");
     if (action == "realtime_start" || action == "realtime_end") {
-        if (type != "realtime_status") return;
-        const auto state = String(root.get(), "state");
-        if (action == "realtime_start" && state == "listening" && Bool(root.get(), "acceptsAudio")) success = true;
-        else if (state == "ended" || state == "error" || state == "disconnected") success = action == "realtime_end" && state == "ended";
+        if (!IsText(root, "type", "realtime_status")) return;
+        const char* state = Text(root, "state");
+        if (!state) return;
+        if (action == "realtime_start" && std::strcmp(state, "listening") == 0 && Bool(root, "acceptsAudio")) success = true;
+        else if (std::strcmp(state, "ended") == 0 || std::strcmp(state, "error") == 0 || std::strcmp(state, "disconnected") == 0)
+            success = action == "realtime_end" && std::strcmp(state, "ended") == 0;
         else return;
     } else if (action == "text") {
-        if (type != "codex_text_result") return;
+        if (!IsText(root, "type", "codex_text_result")) return;
     } else if (action == "stop") {
-        if (type != "turn_stop_result") return;
+        if (!IsText(root, "type", "turn_stop_result")) return;
     } else if (action == "interaction") {
-        if (type != "codex_interaction_result") return;
+        if (!IsText(root, "type", "codex_interaction_result")) return;
     } else {
-        if (type != "codex_action_result" || String(root.get(), "action") != WireAction(action)) return;
+        if (!IsText(root, "type", "codex_action_result") || !IsText(root, "action", WireAction(action))) return;
     }
     auto& result = found->second.result;
     result.status = success ? ai::OperationStatus::Succeeded : ai::OperationStatus::Failed;
-    result.result_json = json;
+    result.result_json = Acknowledgement(root, type, correlation_key, request);
     if (!success) {
-        result.error = String(root.get(), "error");
-        if (result.error.empty()) result.error = String(root.get(), "message");
+        result.error = BoundedText(root, "error", 512);
+        if (result.error.empty()) result.error = BoundedText(root, "message", 512);
         if (result.error.empty()) result.error = "Codex request failed";
     }
+}
+
+void FailPendingRequest(const std::string& request_id, const std::string& error) {
+    if (request_id.empty()) return;
+    auto& store = Get();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    const auto found = store.pending.find(request_id);
+    if (found == store.pending.end() || found->second.result.status != ai::OperationStatus::Pending) return;
+    found->second.result.status = ai::OperationStatus::Failed;
+    const size_t length = BoundedLength(error.c_str(), 513);
+    found->second.result.error = length <= 512 ? error : error.substr(0, 512);
+    if (found->second.result.error.empty()) found->second.result.error = "Codex request could not be sent";
+}
+
+void CompletePendingRequest(const std::string& request_id, const std::string& result_json) {
+    if (request_id.empty()) return;
+    auto& store = Get();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    const auto found = store.pending.find(request_id);
+    if (found == store.pending.end() || found->second.result.status != ai::OperationStatus::Pending) return;
+    found->second.result.status = ai::OperationStatus::Succeeded;
+    const size_t length = BoundedLength(result_json.c_str(), 1025);
+    found->second.result.result_json = length <= 1024 ? result_json : "{}";
+    found->second.result.error.clear();
 }
 
 void Invalidate(const std::string& reason) {

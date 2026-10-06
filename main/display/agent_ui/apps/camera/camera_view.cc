@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -120,6 +121,13 @@ void Hide(lv_obj_t* object) {
 
 void Show(lv_obj_t* object) {
     if (object != nullptr) lv_obj_clear_flag(object, LV_OBJ_FLAG_HIDDEN);
+}
+
+void SetLabelTextIfChanged(lv_obj_t* label, const char* text) {
+    if (label != nullptr && text != nullptr &&
+        std::strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+    }
 }
 
 const char* StatusText(const ViewState& state) {
@@ -791,14 +799,20 @@ void View::Render(const ViewState& state) {
         style_position_ = std::round(style_position_);
         ApplyStyleGeometry();
     }
-    Hide(camera_panel_);
-    Hide(gallery_);
-    Hide(viewer_);
-    ApplyModeVisibility(state.mode);
+    const bool review_layers_visible =
+        state.mode == ViewMode::Review &&
+        (flash_timer_ == nullptr || flash_fading_out_);
+    if (!mode_visibility_initialized_ || visible_mode_ != state.mode ||
+        review_layers_visible_ != review_layers_visible) {
+        ApplyModeVisibility(state.mode);
+        visible_mode_ = state.mode;
+        review_layers_visible_ = review_layers_visible;
+        mode_visibility_initialized_ = true;
+    }
     const char* status_text = StatusText(state);
     if (status_ != nullptr) {
         if (status_text != nullptr) {
-            lv_label_set_text(status_, status_text);
+            SetLabelTextIfChanged(status_, status_text);
             Show(status_);
         } else {
             Hide(status_);
@@ -856,14 +870,12 @@ void View::Render(const ViewState& state) {
 }
 
 void View::RenderCamera(const ViewState& state) {
-    Show(camera_panel_);
     Show(preview_);
     UpdateCaptureButton(state);
     RenderPreview(state);
 }
 
 void View::RenderReview(const ViewState& state) {
-    Show(camera_panel_);
     SetReviewActionsEnabled(!state.saving && !review_exit_active_);
     lv_obj_t* review_ = review_image_;
     const bool flash_is_covering = flash_timer_ != nullptr && !flash_fading_out_;
@@ -889,15 +901,14 @@ void View::RenderReview(const ViewState& state) {
 }
 
 void View::RenderGallery(const ViewState& state) {
-    Show(gallery_);
     if (gallery_empty_ != nullptr) {
         if (state.gallery_loading) {
             Hide(gallery_empty_);
         } else if (!state.gallery_available) {
-            lv_label_set_text(gallery_empty_, I18n::T("请插入 SD 卡"));
+            SetLabelTextIfChanged(gallery_empty_, I18n::T("请插入 SD 卡"));
             Show(gallery_empty_);
         } else if (state.gallery.empty()) {
-            lv_label_set_text(gallery_empty_, I18n::T("暂无照片"));
+            SetLabelTextIfChanged(gallery_empty_, I18n::T("暂无照片"));
             Show(gallery_empty_);
         } else {
             Hide(gallery_empty_);
@@ -907,8 +918,6 @@ void View::RenderGallery(const ViewState& state) {
 }
 
 void View::RenderViewer(const ViewState& state) {
-    Show(viewer_);
-    lv_obj_move_foreground(viewer_);
     Hide(viewer_status_);
     if (state.viewer_image && state.viewer_image->pixels) {
         viewer_frame_ = state.viewer_image;
@@ -929,7 +938,7 @@ void View::RenderViewer(const ViewState& state) {
         viewer_frame_.reset();
         lv_image_set_src(viewer_image_, nullptr);
         if (viewer_status_ != nullptr) {
-            lv_label_set_text(viewer_status_, I18n::T("正在加载照片…"));
+            SetLabelTextIfChanged(viewer_status_, I18n::T("正在加载照片…"));
             Show(viewer_status_);
         }
     } else if (viewer_image_ != nullptr) {
@@ -939,7 +948,7 @@ void View::RenderViewer(const ViewState& state) {
     const char* status_text = StatusText(state);
     if (!state.viewer_loading && status_text != nullptr &&
         viewer_status_ != nullptr) {
-        lv_label_set_text(viewer_status_, status_text);
+        SetLabelTextIfChanged(viewer_status_, status_text);
         Show(viewer_status_);
     }
 }
@@ -1056,11 +1065,16 @@ void View::RenderGalleryItems(const ViewState& state) {
                                 i < state.thumbnails.size(); ++i) {
             const auto& decoded = state.thumbnails[i];
             if (decoded && decoded->pixels) {
-                thumbnail_frames_[i] = decoded;
-                SetDescriptor(thumbnail_descriptors_[i], decoded->pixels.get(),
-                              decoded->data_size, decoded->width, decoded->height,
-                              decoded->stride);
-                lv_image_set_src(thumbnail_images_[i], &thumbnail_descriptors_[i]);
+                if (i >= thumbnail_frames_.size() ||
+                    thumbnail_frames_[i] != decoded) {
+                    lv_image_cache_drop(&thumbnail_descriptors_[i]);
+                    SetDescriptor(thumbnail_descriptors_[i], decoded->pixels.get(),
+                                  decoded->data_size, decoded->width, decoded->height,
+                                  decoded->stride);
+                    lv_image_set_src(thumbnail_images_[i],
+                                     &thumbnail_descriptors_[i]);
+                    thumbnail_frames_[i] = decoded;
+                }
                 set_thumbnail_failure(i, false);
             } else if (i < state.thumbnail_failures.size() &&
                        state.thumbnail_failures[i]) {
@@ -1371,6 +1385,9 @@ void View::ClearContent() {
     thumbnail_frames_.clear();
     rendered_gallery_.clear();
     gallery_structure_built_ = false;
+    mode_visibility_initialized_ = false;
+    visible_mode_ = ViewMode::Camera;
+    review_layers_visible_ = false;
     preview_frame_.reset();
     review_frame_.reset();
     viewer_frame_.reset();

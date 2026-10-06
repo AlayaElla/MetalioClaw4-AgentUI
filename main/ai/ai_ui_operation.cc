@@ -17,7 +17,9 @@ struct Job {
     OperationResult result;
     UiOperations::Step step;
     std::function<void()> cancel;
+    UiOperations::CancellableCancel cancellable_cancel;
     std::atomic<bool> cancelled{false};
+    std::atomic<bool> cancel_attempt_active{false};
     bool started = false;
     uint64_t generation = 0;
     std::chrono::steady_clock::time_point deadline;
@@ -36,20 +38,75 @@ void Tick(lv_timer_t* timer) {
     auto* holder = static_cast<std::shared_ptr<Job>*>(lv_timer_get_user_data(timer));
     auto job = *holder;
     OperationResult result;
-    if (job->cancelled.load()) {
-        if (job->started && job->cancel) job->cancel();
+    UiOperations::Step step;
+    std::function<void()> legacy_cancel;
+    UiOperations::CancellableCancel cancellable_cancel;
+    UiOperations::Step released_step;
+    std::function<void()> released_cancel;
+    UiOperations::CancellableCancel released_cancellable_cancel;
+    bool already_cancelled = false;
+    bool expired = false;
+    bool unavailable = false;
+    bool started = false;
+    {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        if (job->result.status != OperationStatus::Pending) {
+            lv_timer_delete(timer);
+            delete holder;
+            return;
+        }
+        already_cancelled = job->cancelled.load();
+        expired = std::chrono::steady_clock::now() >= job->deadline;
+        started = job->started;
+        if (!already_cancelled && (!expired || job->cancellable_cancel) &&
+            !started && (!Availability::Get().IsAvailable() ||
+                         Availability::Get().Generation() != job->generation)) {
+            unavailable = true;
+        } else if (!already_cancelled && (!expired || job->cancellable_cancel)) {
+            job->started = true;
+            step = job->step;
+        }
+        legacy_cancel = job->cancel;
+        cancellable_cancel = job->cancellable_cancel;
+    }
+
+    if (already_cancelled) {
+        if (started && legacy_cancel) legacy_cancel();
         result.status = OperationStatus::Cancelled;
         result.error = "Operation cancelled; completed effects are not undone";
-    } else if (std::chrono::steady_clock::now() >= job->deadline) {
-        if (job->started && job->cancel) job->cancel();
+    } else if (expired && cancellable_cancel) {
+        // Destructive work that already started must keep reporting its real
+        // outcome. A false response means cancellation lost the start race.
+        bool accepted = false;
+        try { accepted = cancellable_cancel(); } catch (...) {}
+        if (accepted) {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            if (job->result.status == OperationStatus::Pending) {
+                job->cancelled.store(true);
+                result.status = OperationStatus::Cancelled;
+                result.error = "Operation cancelled before it started";
+            }
+        } else {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            job->deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(1);
+        }
+        if (result.status == OperationStatus::Pending && step) {
+            try { result = step(); }
+            catch (const std::exception& error) {
+                result.status = OperationStatus::Failed;
+                result.error = error.what();
+            } catch (...) { result = Error("UI operation failed unexpectedly"); }
+        }
+    } else if (expired) {
+        if (started && legacy_cancel) legacy_cancel();
         result = Error("Operation timed out");
-    } else if (!job->started && (!Availability::Get().IsAvailable() ||
-               Availability::Get().Generation() != job->generation)) {
+    } else if (unavailable) {
         result = Error("AI availability changed before execution");
     } else {
-        job->started = true;
         try {
-            result = job->step();
+            if (step) result = step();
+            else result = Error("UI operation has no active step");
         } catch (const std::exception& error) {
             result.status = OperationStatus::Failed;
             result.error = error.what();
@@ -57,28 +114,39 @@ void Tick(lv_timer_t* timer) {
             result = Error("UI operation failed unexpectedly");
         }
     }
+    bool terminal = false;
     {
         std::lock_guard<std::mutex> lock(job->mutex);
+        if (result.status == OperationStatus::Pending && job->cancelled.load()) {
+            result.status = OperationStatus::Cancelled;
+            result.error = "Operation cancelled; completed effects are not undone";
+        }
         result.operation_id = job->result.operation_id;
         result.generation = job->generation;
         job->result = result;
+        terminal = result.status != OperationStatus::Pending;
+        if (terminal) {
+            released_step.swap(job->step);
+            released_cancel.swap(job->cancel);
+            released_cancellable_cancel.swap(job->cancellable_cancel);
+        }
     }
-    if (result.status != OperationStatus::Pending) {
-        job->step = {};
-        job->cancel = {};
+    if (terminal) {
         lv_timer_delete(timer);
         delete holder;
     }
 }
-}  // namespace
 
-OperationResult UiOperations::Submit(const InvokeRequest& request, Step step,
-                                      std::function<void()> cancel) {
+OperationResult SubmitInternal(const InvokeRequest& request,
+                               UiOperations::Step step,
+                               std::function<void()> cancel,
+                               UiOperations::CancellableCancel cancellable_cancel) {
     if (!step) return Error("Missing UI operation");
     auto job = std::make_shared<Job>();
     job->generation = request.generation;
     job->step = std::move(step);
     job->cancel = std::move(cancel);
+    job->cancellable_cancel = std::move(cancellable_cancel);
     job->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(
         request.deadline_ms ? std::clamp<uint32_t>(request.deadline_ms, 100, 60000) : 30000);
     job->result.status = OperationStatus::Pending;
@@ -113,6 +181,18 @@ OperationResult UiOperations::Submit(const InvokeRequest& request, Step step,
     std::lock_guard<std::mutex> lock(job->mutex);
     return job->result;
 }
+}  // namespace
+
+OperationResult UiOperations::Submit(const InvokeRequest& request, Step step,
+                                      std::function<void()> cancel) {
+    return SubmitInternal(request, std::move(step), std::move(cancel), {});
+}
+
+OperationResult UiOperations::SubmitWithCancellableCancel(
+    const InvokeRequest& request, Step step, CancellableCancel cancel) {
+    if (!cancel) return Error("Missing cancellable cancel callback");
+    return SubmitInternal(request, std::move(step), {}, std::move(cancel));
+}
 
 OperationResult UiOperations::GetResult(const std::string& id) {
     std::shared_ptr<Job> job;
@@ -127,12 +207,34 @@ OperationResult UiOperations::GetResult(const std::string& id) {
 }
 
 bool UiOperations::Cancel(const std::string& id) {
-    std::lock_guard<std::mutex> lock(jobs_mutex);
-    const auto found = jobs.find(id);
-    if (found == jobs.end()) return false;
-    std::lock_guard<std::mutex> result_lock(found->second->mutex);
-    if (found->second->result.status != OperationStatus::Pending) return false;
-    found->second->cancelled.store(true);
+    std::shared_ptr<Job> job;
+    {
+        std::lock_guard<std::mutex> lock(jobs_mutex);
+        const auto found = jobs.find(id);
+        if (found == jobs.end()) return false;
+        job = found->second;
+    }
+    UiOperations::CancellableCancel try_cancel;
+    {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        if (job->result.status != OperationStatus::Pending) return false;
+        try_cancel = job->cancellable_cancel;
+        if (!try_cancel) {
+            job->cancelled.store(true);
+            return true;
+        }
+    }
+    bool expected = false;
+    if (!job->cancel_attempt_active.compare_exchange_strong(expected, true)) return false;
+    bool accepted = false;
+    try { accepted = try_cancel(); } catch (...) { accepted = false; }
+    job->cancel_attempt_active.store(false);
+    if (!accepted) return false;
+    {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        if (job->result.status != OperationStatus::Pending) return false;
+        job->cancelled.store(true);
+    }
     return true;
 }
 }  // namespace ai

@@ -14,6 +14,8 @@ struct Parts {
     int selected_tab = -1;
     std::string rendered_tabs[3];
     lv_obj_t *overlay = nullptr, *drawer = nullptr, *content = nullptr, *tab_bar = nullptr;
+    lv_obj_t *task_list = nullptr;
+    std::string rendered_task_rows[6];
     lv_obj_t *panels[3]{}, *tabs[3]{};
     ui_components::StatusCardParts tasks[6]{};
     lv_obj_t *new_task = nullptr, *realtime = nullptr, *model_context = nullptr, *model_dropdown = nullptr;
@@ -26,6 +28,8 @@ struct Parts {
     ui_components::ActionButtonParts connect{};
 };
 Parts Build(lv_obj_t* root, const Callbacks& callbacks);
+// Show/hide the menu's optional render cache along with the drawer lifecycle.
+void SetVisible(Parts& parts, bool visible);
 void SelectTab(Parts& parts, int index);
 void Refresh(Parts& parts, const codex_menu::State& state, bool pending, bool voice_busy, bool force = false);
 void SetConnectionStatus(Parts& parts, bool connected, const char* text);

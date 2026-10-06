@@ -1,10 +1,12 @@
 #include "codex_view.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -12,7 +14,6 @@
 #include <esp_log.h>
 #include <esp_random.h>
 #include <font_awesome.h>
-#include <mbedtls/base64.h>
 
 #include "cJSON.h"
 #include "codex_ws_client.h"
@@ -24,7 +25,9 @@
 #include "codex_notification_service.h"
 #include "codex_status_ring.h"
 #include "codex_ai_provider.h"
+#include "codex_protocol_service.h"
 #include "codex_realtime_captions.h"
+#include "codex_voice_footer.h"
 #include "application.h"
 #include "ai/ai_availability.h"
 #include "board.h"
@@ -42,6 +45,15 @@ namespace agent_ui {
 namespace {
 
 namespace controls = ui_components;
+using ProtocolService = codex_protocol::Service;
+using TransportContext = ProtocolService::TransportContext;
+
+ProtocolService& Protocol() { return codex_protocol::GetService(); }
+
+CodexWsClient::SendContext ToClientSendContext(const TransportContext& context) {
+    return {context.app_generation, context.connection_generation,
+            context.connection_epoch, context.valid};
+}
 
 constexpr char kTag[] = "AgentCodex";
 constexpr int kMaxMessages = 10;
@@ -53,6 +65,14 @@ constexpr int kRealtimePixelSize = 9;
 // reply. The destructive stop action uses a deliberately slower hold gesture.
 constexpr uint32_t kStopHoldDurationMs = 1200;
 constexpr uint32_t kStopHoldUpdateMs = 20;
+
+void PostSendFailure(const TransportContext& context, std::string message,
+                     std::function<void()> on_failure = {});
+bool QueueCommand(std::string json, std::string ai_request_id = {},
+                  std::string failure_message = "发送失败，请检查连接后重试",
+                  std::function<void()> on_failure = {},
+                  std::function<void()> on_sent = {},
+                  const TransportContext* captured_context = nullptr);
 
 enum class VoiceStage {
     Idle,
@@ -105,7 +125,9 @@ struct UiState {
     std::string discovered_name;
     std::string discovered_ip;
     std::string voice_request_id;
+    TransportContext voice_send_context{};
     std::string realtime_request_id;
+    TransportContext realtime_send_context{};
     std::string realtime_host_id;
     std::string realtime_thread_id;
     std::string realtime_stream_id;
@@ -155,6 +177,8 @@ struct UiState {
     bool remote_mode = false;
     bool connected_remote_mode = false;
     bool voice_animation_active = false;
+    bool action_visual_ready = false;
+    std::array<uint32_t, 6> action_visual_state{};
     bool ring_enabled = true;
     bool bridge_was_usable = false;
     std::string displayed_task;
@@ -199,6 +223,22 @@ void UpdateActionButton() {
     if (s_ui.action_button == nullptr || s_ui.action_icon == nullptr) return;
     const bool codex_available = CanUseCodex();
     const auto& colors = Theme::Get().colors();
+    if (codex_available && s_ui.voice_pressed) {
+        SetStatus(true, s_ui.voice_cancel_armed ? "松开手指，取消本次输入" : "松开发送 · 上滑取消");
+    }
+    const uint32_t flags = static_cast<uint32_t>(codex_available) |
+        (static_cast<uint32_t>(s_ui.voice_pressed) << 1) |
+        (static_cast<uint32_t>(s_ui.voice_cancel_armed) << 2) |
+        (static_cast<uint32_t>(s_ui.voice_cancel_pending) << 3) |
+        (static_cast<uint32_t>(s_ui.task_active) << 4) |
+        (static_cast<uint32_t>(s_ui.stop_pending) << 5) |
+        (static_cast<uint32_t>(s_ui.stop_pressed) << 6);
+    const std::array<uint32_t, 6> visual_state{
+        static_cast<uint32_t>(s_ui.voice_stage), flags,
+        colors.accent, colors.warning, colors.danger, colors.accent_ink};
+    if (s_ui.action_visual_ready && s_ui.action_visual_state == visual_state) return;
+    s_ui.action_visual_state = visual_state;
+    s_ui.action_visual_ready = true;
     uint32_t color = colors.accent;
     const char* icon = FONT_AWESOME_MICROPHONE;
     if (s_ui.voice_stage != VoiceStage::Idle) {
@@ -222,7 +262,7 @@ void UpdateActionButton() {
         lv_color_hex(cancelling ? 0x7F1D1D : colors.accent_ink), LV_PART_MAIN);
     if (s_ui.action_icon) lv_obj_set_style_text_color(s_ui.action_icon,
         lv_color_hex(cancelling ? 0x7F1D1D : colors.accent_ink), LV_PART_MAIN);
-    lv_label_set_text(s_ui.action_icon, icon);
+    controls::SetLabelTextIfChanged(s_ui.action_icon, icon);
     if (s_ui.action_label != nullptr) {
         const char* label = "按住说话";
         if (s_ui.voice_cancel_armed && s_ui.voice_pressed) {
@@ -246,10 +286,7 @@ void UpdateActionButton() {
         } else if (s_ui.task_active) {
             label = "按住说话";
         }
-        lv_label_set_text(s_ui.action_label, label);
-    }
-    if (codex_available && s_ui.voice_pressed) {
-        SetStatus(true, s_ui.voice_cancel_armed ? "松开手指，取消本次输入" : "松开发送 · 上滑取消");
+        controls::SetLabelTextIfChanged(s_ui.action_label, label);
     }
     if (codex_available) lv_obj_remove_state(s_ui.action_button, LV_STATE_DISABLED);
     else lv_obj_add_state(s_ui.action_button, LV_STATE_DISABLED);
@@ -267,7 +304,7 @@ void UpdateActionButton() {
             lv_obj_add_state(s_ui.stop_button, LV_STATE_DISABLED);
         else lv_obj_remove_state(s_ui.stop_button, LV_STATE_DISABLED);
     }
-    if (s_ui.stop_label != nullptr) lv_label_set_text(s_ui.stop_label,
+    if (s_ui.stop_label != nullptr) controls::SetLabelTextIfChanged(s_ui.stop_label,
         s_ui.stop_pending ? "正在停止…" : s_ui.stop_pressed ? "继续按住…" : "停止");
     // Both primary actions share the available width beside the menu.
     if (s_ui.voice_button.record_dot != nullptr) {
@@ -562,7 +599,8 @@ void ShowRealtimePage(bool show) {
     UpdateStatusRing();
 }
 
-void EndRealtimeSession(bool notify_pc, bool keep_page = false) {
+bool EndRealtimeSession(bool notify_pc, bool keep_page = false,
+                        const std::string& ai_operation_id = {}) {
     const std::string request_id = s_ui.realtime_request_id;
     const ai::Availability::Token availability_token = s_ui.realtime_availability_token;
     const bool had_session = !request_id.empty() || availability_token != 0 ||
@@ -577,23 +615,74 @@ void EndRealtimeSession(bool notify_pc, bool keep_page = false) {
     s_ui.realtime_last_sequence = 0;
     s_ui.realtime_captions.Clear();
     UpdateRealtimeCaptionText();
-    // Call cleanup shares capture state with dictation. Only its owner may
-    // clear that state, so dictation's stop can still release its AI lease.
-    if (had_session) Application::GetInstance().EndCodexRealtimeSession();
-    // EndCodexRealtimeSession schedules capture/audio cleanup. Queue this
-    // release after it so another AI owner cannot begin while the call still
-    // owns microphone, playback, or wake-word state.
+    bool end_admitted = true;
+    auto& client = Protocol();
+    const auto send_context = s_ui.realtime_send_context;
+    s_ui.realtime_send_context = {};
+    const auto report_deferred_failure = [send_context](const std::string& message) {
+        auto& current = Protocol();
+        if (!current.IsContextCurrent(send_context, true)) return;
+        PostSendFailure(send_context, message);
+    };
+    const auto enqueue_end_after_audio_stops = [request_id, ai_operation_id,
+            report_deferred_failure, send_context]() {
+        auto& current = Protocol();
+        const bool same_transport = current.IsContextCurrent(send_context, true);
+        if (!same_transport) {
+            const std::string failure = "未能通知电脑结束实时语音";
+            if (!ai_operation_id.empty()) codex_ai::FailPendingRequest(ai_operation_id, failure);
+            report_deferred_failure(failure);
+            return;
+        }
+        const auto on_sent = ai_operation_id.empty() ? std::function<void()>{} :
+            std::function<void()>{[ai_operation_id]() {
+                // This confirms the full local WebSocket write, not the PC's
+                // later realtime_status(end) acknowledgement.
+                codex_ai::CompletePendingRequest(
+                    ai_operation_id, "{\"transportSent\":true}");
+            }};
+        if (!QueueCommand(
+                "{\"type\":\"realtime_end\",\"requestId\":\"" + request_id + "\"}",
+                ai_operation_id, "未能通知电脑结束实时语音", {}, on_sent, &send_context)) {
+            const std::string failure = "实时语音结束请求未能排队";
+            if (!ai_operation_id.empty()) codex_ai::FailPendingRequest(ai_operation_id, failure);
+            report_deferred_failure(failure);
+        }
+    };
+
+    // Stop capture and cancel its pending audio on Application's task before
+    // appending realtime_end to the shared TX FIFO. Any already-admitted frame
+    // therefore remains ahead of the end marker.
+    if (had_session) {
+        if (notify_pc && !request_id.empty() && client.IsConnected()) {
+            Application::GetInstance().EndCodexRealtimeSession(enqueue_end_after_audio_stops);
+        } else {
+            Application::GetInstance().EndCodexRealtimeSession();
+        }
+    }
+    // Release audio ownership after capture/playback cleanup is queued, so
+    // another AI owner cannot begin while this call still owns audio state.
     if (availability_token != 0) {
         Application::GetInstance().Schedule([availability_token]() {
             ai::Availability::Get().ReleaseBlock(availability_token);
         });
     }
     if (!keep_page) ShowRealtimePage(false);
-    if (notify_pc && !request_id.empty() && CodexWsClient::GetInstance().IsConnected()) {
-        CodexWsClient::GetInstance().SendTextMessage(
-            "{\"type\":\"realtime_end\",\"requestId\":\"" + request_id + "\"}",
-            pdMS_TO_TICKS(200));
+    if (notify_pc && !request_id.empty()) {
+        if (!client.IsConnected()) {
+            end_admitted = false;
+            const std::string failure = "未能通知电脑结束实时语音";
+            if (!ai_operation_id.empty()) codex_ai::FailPendingRequest(ai_operation_id, failure);
+        } else if (!had_session) {
+            end_admitted = QueueCommand(
+                "{\"type\":\"realtime_end\",\"requestId\":\"" + request_id + "\"}",
+                ai_operation_id, "未能通知电脑结束实时语音", {}, {}, &send_context);
+        }
+        if (!end_admitted) {
+            SetStatus(false, "未能通知电脑结束实时语音");
+        }
     }
+    return end_admitted;
 }
 
 void ShowRealtimeError(const char* message) {
@@ -627,12 +716,10 @@ void StartRealtimeSession(const std::string& provided_request_id = {}) {
         return;
     }
     s_ui.realtime_availability_token = availability_token;
-    const std::string request = TargetedRequest("realtime_start", request_id);
-    if (request.empty() || !CodexWsClient::GetInstance().SendTextMessage(request)) {
-        ShowRealtimeError("实时语音连接请求失败，请检查 PC 桥接连接后重试。");
-        return;
-    }
     s_ui.realtime_request_id = request_id;
+    auto& client = Protocol();
+    const auto send_context = client.CaptureSendContext();
+    s_ui.realtime_send_context = send_context;
     s_ui.realtime_host_id = target->host_id;
     s_ui.realtime_thread_id = target->thread_id;
     s_ui.realtime_stream_id = s_ui.menu_state.stream_id;
@@ -640,6 +727,16 @@ void StartRealtimeSession(const std::string& provided_request_id = {}) {
     s_ui.realtime_last_sequence = 0;
     s_ui.realtime_captions.Clear();
     UpdateRealtimeCaptionText();
+    const std::string request = TargetedRequest("realtime_start", request_id);
+    if (request.empty() || !QueueCommand(request, request_id,
+            "实时语音连接请求发送失败，请检查 PC 桥接连接后重试。",
+            [request_id]() {
+                if (s_ui.realtime_request_id == request_id)
+                    ShowRealtimeError("实时语音连接请求发送失败，请检查 PC 桥接连接后重试。");
+            }, {}, &send_context)) {
+        ShowRealtimeError("实时语音连接请求失败，请检查 PC 桥接连接后重试。");
+        return;
+    }
     if (auto* codec = Board::GetInstance().GetAudioCodec()) {
         s_ui.realtime_volume_percent = codec->output_volume();
         if (s_ui.realtime_volume_slider) lv_slider_set_value(s_ui.realtime_volume_slider, s_ui.realtime_volume_percent, LV_ANIM_OFF);
@@ -913,13 +1010,13 @@ bool HasNewConnectionInfo() {
 void UpdateConnectionAction() {
     if (s_ui.connection_action.label == nullptr) return;
     const bool unchanged_connection =
-        CodexWsClient::GetInstance().IsConnected() && !HasNewConnectionInfo();
-    lv_label_set_text(s_ui.connection_action.label,
+        Protocol().IsConnected() && !HasNewConnectionInfo();
+    controls::SetLabelTextIfChanged(s_ui.connection_action.label,
                       unchanged_connection ? "已连接" : "连接");
 }
 
 void CaptureConnectedConfig() {
-    auto& client = CodexWsClient::GetInstance();
+    auto& client = Protocol();
     std::string token;
     if (client.LoadToken(token)) s_ui.connected_token = token;
     else s_ui.connected_token.clear();
@@ -937,14 +1034,14 @@ void OnConnectionInfoChanged(lv_event_t*) {
 void HideConfig() {
     Keyboard::Get().Hide();
     if (s_ui.config_overlay != nullptr) {
-        lv_obj_add_flag(s_ui.config_overlay, LV_OBJ_FLAG_HIDDEN);
+        codex_menu_ui::SetVisible(s_ui.menu_ui, false);
         SyncConversation();
     }
 }
 
 void ShowConfig() {
     if (s_ui.config_overlay == nullptr) return;
-    lv_obj_remove_flag(s_ui.config_overlay, LV_OBJ_FLAG_HIDDEN);
+    codex_menu_ui::SetVisible(s_ui.menu_ui, true);
     lv_obj_move_foreground(s_ui.config_overlay);
     codex_status_ring::Raise(s_ui.ring_frame);
     if (s_ui.discovery_name != nullptr) {
@@ -954,16 +1051,20 @@ void ShowConfig() {
                                          : s_ui.discovered_name.c_str());
     }
     RefreshCodexMenu();
-    if (!s_ui.remote_mode && !CodexWsClient::GetInstance().IsConnected()) CodexWsClient::GetInstance().StartDiscovery(8000);
+    if (!s_ui.remote_mode && !Protocol().IsConnected()) Protocol().StartDiscovery(8000);
     RefreshDraftSettings();
 }
 
-void HandleMessage(const std::string& message) {
-    cJSON* root = cJSON_Parse(message.c_str());
+void HandleMessage(const CodexWsMessage& message) {
+    if (message.notice == CodexWsMessage::Notice::StateTooLarge) {
+        SetStatus(CanUseCodex(), "状态过大，已保持连接并跳过这次界面更新");
+        return;
+    }
+    const cJSON* root = message.Json();
     if (root == nullptr) return;
     const cJSON* type_item = cJSON_GetObjectItemCaseSensitive(root, "type");
     const char* type = cJSON_IsString(type_item) ? type_item->valuestring : "";
-    codex_ai::ObserveMessage(message);
+    codex_ai::ObserveMessage(root);
     if (std::strcmp(type, "bridge_status") == 0) {
         const cJSON* version = cJSON_GetObjectItemCaseSensitive(root, "version");
         const cJSON* state = cJSON_GetObjectItemCaseSensitive(root, "state");
@@ -976,17 +1077,14 @@ void HandleMessage(const std::string& message) {
                 cJSON_IsTrue(codex_connected), lv_tick_get());
             RefreshBridgeUi(lv_tick_get());
         }
-        cJSON_Delete(root);
         return;
     }
     // Only a current bridge_status may make task data usable.  In particular,
     // a delayed codex_state must not revive controls after a heartbeat timeout.
     if (!CanUseCodex()) {
-        cJSON_Delete(root);
         return;
     }
-    if (s_ui.conversation_ui && s_ui.conversation_ui->HandleMessage(message)) {
-        cJSON_Delete(root);
+    if (s_ui.conversation_ui && s_ui.conversation_ui->HandleMessage(root)) {
         return;
     }
     if (std::strcmp(type, "chat") == 0 || std::strcmp(type, "status") == 0 ||
@@ -996,7 +1094,7 @@ void HandleMessage(const std::string& message) {
         const cJSON* thread = cJSON_GetObjectItemCaseSensitive(root, "thread_id");
         if (!cJSON_IsString(host) || !cJSON_IsString(thread) ||
             !codex_menu::MatchesSelectedTask(s_ui.menu_state, host->valuestring, thread->valuestring)) {
-            cJSON_Delete(root); return;
+            return;
         }
     }
 
@@ -1006,10 +1104,10 @@ void HandleMessage(const std::string& message) {
             s_ui.menu_state.draft_status == "preparing" &&
             !s_ui.pending_menu_request.empty();
         const bool stale_before_new_task = optimistic_new_task &&
-            codex_menu::ParseStateJson(message, &incoming) &&
+            codex_menu::ParseStateRoot(root, &incoming) &&
             incoming.connected && incoming.stream_id == s_ui.menu_state.stream_id &&
             incoming.draft_request_id != s_ui.menu_state.draft_request_id;
-        if (!stale_before_new_task && codex_menu::ApplyStateJson(message, &s_ui.menu_state)) {
+        if (!stale_before_new_task && codex_menu::ApplyStateRoot(root, &s_ui.menu_state)) {
             IdlePower::Get().SetMicroDisplay(ParseMicroDisplay(root));
             TrySelectEntryTask();
             SyncConversation();
@@ -1019,14 +1117,11 @@ void HandleMessage(const std::string& message) {
     } else if (std::strcmp(type, "codex_action_result") == 0) {
         std::string error;
         const cJSON* request = cJSON_GetObjectItemCaseSensitive(root, "request_id");
-        if (!cJSON_IsString(request) || s_ui.pending_menu_request != request->valuestring) {
-            cJSON_Delete(root);
-            return;
-        }
+        if (!cJSON_IsString(request) || s_ui.pending_menu_request != request->valuestring) return;
         const cJSON* action = cJSON_GetObjectItemCaseSensitive(root, "action");
         const bool new_task = cJSON_IsString(action) &&
                               std::strcmp(action->valuestring, "new_task") == 0;
-        if (codex_menu::ApplyActionResultJson(message, &s_ui.menu_state, &error)) {
+        if (codex_menu::ApplyActionResultRoot(root, &s_ui.menu_state, &error)) {
             s_ui.pending_menu_request.clear();
             if (new_task) s_ui.pending_new_task = false;
             if (s_ui.menu_pending_timer) { lv_timer_delete(s_ui.menu_pending_timer); s_ui.menu_pending_timer = nullptr; }
@@ -1035,6 +1130,7 @@ void HandleMessage(const std::string& message) {
             RefreshCodexMenu();
             UpdateStatusRing();
             if (new_task) SetStatus(true, "新任务已就绪");
+            if (message.state_omitted) SetStatus(true, "操作已确认，状态过大，稍后同步界面");
         } else if (!error.empty()) {
             SetStatus(true, error.c_str());
             s_ui.pending_menu_request.clear();
@@ -1052,14 +1148,12 @@ void HandleMessage(const std::string& message) {
         }
     } else if (std::strcmp(type, "realtime_status") == 0) {
         if (!IsCurrentRealtime(root)) {
-            cJSON_Delete(root);
             return;
         }
         const cJSON* state = cJSON_GetObjectItemCaseSensitive(root, "state");
         const cJSON* accepts_audio = cJSON_GetObjectItemCaseSensitive(root, "acceptsAudio");
         const cJSON* detail = cJSON_GetObjectItemCaseSensitive(root, "message");
         if (!cJSON_IsString(state)) {
-            cJSON_Delete(root);
             return;
         }
         const char* value = state->valuestring;
@@ -1067,7 +1161,9 @@ void HandleMessage(const std::string& message) {
                                  std::strcmp(value, "thinking") == 0;
         if (input_phase && cJSON_IsTrue(accepts_audio) && !s_ui.realtime_capture_started) {
             s_ui.realtime_capture_started = true;
-            Application::GetInstance().StartCodexRealtimeCapture(s_ui.realtime_request_id);
+            Application::GetInstance().StartCodexRealtimeCapture(
+                s_ui.realtime_request_id,
+                ToClientSendContext(s_ui.realtime_send_context));
         } else if ((!input_phase || !cJSON_IsTrue(accepts_audio)) && s_ui.realtime_capture_started) {
             s_ui.realtime_capture_started = false;
             Application::GetInstance().StopCodexRealtimeCapture();
@@ -1117,33 +1213,26 @@ void HandleMessage(const std::string& message) {
             const cJSON* rate = cJSON_GetObjectItemCaseSensitive(root, "sampleRate");
             const cJSON* duration = cJSON_GetObjectItemCaseSensitive(root, "frameDuration");
             const cJSON* codec = cJSON_GetObjectItemCaseSensitive(root, "codec");
-            const cJSON* encoded = cJSON_GetObjectItemCaseSensitive(root, "data");
             if (cJSON_IsNumber(generation) && cJSON_IsNumber(sequence) && cJSON_IsNumber(rate) &&
-                cJSON_IsNumber(duration) && cJSON_IsString(codec) && cJSON_IsString(encoded) &&
+                cJSON_IsNumber(duration) && cJSON_IsString(codec) && message.realtime_audio_valid &&
                 std::strcmp(codec->valuestring, "opus") == 0 && rate->valueint == 16000 &&
-                duration->valueint == 20 && std::strlen(encoded->valuestring) <= 5464) {
+                duration->valueint == 20 && !message.realtime_audio.empty() &&
+                message.realtime_audio.size() <= 4096) {
                 const uint32_t frame_generation = static_cast<uint32_t>(generation->valuedouble);
                 const uint32_t frame_sequence = static_cast<uint32_t>(sequence->valuedouble);
                 if (frame_generation == s_ui.realtime_generation && frame_sequence > s_ui.realtime_last_sequence) {
-                    size_t decoded_size = 0;
-                    const int sizing = mbedtls_base64_decode(nullptr, 0, &decoded_size,
-                        reinterpret_cast<const unsigned char*>(encoded->valuestring),
-                        std::strlen(encoded->valuestring));
-                    if (sizing == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL && decoded_size > 0 && decoded_size <= 4096) {
-                        auto packet = std::make_unique<AudioStreamPacket>();
-                        packet->payload.resize(decoded_size);
-                        size_t written = 0;
-                        if (mbedtls_base64_decode(packet->payload.data(), packet->payload.size(), &written,
-                                reinterpret_cast<const unsigned char*>(encoded->valuestring),
-                                std::strlen(encoded->valuestring)) == 0 && written == decoded_size) {
-                            packet->sample_rate = 16000;
-                            packet->frame_duration = 20;
-                            if (Application::GetInstance().PushCodexRealtimeAudio(std::move(packet))) {
-                                s_ui.realtime_last_sequence = frame_sequence;
-                            }
-                        }
+                    auto packet = std::make_unique<AudioStreamPacket>();
+                    packet->payload = message.realtime_audio;
+                    packet->sample_rate = 16000;
+                    packet->frame_duration = 20;
+                    if (Application::GetInstance().PushCodexRealtimeAudio(std::move(packet))) {
+                        s_ui.realtime_last_sequence = frame_sequence;
+                    } else {
+                        ShowRealtimeError("实时音频队列已满，请重新连接后重试。");
                     }
                 }
+            } else {
+                ShowRealtimeError("收到的实时音频帧无效，请重新连接后重试。");
             }
         }
     } else if (std::strcmp(type, "turn_stop_result") == 0) {
@@ -1160,7 +1249,6 @@ void HandleMessage(const std::string& message) {
         const cJSON* request_id = cJSON_GetObjectItemCaseSensitive(root, "requestId");
         if (!cJSON_IsString(request_id) || s_ui.voice_request_id.empty() ||
             s_ui.voice_request_id != request_id->valuestring) {
-            cJSON_Delete(root);
             return;
         }
         const cJSON* mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
@@ -1186,7 +1274,8 @@ void HandleMessage(const std::string& message) {
                     if (ShouldCaptureDeviceAudio(mode, audio_source, accepts_audio) &&
                         !s_ui.voice_capture_started) {
                         s_ui.voice_capture_started = true;
-                        Application::GetInstance().StartCodexVoiceCapture();
+                        Application::GetInstance().StartCodexVoiceCapture(
+                            ToClientSendContext(s_ui.voice_send_context));
                     }
                     SetVoiceStage(VoiceStage::Recording);
                 }
@@ -1243,43 +1332,128 @@ void HandleMessage(const std::string& message) {
             }
         }
     }
-    cJSON_Delete(root);
     RefreshBridgeUi(lv_tick_get());
 }
 
-void PostMessage(const std::string& message) {
-    lv_obj_t* root = s_ui.root.load();
-    UiDispatcher::Post([root, message]() {
-        if (root != nullptr && s_ui.root.load() == root) HandleMessage(message);
-    });
-}
+void InvalidateCodexSession();
 
-void PostStatus(bool connected) {
-    lv_obj_t* root = s_ui.root.load();
-    UiDispatcher::Post([root, connected]() {
-        if (root == nullptr || s_ui.root.load() != root) return;
-        s_ui.bridge_connection.SetTransportConnected(connected, lv_tick_get());
+bool ApplyProtocolEvent(ProtocolService::Event event) {
+    auto& service = Protocol();
+    const bool require_connected = event.kind == ProtocolService::EventKind::Message ||
+        (event.kind == ProtocolService::EventKind::Status && event.connected);
+    if (s_ui.root.load() == nullptr ||
+        !service.IsEventCurrent(event.activation_generation, event.context,
+                                require_connected)) return false;
+
+    if (event.kind == ProtocolService::EventKind::Message ||
+        event.kind == ProtocolService::EventKind::Status) {
+        const bool changed = service.AcknowledgeContext(
+            event.activation_generation, event.context);
+        if (changed) {
+            InvalidateCodexSession();
+            s_ui.bridge_connection = {};
+            s_ui.bridge_was_usable = false;
+        }
+        s_ui.bridge_connection.SetTransportConnected(
+            event.kind == ProtocolService::EventKind::Message || event.connected,
+            lv_tick_get());
+    }
+
+    switch (event.kind) {
+    case ProtocolService::EventKind::Message:
+        if (event.message) HandleMessage(*event.message);
+        break;
+    case ProtocolService::EventKind::Status:
         RefreshBridgeUi(lv_tick_get());
-        if (connected) {
+        if (event.connected) {
             CaptureConnectedConfig();
             HideConfig();
         }
         UpdateConnectionAction();
-    });
+        break;
+    case ProtocolService::EventKind::Discovery:
+        s_ui.discovered_name = std::move(event.name);
+        s_ui.discovered_ip = std::move(event.ip);
+        s_ui.discovered_port = event.port;
+        if (s_ui.discovery_name != nullptr)
+            lv_label_set_text(s_ui.discovery_name, s_ui.discovered_name.c_str());
+        if (!service.HasToken()) ShowConfig();
+        break;
+    case ProtocolService::EventKind::SendFailure:
+        if (event.on_failure) event.on_failure();
+        SetStatus(CanUseCodex(), event.failure_message.c_str());
+        break;
+    }
+    return true;
 }
 
-void PostDiscovery(const std::string& name, const std::string& ip, int port) {
-    lv_obj_t* root = s_ui.root.load();
-    UiDispatcher::Post([root, name, ip, port]() {
-        if (root == nullptr || s_ui.root.load() != root) return;
-        s_ui.discovered_name = name;
-        s_ui.discovered_ip = ip;
-        s_ui.discovered_port = port;
-        if (s_ui.discovery_name != nullptr) {
-            lv_label_set_text(s_ui.discovery_name, name.c_str());
+bool QueueProtocolEventAttempt(ProtocolService::Event event, unsigned retry) {
+    if (s_ui.root.load() == nullptr) return false;
+    const size_t retained_bytes = event.kind == ProtocolService::EventKind::Message && event.message
+        ? std::max<size_t>(128, event.message->retained_bytes)
+        : 256 + event.name.size() + event.ip.size() + event.failure_message.size();
+    const auto kind = event.kind;
+    const auto message = event.message;
+    const auto pending = std::make_shared<ProtocolService::Event>(std::move(event));
+    auto apply = [pending]() mutable {
+        ApplyProtocolEvent(std::move(*pending));
+    };
+
+    if (kind == ProtocolService::EventKind::Status) {
+        const auto result = UiDispatcher::PostLatest(UiDispatcher::SnapshotKey::CodexConnection,
+            std::move(apply), retained_bytes);
+        return result == UiDispatcher::PostResult::Accepted ||
+               result == UiDispatcher::PostResult::Replaced;
+    }
+    if (kind == ProtocolService::EventKind::Message && message &&
+        message->notice == CodexWsMessage::Notice::None) {
+        const cJSON* type = cJSON_GetObjectItemCaseSensitive(message->Json(), "type");
+        if (cJSON_IsString(type) && std::strcmp(type->valuestring, "codex_state") == 0 &&
+            cJSON_GetObjectItemCaseSensitive(message->Json(), "request_id") == nullptr &&
+            !message->state_omitted) {
+            const auto result = UiDispatcher::PostLatest(UiDispatcher::SnapshotKey::CodexState,
+                std::move(apply), retained_bytes);
+            return result == UiDispatcher::PostResult::Accepted ||
+                   result == UiDispatcher::PostResult::Replaced;
         }
-        if (!CodexWsClient::GetInstance().HasToken()) ShowConfig();
-    });
+    }
+    if (UiDispatcher::PostBounded(std::move(apply), retained_bytes) ==
+        UiDispatcher::PostResult::Accepted) return true;
+
+    // Retry a full UI queue through the main loop a fixed number of times.
+    // This is bounded recovery, not a guarantee that a permanently full UI
+    // queue will eventually deliver the failure callback.
+    if (kind == ProtocolService::EventKind::SendFailure && retry < 3) {
+        const auto activation_generation = pending->activation_generation;
+        const auto context = pending->context;
+        Application::GetInstance().Schedule([pending, retry, activation_generation, context]() {
+            if (!Protocol().IsEventCurrent(activation_generation, context, false)) return;
+            QueueProtocolEventAttempt(*pending, retry + 1);
+        });
+        return true;
+    }
+    if (kind == ProtocolService::EventKind::SendFailure)
+        ESP_LOGW(kTag, "Codex send-failure UI event dropped after bounded retries");
+    return false;
+}
+
+bool QueueProtocolEvent(ProtocolService::Event event) {
+    return QueueProtocolEventAttempt(std::move(event), 0);
+}
+
+void PostSendFailure(const TransportContext& context, std::string message,
+                     std::function<void()> on_failure) {
+    Protocol().PostSendFailure(context, std::move(message), std::move(on_failure));
+}
+
+bool QueueCommand(std::string json, std::string ai_request_id,
+                  std::string failure_message,
+                  std::function<void()> on_failure,
+                  std::function<void()> on_sent,
+                  const TransportContext* captured_context) {
+    return Protocol().QueueCommand(std::move(json), std::move(ai_request_id),
+        std::move(failure_message), std::move(on_failure), std::move(on_sent),
+        captured_context) == ProtocolService::Admission::Accepted;
 }
 
 void CancelVoiceLabelTimer() {
@@ -1297,12 +1471,31 @@ void FinishVoiceCapture(bool cancelled) {
                       ? VoiceStage::AwaitingRecognition
                       : VoiceStage::Finishing);
     const std::string request_id = s_ui.voice_request_id;
-    auto send_voice_end = [request_id, cancelled]() {
-        auto& ws = CodexWsClient::GetInstance();
-        if (!ws.SendTextMessage("{\"type\":\"voice_end\",\"requestId\":\"" +
-                                request_id + (cancelled ? "\",\"cancelled\":true}" : "\"}"))) {
-            // Closing the transport also releases PTT in the PC bridge.
-            ws.Reconnect();
+    const auto send_context = s_ui.voice_send_context;
+    auto send_voice_end = [request_id, cancelled, send_context]() {
+        auto& client = Protocol();
+        const std::string message = "{\"type\":\"voice_end\",\"requestId\":\"" +
+            request_id + (cancelled ? "\",\"cancelled\":true}" : "\"}");
+        if (!QueueCommand(message, {}, "语音结束请求发送失败", [request_id, send_context]() {
+                if (s_ui.voice_request_id != request_id) return;
+                s_ui.voice_pressed = false;
+                s_ui.voice_cancel_pending = false;
+                s_ui.voice_request_id.clear();
+                s_ui.voice_send_context = {};
+                s_ui.voice_target.clear();
+                SetVoiceStage(VoiceStage::Error);
+                auto& current = Protocol();
+                // A stale completion must never tear down a replacement socket.
+                if (current.IsContextCurrent(send_context, true)) {
+                    current.RequestReconnectAsync(send_context);
+                }
+            }, {}, &send_context)) {
+            // Admission can fail because this context is stale. Only force a
+            // reconnect for the still-current voice request and transport.
+            if (s_ui.voice_request_id == request_id &&
+                client.IsContextCurrent(send_context, true)) {
+                client.RequestReconnectAsync(send_context);
+            }
         }
     };
     if (cancelled) {
@@ -1335,13 +1528,20 @@ void InvalidateCodexSession() {
     }
     CancelVoiceLabelTimer();
     const std::string cancelled_voice_request = s_ui.voice_request_id;
-    StopDeviceVoiceCapture([cancelled_voice_request]() {
+    const auto voice_send_context = s_ui.voice_send_context;
+    StopDeviceVoiceCapture([cancelled_voice_request, voice_send_context]() {
         if (cancelled_voice_request.empty() ||
-            !CodexWsClient::GetInstance().IsConnected()) return;
-        CodexWsClient::GetInstance().SendTextMessage(
+            !Protocol().IsConnected()) return;
+        QueueCommand(
             "{\"type\":\"voice_end\",\"requestId\":\"" +
                 cancelled_voice_request + "\",\"cancelled\":true}",
-            pdMS_TO_TICKS(200));
+            {}, "语音取消请求发送失败", [cancelled_voice_request]() {
+                if (s_ui.voice_request_id == cancelled_voice_request) {
+                    s_ui.voice_request_id.clear();
+                    s_ui.voice_send_context = {};
+                    s_ui.voice_target.clear();
+                }
+            }, {}, &voice_send_context);
     });
     s_ui.voice_pressed = false;
     s_ui.voice_cancel_armed = false;
@@ -1393,8 +1593,9 @@ void RefreshBridgeUi(uint32_t now_ms) {
     if (s_ui.bridge_connection.ConsumeSyncRequest(now_ms)) {
         // bridge_status is the liveness source.  The bridge replies with a
         // heartbeat followed by a fresh snapshot, including after recovery.
-        if (!CodexWsClient::GetInstance().SendTextMessage(
-                "{\"type\":\"codex_sync\"}", pdMS_TO_TICKS(200))) {
+        if (!QueueCommand("{\"type\":\"codex_sync\"}", {}, "同步请求发送失败", []() {
+                s_ui.bridge_connection.ResetSyncRequest();
+            })) {
             // Keep the bridge liveness state unchanged, but retry the fresh
             // snapshot request on the next bounded UI refresh.
             s_ui.bridge_connection.ResetSyncRequest();
@@ -1405,7 +1606,6 @@ void RefreshBridgeUi(uint32_t now_ms) {
 }
 
 void StartVoiceCapture() {
-    auto& client = CodexWsClient::GetInstance();
     if (!CanUseCodex()) {
         ShowConfig();
         return;
@@ -1422,16 +1622,38 @@ void StartVoiceCapture() {
                             std::to_string(s_ui.menu_boot_nonce) + "-" +
                             std::to_string(++s_ui.request_counter);
     const auto request = TargetedRequest("voice_start", s_ui.voice_request_id);
-    if (request.empty() || !client.SendTextMessage(request)) {
+    const std::string request_id = s_ui.voice_request_id;
+    if (request.empty()) {
         s_ui.voice_request_id.clear();
         SetStatus(true, "请等待任务同步后再说话");
         return;
     }
     s_ui.voice_target = CurrentVoiceTarget();
+    const auto send_context = Protocol().CaptureSendContext();
+    s_ui.voice_send_context = send_context;
     s_ui.voice_pressed = true;
     s_ui.voice_cancel_armed = false;
     s_ui.voice_cancel_pending = false;
     s_ui.voice_mode = VoiceMode::Micro;
+    if (!QueueCommand(request, request_id, "语音开始请求发送失败", [request_id]() {
+            if (s_ui.voice_request_id != request_id) return;
+            StopDeviceVoiceCapture();
+            s_ui.voice_request_id.clear();
+            s_ui.voice_send_context = {};
+            s_ui.voice_target.clear();
+            s_ui.voice_pressed = false;
+            s_ui.voice_cancel_armed = false;
+            s_ui.voice_cancel_pending = false;
+            SetVoiceStage(VoiceStage::Error);
+        }, {}, &send_context)) {
+        s_ui.voice_send_context = {};
+        s_ui.voice_request_id.clear();
+        s_ui.voice_target.clear();
+        s_ui.voice_pressed = false;
+        s_ui.voice_cancel_armed = false;
+        SetStatus(true, "语音开始请求未能排队");
+        return;
+    }
     SetStatus(true);
     SetVoiceStage(VoiceStage::Preparing);
 }
@@ -1455,7 +1677,12 @@ void SendStopRequest() {
                            std::to_string(s_ui.menu_boot_nonce) + "-" +
                            std::to_string(++s_ui.request_counter);
     const auto request = TargetedRequest("turn_stop", id);
-    if (!request.empty() && CodexWsClient::GetInstance().SendTextMessage(request)) {
+    if (!request.empty() && QueueCommand(request, id, "停止请求发送失败", [id]() {
+            if (s_ui.stop_request_id != id) return;
+            s_ui.stop_request_id.clear();
+            s_ui.stop_pending = false;
+            UpdateActionButton();
+        })) {
         s_ui.stop_request_id = id;
         s_ui.stop_pending = true;
         UpdateActionButton();
@@ -1546,7 +1773,7 @@ void OnStopReleased(lv_event_t*) { ResetStopHoldProgress(); }
 
 void OnSaveToken(lv_event_t*) {
     if (s_ui.token == nullptr) return;
-    auto& client = CodexWsClient::GetInstance();
+    auto& client = Protocol();
     if (client.IsConnected() && !HasNewConnectionInfo()) {
         HideConfig();
         return;
@@ -1569,22 +1796,33 @@ void OnSaveToken(lv_event_t*) {
                 settings.SetString("remote_url", remote_uri);
             }
         }
-        client.Connect(remote_uri);
+        if (!client.RequestConnectAsync(remote_uri)) {
+            SetStatus(false, "连接请求未能排队，请重试");
+        } else {
+            SetStatus(true, "正在连接电脑…");
+        }
     } else {
         const std::string ip = !s_ui.discovered_ip.empty()
                                    ? s_ui.discovered_ip
-                                   : client.GetCurrentIp();
+                                   : client.CurrentIp();
         const int port = !s_ui.discovered_ip.empty()
                              ? s_ui.discovered_port
-                             : client.GetCurrentPort();
-        if (!ip.empty()) client.Connect(ip, port);
-        else client.StartDiscovery(8000);
+                             : client.CurrentPort();
+        if (!ip.empty()) {
+            if (!client.RequestConnectAsync(ip + ":" + std::to_string(port))) {
+                SetStatus(false, "连接请求未能排队，请重试");
+            } else {
+                SetStatus(true, "正在连接电脑…");
+            }
+        } else {
+            client.StartDiscovery(8000);
+        }
     }
 }
 
 void SetConnectionMode(bool remote) {
     s_ui.remote_mode = remote;
-    CodexWsClient::GetInstance().SetDiscoveryEnabled(!remote);
+    Protocol().SetDiscoveryEnabled(!remote);
     for (size_t i = 0; i < 2; ++i) {
         controls::SetSegmentButtonSelected(s_ui.connection_modes[i],
                                            i == static_cast<size_t>(remote));
@@ -1595,7 +1833,7 @@ void SetConnectionMode(bool remote) {
             lv_obj_add_flag(s_ui.connection_panels[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
-    if (!remote) CodexWsClient::GetInstance().StartDiscovery(8000);
+    if (!remote) Protocol().StartDiscovery(8000);
     UpdateConnectionAction();
 }
 
@@ -1605,21 +1843,6 @@ void OnConnectionMode(lv_event_t* event) {
 }
 
 void OnOpenConfig(lv_event_t*) { ShowConfig(); }
-
-void AddMenuGlyph(lv_obj_t* button) {
-    if (button == nullptr) return;
-    for (int i = 0; i < 3; ++i) {
-        lv_obj_t* line = lv_obj_create(button);
-        lv_obj_remove_style_all(line);
-        lv_obj_set_size(line, 28, 3);
-        lv_obj_set_style_bg_color(
-            line, lv_color_hex(Theme::Get().colors().muted), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(line, 2, LV_PART_MAIN);
-        lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 12 + i * 8);
-        lv_obj_remove_flag(line, LV_OBJ_FLAG_CLICKABLE);
-    }
-}
 
 void BuildConfigDialog(lv_obj_t* root) {
     codex_menu_ui::Callbacks callbacks{};
@@ -1667,7 +1890,7 @@ void BuildConfigDialog(lv_obj_t* root) {
     s_ui.model_dropdown = parts.model_dropdown;
     s_ui.fast_switch = parts.fast_switch;
     std::string saved_token;
-    if (CodexWsClient::GetInstance().LoadToken(saved_token)) {
+    if (Protocol().LoadToken(saved_token)) {
         lv_textarea_set_text(s_ui.token, saved_token.c_str());
     }
     Keyboard::Get().Bind(s_ui.remote_ip, "服务器地址", LV_KEYBOARD_MODE_USER_1);
@@ -1706,12 +1929,25 @@ bool SendMenuAction(const char* action, int slot = -1, const std::string& model 
     const std::string json = codex_menu::BuildActionJson(request_id, action, slot, model, effort, fast,
         target.thread_id, draft ? "local" : target.host_id,
         draft ? s_ui.menu_state.draft_request_id : "", draft || (setting && slot < 0) ? s_ui.menu_state.stream_id : "");
-    if (json.empty() || !CodexWsClient::GetInstance().SendTextMessage(json)) return false;
+    const bool new_task = std::strcmp(action, "new_task") == 0;
+    if (json.empty() || !QueueCommand(json, request_id, "Codex 操作发送失败", [request_id, new_task]() {
+            if (s_ui.pending_menu_request != request_id) return;
+            s_ui.pending_menu_request.clear();
+            if (new_task) {
+                s_ui.pending_new_task = false;
+                codex_menu::FailDraft(&s_ui.menu_state, "新任务请求发送失败，请重试");
+            }
+            if (s_ui.menu_pending_timer) {
+                lv_timer_delete(s_ui.menu_pending_timer);
+                s_ui.menu_pending_timer = nullptr;
+            }
+            if (new_task) SyncConversation();
+            RefreshCodexMenu();
+        })) return false;
     s_ui.pending_menu_request = request_id;
     // Explicit task selection/new-task actions also settle this page entry, so
     // a later state snapshot cannot override the user's choice.
     if (std::strcmp(action, "select_task") == 0 || std::strcmp(action, "new_task") == 0) s_task_entry.Complete();
-    const bool new_task = std::strcmp(action, "new_task") == 0;
     if (new_task) {
         s_ui.pending_new_task = true;
         codex_menu::BeginDraft(&s_ui.menu_state, request_id);
@@ -1859,7 +2095,8 @@ codex_ai::DispatchResult DispatchCodexAi(const std::string& action, const std::s
         return result;
     }
     if (action == "reconnect") {
-        result.accepted = CodexWsClient::GetInstance().Reconnect(); result.immediate = result.accepted;
+        result.accepted = Protocol().RequestReconnectAsync();
+        result.immediate = result.accepted;
         result.result_json = result.accepted ? "{\"requested\":true}" : "{}";
         result.error = result.accepted ? "" : "无法重新连接 Codex 桥接"; return result;
     }
@@ -1880,13 +2117,16 @@ codex_ai::DispatchResult DispatchCodexAi(const std::string& action, const std::s
     } else if (action == "stop") {
         if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
         const std::string message = TargetedRequest("turn_stop", request_id);
-        result.accepted = !message.empty() && CodexWsClient::GetInstance().SendTextMessage(message, pdMS_TO_TICKS(200));
+        result.accepted = !message.empty() && QueueCommand(message, request_id, "停止请求发送失败");
     } else if (action == "realtime_start") {
         if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
         StartRealtimeSession(request_id); result.accepted = s_ui.realtime_request_id == request_id;
     } else if (action == "realtime_end") {
         if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
-        EndRealtimeSession(true); result.accepted = true; result.immediate = true; result.result_json = "{\"ended\":true}";
+        const bool was_active = !s_ui.realtime_request_id.empty();
+        result.accepted = EndRealtimeSession(true, false, request_id);
+        result.immediate = !was_active && result.accepted;
+        result.result_json = result.immediate ? "{\"ended\":true}" : "{\"sent\":true}";
     } else if (action == "text") {
         if (!AiTargetMatches(args)) { result.error = "目标任务或草稿已变化"; return result; }
         const std::string text = AiArgumentString(args, "text");
@@ -1900,7 +2140,7 @@ codex_ai::DispatchResult DispatchCodexAi(const std::string& action, const std::s
         char* printed = cJSON_PrintUnformatted(message); const std::string wire = printed ? printed : "";
         if (printed) cJSON_free(printed);
         cJSON_Delete(message);
-        result.accepted = !wire.empty() && CodexWsClient::GetInstance().SendTextMessage(wire, pdMS_TO_TICKS(200));
+        result.accepted = !wire.empty() && QueueCommand(wire, request_id, "文字请求发送失败");
     } else if (action == "interaction") {
         if (!AiTargetMatches(args, false)) { result.error = "目标任务已变化"; return result; }
         const std::string interaction_id = AiArgumentString(args, "interaction_id");
@@ -1924,7 +2164,7 @@ codex_ai::DispatchResult DispatchCodexAi(const std::string& action, const std::s
         char* printed = cJSON_PrintUnformatted(message); const std::string wire = printed ? printed : "";
         if (printed) cJSON_free(printed);
         cJSON_Delete(message);
-        result.accepted = !wire.empty() && CodexWsClient::GetInstance().SendTextMessage(wire, pdMS_TO_TICKS(200));
+        result.accepted = !wire.empty() && QueueCommand(wire, request_id, "交互回答发送失败");
     } else { result.error = "不支持的 Codex 操作"; return result; }
     result.correlation_id = request_id;
     if (!result.accepted && result.error.empty()) result.error = "请求未被 Codex 桥接接受";
@@ -2033,12 +2273,9 @@ void OnDeleted(lv_event_t*) {
     IdlePower::Get().SetMicroDisplay({});
     if (s_ui.pending_menu_request.empty()) s_task_entry.Remember(s_ui.menu_state);
     EndRealtimeSession(true);
-    auto& client = CodexWsClient::GetInstance();
-    client.SetOnMessageCallback({});
-    client.SetOnStatusCallback({});
-    client.SetOnDiscoveryCallback({});
+    auto& service = Protocol();
     FinishVoiceCapture(true);
-    client.SetAppActive(false);
+    service.Deactivate();
     ResetStopHoldProgress();
     if (s_ui.menu_pending_timer) { lv_timer_delete(s_ui.menu_pending_timer); s_ui.menu_pending_timer = nullptr; }
     if (s_ui.bridge_status_timer) { lv_timer_delete(s_ui.bridge_status_timer); s_ui.bridge_status_timer = nullptr; }
@@ -2124,6 +2361,7 @@ void OnDeleted(lv_event_t*) {
 
 lv_obj_t* CodexView::Create() {
     s_task_entry.Begin();
+    s_ui.action_visual_ready = false;
     auto shell = CreateAppShell("Codex", "自动发现 PC 服务");
     s_ui.task_actions = shell.actions;
     s_ui.root.store(shell.root);
@@ -2255,70 +2493,38 @@ lv_obj_t* CodexView::Create() {
         }
     }, 33, nullptr);
 
-    auto voice = controls::AddBottomVoiceButton(
-        shell.actions, "按住说话", nullptr);
-    s_ui.action_button = voice.root;
-    s_ui.action_icon = voice.icon;
-    s_ui.action_label = voice.label;
-    s_ui.voice_button = voice;
-    auto stop = controls::AddBottomPrimaryButton(
-        shell.actions, FONT_AWESOME_STOP, "停止", nullptr, nullptr);
-    lv_obj_set_width(voice.root, 0);
-    lv_obj_set_width(stop.root, 0);
-    lv_obj_set_flex_grow(voice.root, 2);
-    lv_obj_set_flex_grow(stop.root, 1);
-    lv_obj_set_style_bg_color(stop.root, lv_color_hex(Theme::Get().colors().danger), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(stop.root, lv_color_darken(lv_color_hex(Theme::Get().colors().danger), LV_OPA_20), LV_STATE_PRESSED);
-    lv_obj_set_style_opa(stop.root, LV_OPA_50, LV_STATE_DISABLED);
-    s_ui.stop_button = stop.root;
-    s_ui.stop_label = stop.label;
-    lv_obj_add_flag(stop.root, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(stop.root, OnStopPressed, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_event_cb(stop.root, OnStopReleased, LV_EVENT_RELEASED, nullptr);
-    lv_obj_add_event_cb(stop.root, OnStopReleased, LV_EVENT_PRESS_LOST, nullptr);
-    s_ui.stop_hold_progress = lv_obj_create(stop.root);
-    lv_obj_remove_style_all(s_ui.stop_hold_progress);
-    lv_obj_set_size(s_ui.stop_hold_progress, 0, 7);
-    lv_obj_align(s_ui.stop_hold_progress, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    lv_obj_set_style_bg_color(
-        s_ui.stop_hold_progress,
-        lv_color_hex(Theme::Get().colors().accent_ink), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_ui.stop_hold_progress, LV_OPA_COVER,
-                            LV_PART_MAIN);
-    lv_obj_set_style_radius(s_ui.stop_hold_progress, 4, LV_PART_MAIN);
-    lv_obj_remove_flag(s_ui.stop_hold_progress, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(voice.root, OnVoicePressed, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_flag(voice.root, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_add_event_cb(voice.root, OnVoicePressing, LV_EVENT_PRESSING, nullptr);
-    lv_obj_add_event_cb(voice.root, OnVoiceReleased, LV_EVENT_RELEASED, nullptr);
-    lv_obj_add_event_cb(voice.root, OnVoiceReleased, LV_EVENT_PRESS_LOST, nullptr);
-    auto menu = controls::AddBottomActionButton(
-        shell.actions, nullptr, "菜单", OnOpenConfig);
-    AddMenuGlyph(menu.root);
+    const auto& footer_colors = Theme::Get().colors();
+    const auto footer = codex_voice_footer::Build(shell.actions,
+        {footer_colors.danger, footer_colors.accent_ink, footer_colors.muted},
+        {OnVoicePressed, OnVoicePressing, OnVoiceReleased,
+         OnStopPressed, OnStopReleased, OnOpenConfig});
+    s_ui.action_button = footer.voice.root;
+    s_ui.action_icon = footer.voice.icon;
+    s_ui.action_label = footer.voice.label;
+    s_ui.voice_button = footer.voice;
+    s_ui.stop_button = footer.stop.root;
+    s_ui.stop_label = footer.stop.label;
+    s_ui.stop_hold_progress = footer.stop_hold_progress;
 
-    auto& client = CodexWsClient::GetInstance();
-    client.Init();
     BuildConfigDialog(shell.root);
     s_ui.conversation_ui = std::make_unique<CodexConversationUi>(s_ui.chat, shell.root,
         [](const std::string& json) {
-            return CanUseCodex() && CodexWsClient::GetInstance().SendTextMessage(json, pdMS_TO_TICKS(200));
+            return CanUseCodex() && QueueCommand(json, {}, "交互回答发送失败");
         },
         [](lv_obj_t* bubble, const char* text, bool user) { RenderMarkdown(bubble, text, user, Theme::Get().colors()); });
     s_ui.ring_frame = codex_status_ring::Create(shell.root);
 
     UiDispatcher::Init();
-    client.SetOnMessageCallback(PostMessage);
-    client.SetOnStatusCallback(PostStatus);
-    client.SetOnDiscoveryCallback(PostDiscovery);
-    client.SetAppActive(true);
-    s_ui.bridge_connection.SetTransportConnected(client.IsConnected(), lv_tick_get());
+    auto& service = Protocol();
+    service.Activate(QueueProtocolEvent);
+    s_ui.bridge_connection.SetTransportConnected(service.IsConnected(), lv_tick_get());
     s_ui.bridge_status_timer = lv_timer_create([](lv_timer_t*) {
         RefreshBridgeUi(lv_tick_get());
     }, 1000, nullptr);
     RefreshBridgeUi(lv_tick_get());
-    client.SetDiscoveryEnabled(!s_ui.remote_mode);
-    if (!client.IsConnected()) client.StartDiscovery(8000);
-    if (!client.HasToken()) ShowConfig();
+    service.SetDiscoveryEnabled(!s_ui.remote_mode);
+    if (!service.IsConnected()) service.StartDiscovery(8000);
+    if (!service.HasToken()) ShowConfig();
     SyncConversation();
     UpdateStatusRing();
     return shell.root;

@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "cJSON.h"
+
 namespace agent_ui::codex_menu {
 
 enum class SlotState { Unbound, Unknown, Idle, Working, Waiting, Error };
@@ -95,11 +97,16 @@ private:
 };
 
 // Parsing and message construction have no LVGL, NVS, or transport dependency.
+// Root overloads borrow the parsed JSON tree; callers retain ownership.
+bool ParseStateRoot(const cJSON* root, State* out, std::string* error = nullptr);
 bool ParseStateJson(const std::string& json, State* out, std::string* error = nullptr);
+bool ApplyStateRoot(const cJSON* root, State* state, std::string* error = nullptr);
 bool ApplyStateJson(const std::string& json, State* state, std::string* error = nullptr);
 const Slot* SelectedTask(const State& state);
 const Slot* SettingsTarget(const State& state);
 bool MatchesSelectedTask(const State& state, const std::string& host_id, const std::string& thread_id);
+bool ApplyActionResultRoot(const cJSON* root, State* state,
+                           std::string* error = nullptr);
 bool ApplyActionResultJson(const std::string& json, State* state,
                            std::string* error = nullptr);
 // Optimistic device-only state used from a successfully sent new_task action

@@ -104,6 +104,7 @@ const char* DisconnectReason(uint8_t reason) {
 
 struct Adapter::Impl {
     EventSink sink;
+    ConfigChangedSink config_changed_sink;
     std::atomic<bool> active{false};
     std::atomic<bool> wifi_initialized{false};
     std::atomic<bool> scan_in_progress{false};
@@ -163,6 +164,11 @@ struct Adapter::Impl {
         return std::string(ssid, strnlen(ssid, sizeof(ap.ssid)));
     }
 
+    void NotifyConfigChanged() {
+        const ConfigChangedSink callback = config_changed_sink;
+        if (callback) callback();
+    }
+
     void EmitSavedNetworks(const std::string& connected_ssid) {
         Event event;
         event.type = EventType::SavedNetworks;
@@ -201,13 +207,19 @@ struct Adapter::Impl {
     }
 
     void SaveSimSlot(int slot) {
-        Settings settings("network", true);
-        settings.SetInt("sim_slot", slot);
+        {
+            Settings settings("network", true);
+            settings.SetInt("sim_slot", slot);
+        }
+        NotifyConfigChanged();
     }
 
     void SaveNetworkType(int type) {
-        Settings settings("network", true);
-        settings.SetInt("type", type);
+        {
+            Settings settings("network", true);
+            settings.SetInt("type", type);
+        }
+        NotifyConfigChanged();
     }
 
     DualNetworkBoard* GetDualBoard() const {
@@ -925,6 +937,10 @@ Adapter::~Adapter() {
 
 void Adapter::SetEventSink(EventSink sink) {
     if (impl_ != nullptr) impl_->sink = std::move(sink);
+}
+
+void Adapter::SetConfigChangedSink(ConfigChangedSink sink) {
+    if (impl_ != nullptr) impl_->config_changed_sink = std::move(sink);
 }
 
 void Adapter::Execute(const Command& command) {

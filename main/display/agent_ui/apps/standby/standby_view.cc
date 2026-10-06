@@ -10,7 +10,7 @@
 
 #include "application.h"
 #include "audio_output_route.h"
-#include "apps/home/home_renderer.h"
+#include "agent_ui/agent_ui_runtime.h"
 #include "backlight.h"
 #include "board.h"
 #include "components/expression_player.h"
@@ -68,6 +68,7 @@ struct State {
 State s_ui;
 std::atomic<bool> s_active_snapshot{false};
 std::atomic<bool> s_screen_off_snapshot{false};
+std::atomic<uint32_t> s_screen_off_generation{0};
 
 void ScheduleScreenOff();
 void UnlockToSource();
@@ -344,6 +345,12 @@ void EnterScreenOff() {
     lv_refr_now(nullptr);
     s_ui.black = true;
     s_screen_off_snapshot.store(true, std::memory_order_release);
+    uint32_t generation =
+        s_screen_off_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (generation == 0) {
+        generation =
+            s_screen_off_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
     if (s_ui.clock_timer != nullptr) {
         lv_timer_pause(s_ui.clock_timer);
     }
@@ -363,7 +370,7 @@ void EnterScreenOff() {
         if (display != nullptr && display->IsPowerSaveActive()) {
             PerformanceManager::Get().SetStandbyPhase(
                 StandbyPerformancePhase::ScreenOff);
-            Board::GetInstance().SetLowPowerStandby(true);
+            PowerKey::RequestStandbyEntry();
             if (Backlight* backlight = Board::GetInstance().GetBacklight()) {
                 backlight->SetBrightness(0, false);
             }
@@ -395,7 +402,7 @@ void EnterScreenOff() {
     }
     PerformanceManager::Get().SetStandbyPhase(
         StandbyPerformancePhase::ScreenOff);
-    Board::GetInstance().SetLowPowerStandby(true);
+    PowerKey::RequestStandbyEntry();
     if (Backlight* backlight = Board::GetInstance().GetBacklight()) {
         backlight->SetBrightness(0, false);
     }
@@ -432,6 +439,10 @@ void WakeLockScreen() {
             return;
         }
     }
+
+    // The panel is restored now; request a fresh battery sample without
+    // waiting for I2C on the LVGL owner thread.
+    Board::GetInstance().ResumeBatterySamplingSoon();
 
     // Show the recovered panel before waiting for radio/audio clocks. Keep
     // the application audio gate closed until the worker confirms readiness.
@@ -489,8 +500,8 @@ void UnlockToSource() {
     if (s_ui.source_screen != nullptr &&
         lv_obj_is_valid(s_ui.source_screen)) {
         SendAppLifecycle(s_ui.source_screen, AppLifecycleEvent::Resume);
-        if (s_ui.source_screen == home::Renderer::Screen()) {
-            home::Renderer::SetRenderingPaused(false);
+        if (Runtime::Get().IsHomeScreen(s_ui.source_screen)) {
+            Runtime::Get().SetHomeRenderingPaused(false);
         }
     }
     if (Backlight* backlight = Board::GetInstance().GetBacklight()) {
@@ -537,8 +548,8 @@ void StandbyView::Show(bool screen_off_immediately) {
     s_ui.dragging = false;
     s_ui.black_overlay = nullptr;
     SendAppLifecycle(s_ui.source_screen, AppLifecycleEvent::Suspend);
-    if (s_ui.source_screen == home::Renderer::Screen()) {
-        home::Renderer::SetRenderingPaused(true);
+    if (Runtime::Get().IsHomeScreen(s_ui.source_screen)) {
+        Runtime::Get().SetHomeRenderingPaused(true);
     }
     CreateLockUi();
     StatusBar::Get().SetLockScreenMode(true);
@@ -615,6 +626,10 @@ bool StandbyView::IsActive() {
 
 bool StandbyView::IsScreenOff() {
     return s_screen_off_snapshot.load(std::memory_order_acquire);
+}
+
+uint32_t StandbyView::ScreenOffGeneration() {
+    return s_screen_off_generation.load(std::memory_order_acquire);
 }
 
 }  // namespace agent_ui

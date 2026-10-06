@@ -16,6 +16,7 @@ public:
     void BuildInto(lv_obj_t* parent);
     void ResetUi();
     void LifecycleCallback(AppLifecycleEvent event);
+    void SetConfigChangedCallback(Adapter::ConfigChangedSink callback);
 
     const ViewState& state() const { return controller_.state(); }
     uint64_t revision() const { return revision_; }

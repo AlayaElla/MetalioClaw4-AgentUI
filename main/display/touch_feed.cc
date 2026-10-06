@@ -1,4 +1,7 @@
 #include "touch_feed.h"
+#include "touch_activity_gate.h"
+
+#include <atomic>
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -18,6 +21,9 @@ volatile bool s_run = false;
 volatile bool s_paused = false;
 uint32_t s_period_ms = 20;
 void (*s_activity_callback)() = nullptr;
+TouchActivityGate s_activity_gate;
+std::atomic<uint32_t> s_activity_epoch{0};
+uint32_t s_last_activity_epoch = 0;
 
 struct TouchSnapshot {
     bool pressed = false;
@@ -160,7 +166,13 @@ void IndevReadCb(lv_indev_t* indev, lv_indev_data_t* data) {
     data->point.y = snap.y;
     data->state =
         snap.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-    if (snap.pressed && s_activity_callback != nullptr) {
+    const uint32_t activity_epoch = s_activity_epoch.load(std::memory_order_relaxed);
+    if (activity_epoch != s_last_activity_epoch) {
+        s_last_activity_epoch = activity_epoch;
+        s_activity_gate.Reset();
+    }
+    if (s_activity_gate.ShouldNotify(snap.pressed, lv_tick_get()) &&
+        s_activity_callback != nullptr) {
         s_activity_callback();
     }
 }
@@ -211,11 +223,13 @@ void touch_feed_attach_indev(lv_indev_t* indev) {
         return;
     }
     s_last_read = {};
+    s_activity_epoch.fetch_add(1, std::memory_order_relaxed);
     lv_indev_set_read_cb(indev, IndevReadCb);
 }
 
 void touch_feed_set_activity_callback(void (*callback)()) {
     s_activity_callback = callback;
+    s_activity_epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void touch_feed_set_period(uint32_t period_ms) {
@@ -224,6 +238,7 @@ void touch_feed_set_period(uint32_t period_ms) {
 }
 
 void touch_feed_pause() {
+    s_activity_epoch.fetch_add(1, std::memory_order_relaxed);
     if (s_task == nullptr || s_paused) {
         ClearSnapshot();
         return;
@@ -235,12 +250,14 @@ void touch_feed_pause() {
 
 void touch_feed_resume() {
     if (!s_paused) return;
+    s_activity_epoch.fetch_add(1, std::memory_order_relaxed);
     s_paused = false;
     if (s_task != nullptr) xTaskNotifyGive(s_task);
     ESP_LOGI(kTag, "reader resumed");
 }
 
 void touch_feed_stop() {
+    s_activity_epoch.fetch_add(1, std::memory_order_relaxed);
     if (s_task != nullptr) {
         s_run = false;
         s_paused = false;

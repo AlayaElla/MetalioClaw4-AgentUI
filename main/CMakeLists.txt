@@ -16,6 +16,7 @@ set(SOURCES "audio/audio_codec.cc"
             "display/lcd_display.cc"
             "display/oled_display.cc"
             "display/lv_adapter_display.cc"
+            "display/display_render_telemetry.cc"
             "display/touch_feed.cc"
             "display/font/font_agent_small_18.c"
             "display/font/font_agent_medium_28.c"
@@ -42,6 +43,7 @@ set(SOURCES "audio/audio_codec.cc"
             "ai/ai_capabilities.cc"
             "ai_settings.cc"
             "ai/ai_availability.cc"
+            "ai/codex_capture_coordinator.cc"
             "ai/ai_ui_operation.cc"
             "ai/system_connectivity.cc"
             "xiaozhi_server_settings.cc"
@@ -68,9 +70,6 @@ set(INCLUDE_DIRS
 
 include("${CMAKE_CURRENT_LIST_DIR}/display/agent_ui/sources.cmake")
 list(APPEND SOURCES ${AGENT_UI_SOURCES})
-list(APPEND SOURCES "display/agent_ui/core/performance_manager.cc")
-list(APPEND SOURCES "display/agent_ui/core/app_mcp_tools.cc")
-list(APPEND SOURCES "display/agent_ui/components/ui_components.cc")
 list(APPEND INCLUDE_DIRS ${AGENT_UI_INCLUDE_DIRS})
 
 list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/../components/codex_remote")
@@ -252,6 +251,41 @@ idf_component_register(SRCS ${SOURCES}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     )
+
+# Managed dependencies are regenerated on a clean checkout. Validate and
+# replay our owner-task hook and cache-sync optimization at configure time.
+idf_component_get_property(ESP_LVGL_ADAPTER_DIR
+    espressif__esp_lvgl_adapter COMPONENT_DIR)
+idf_component_get_property(ESP_LVGL_ADAPTER_LIB
+    espressif__esp_lvgl_adapter COMPONENT_LIB)
+idf_build_get_property(ESP_LVGL_PATCH_PYTHON PYTHON)
+set(ESP_LVGL_PATCH_SCRIPT
+    "${PROJECT_DIR}/scripts/apply_esp_lvgl_adapter_system_performance.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${ESP_LVGL_PATCH_SCRIPT}"
+    "${PROJECT_DIR}/patches/esp-lvgl-adapter-v0.6.3-system-performance.patch"
+    "${PROJECT_DIR}/patches/esp-lvgl-adapter-v0.6.3-system-performance.manifest.json"
+    "${CMAKE_CURRENT_LIST_DIR}/display/display_cache_sync_plan.h")
+execute_process(
+    COMMAND "${ESP_LVGL_PATCH_PYTHON}" "${ESP_LVGL_PATCH_SCRIPT}"
+            --component-dir "${ESP_LVGL_ADAPTER_DIR}"
+    RESULT_VARIABLE ESP_LVGL_PATCH_RESULT
+    OUTPUT_VARIABLE ESP_LVGL_PATCH_OUTPUT
+    ERROR_VARIABLE ESP_LVGL_PATCH_ERROR
+)
+if(NOT ESP_LVGL_PATCH_RESULT STREQUAL "0")
+    message(FATAL_ERROR
+        "LVGL adapter patch verification failed: ${ESP_LVGL_PATCH_ERROR}")
+endif()
+string(STRIP "${ESP_LVGL_PATCH_OUTPUT}" ESP_LVGL_PATCH_OUTPUT)
+message(STATUS "${ESP_LVGL_PATCH_OUTPUT}")
+target_include_directories(${ESP_LVGL_ADAPTER_LIB} PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/display")
+
+option(AGENT_UI_EXPERIMENTAL_DIRECT_RENDER
+       "Build the MIPI DSI DIRECT rendering experiment" OFF)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    AGENT_UI_EXPERIMENTAL_DIRECT_RENDER=$<BOOL:${AGENT_UI_EXPERIMENTAL_DIRECT_RENDER}>)
 
 target_link_libraries(${COMPONENT_LIB} PRIVATE
                       idf::esp_driver_pcnt
